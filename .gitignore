@@ -1,0 +1,8 @@
+# large / generated artifacts
+*.gif
+checkpoints/
+logs/
+runs/
+__pycache__/
+*.pyc
+MUJOCO_LOG.TXT
