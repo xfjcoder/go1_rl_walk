@@ -2,6 +2,9 @@
 Load a trained checkpoint and watch Go1 walk.
 
 Usage:
+    python play.py --run-dir runs/pilot_a_kp40 --record out.gif   # latest checkpoint of a run, with the run's own
+                                                                   # env settings (kp/kd/rewards) -- preferred
+    python play.py --run-dir runs/pilot_a_kp40 --model go1_flat_1000000_steps --record out.gif   # a specific one
     python play.py --model checkpoints/go1_flat_final.zip                # interactive viewer (needs GLFW)
     python play.py --model checkpoints/go1_flat_final.zip --record out.gif  # offscreen -> GIF, no window
 
@@ -11,20 +14,28 @@ on some Linux setups. If the plain command crashes, try:
 or use --record, which renders offscreen and never opens a window.
 """
 import argparse
+import json
+import os
+import re
 import time
 
 from stable_baselines3 import PPO
 from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
 
 from envs.go1_env import Go1FlatEnv
+from eval_policy import latest_checkpoint
 
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model", type=str, required=True)
+    parser.add_argument("--run-dir", type=str, default=None,
+                         help="runs/<name> from train.py --run-name. Uses that run's env_kwargs.json and "
+                              "its latest checkpoint (or --model NAME inside <run-dir>/checkpoints).")
+    parser.add_argument("--model", type=str, default=None)
     parser.add_argument("--vecnormalize", type=str, default="checkpoints/vecnormalize_final.pkl")
     parser.add_argument("--episodes", type=int, default=5)
-    parser.add_argument("--target-speed", type=float, default=1.0)
+    parser.add_argument("--target-speed", type=float, default=None,
+                         help="Command speed (m/s). Default: the run's own with --run-dir, else 1.0.")
     parser.add_argument("--record", type=str, default=None,
                          help="Save an offscreen-rendered GIF instead of opening a live viewer")
     parser.add_argument("--slowmo", type=float, default=1.0,
@@ -39,9 +50,26 @@ def main():
 
     render_mode = "rgb_array" if args.record else "human"
 
+    env_kwargs = {}
+    if args.run_dir:
+        ckpt_dir = os.path.join(args.run_dir, "checkpoints")
+        model_path = os.path.join(ckpt_dir, args.model) if args.model else latest_checkpoint(ckpt_dir)
+        m = re.search(r"go1_flat_(\d+)_steps$", os.path.basename(model_path))
+        args.vecnormalize = os.path.join(ckpt_dir, f"go1_flat_vecnormalize_{m.group(1)}_steps.pkl") if m \
+            else os.path.join(ckpt_dir, "vecnormalize_final.pkl")
+        with open(os.path.join(args.run_dir, "env_kwargs.json")) as f:
+            env_kwargs = json.load(f)
+        print(f"Using {model_path}.zip with the run's env settings (kp={env_kwargs['kp']}, kd={env_kwargs['kd']})")
+    else:
+        if not args.model:
+            parser.error("give --run-dir or --model")
+        model_path = args.model
+    if args.target_speed is not None:
+        env_kwargs["target_speed"] = args.target_speed
+    env_kwargs.setdefault("target_speed", 1.0)
+
     def make_env():
-        return Go1FlatEnv(render_mode=render_mode, target_speed=args.target_speed,
-                           domain_randomize=False, camera=args.camera)
+        return Go1FlatEnv(render_mode=render_mode, domain_randomize=False, camera=args.camera, **env_kwargs)
 
     env = DummyVecEnv([make_env])
     try:
@@ -51,7 +79,7 @@ def main():
     except FileNotFoundError:
         print("No VecNormalize stats found, running without observation normalization.")
 
-    model = PPO.load(args.model)
+    model = PPO.load(model_path)
 
     frames = []
     try:
