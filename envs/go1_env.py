@@ -100,13 +100,15 @@ class Go1FlatEnv(gym.Env):
                                                # penalized at all before (confirmed: one leg stayed
                                                # lifted "all the time" while others dragged).
         foot_duty_weight: float = 0.3,
-        ground_height_threshold: float = 0.015,  # a foot below this height counts as "grounded"
-                                                  # for ALL gait-timing reward terms (gait,
-                                                  # trot_symmetry, foot_duty, phase_match). Based
-                                                  # on height rather than the raw contact-force
-                                                  # sensor, whose tiny (1e-3) force threshold let
-                                                  # a foot register as "swinging" from a momentary
-                                                  # force dip with no real height change.
+        contact_force_threshold: float = 1.0,    # N. A foot counts as "grounded" (for ALL gait-timing
+                                                  # reward terms: gait, trot_symmetry, foot_duty,
+                                                  # phase_match, air_time) when it has a MuJoCo contact
+                                                  # with normal force above this. This replaced a foot
+                                                  # HEIGHT threshold of 0.015 m, which was below the
+                                                  # foot site's resting height (0.022 m = sphere radius,
+                                                  # the site sits at the sphere centre), so a robot
+                                                  # standing on all four feet was seen as having ZERO
+                                                  # feet down and every contact-based term was wrong.
         gait_period: float = 0.7,             # seconds per full stride cycle (2 diagonal beats).
                                                # Only used if phase_match_weight > 0 or
                                                # use_gait_reference is True -- both default off now.
@@ -205,7 +207,7 @@ class Go1FlatEnv(gym.Env):
         self.max_foot_duty_cycle = max_foot_duty_cycle
         self.min_foot_duty_cycle = min_foot_duty_cycle
         self.foot_duty_weight = foot_duty_weight
-        self.ground_height_threshold = ground_height_threshold
+        self.contact_force_threshold = contact_force_threshold
         self.gait_period = gait_period
         self.phase_match_weight = phase_match_weight
         self.air_time_weight = air_time_weight
@@ -243,6 +245,12 @@ class Go1FlatEnv(gym.Env):
         self._foot_site_ids = np.array(
             [mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_SITE, n) for n in FOOT_SITES]
         )
+        self._foot_geom_ids = np.array(
+            [mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_GEOM, n.replace("_site", ""))
+             for n in FOOT_SITES]
+        )
+        self._foot_radius = float(self.model.geom_size[self._foot_geom_ids[0], 0])  # site is at sphere centre
+        self._contact_force = np.zeros(6)
         self._touch_sensor_adr = {
             n: self.model.sensor_adr[mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_SENSOR, n)]
             for n in FOOT_TOUCH_SENSORS
@@ -374,7 +382,10 @@ class Go1FlatEnv(gym.Env):
         if self._viewer is not None:
             self._viewer.sync()
 
-        info = {"reward_components": reward_info}
+        qw, qx, qy, qz = self.data.sensordata[self._imu_quat_adr:self._imu_quat_adr + 4]
+        info = {"reward_components": reward_info,
+                "base_pos": self.data.qpos[:3].copy(),
+                "yaw": float(np.arctan2(2 * (qw * qz + qx * qy), 1 - 2 * (qy ** 2 + qz ** 2)))}
         return obs, reward, terminated, truncated, info
 
     def render(self, camera: str | None = None):
@@ -387,6 +398,19 @@ class Go1FlatEnv(gym.Env):
     def close(self):
         if self._viewer is not None:
             self._viewer.close()
+
+    def _foot_contacts(self) -> np.ndarray:
+        """bool[4] (FR, FL, RR, RL): foot has a contact with normal force > contact_force_threshold.
+        Uses real MuJoCo contacts, so it stays correct on rough terrain (unlike a height threshold)."""
+        touches = np.zeros(4, dtype=bool)
+        for i in range(self.data.ncon):
+            c = self.data.contact[i]
+            hit = np.flatnonzero((self._foot_geom_ids == c.geom1) | (self._foot_geom_ids == c.geom2))
+            if hit.size and not touches[hit[0]]:
+                mujoco.mj_contactForce(self.model, self.data, i, self._contact_force)
+                if self._contact_force[0] > self.contact_force_threshold:
+                    touches[hit[0]] = True
+        return touches
 
     def _gait_phase(self) -> float:
         """Where we are in the prescribed stride cycle, in [0, 1)."""
@@ -475,16 +499,12 @@ class Go1FlatEnv(gym.Env):
 
         # 7. Foot air-time bonus: encourage lifting feet (discourages shuffling/dragging)
         #
-        # "touches" is defined by actual foot HEIGHT (ground_height_threshold), not the raw
-        # contact-force sensor. The force sensor's threshold (1e-3, a tiny force) let a foot
-        # register as "swinging" from a momentary, imperceptible force dip with no real height
-        # change -- exactly the loophole that let rear legs satisfy the duty-cycle penalty while
-        # still visually dragging (confirmed: front legs showed genuine large-amplitude stepping
-        # while rear legs kept the same "quick tiny/dragging" pattern despite the penalty).
-        # Requiring a real height clearance closes this for every term that uses "touches" below
-        # (gait, trot_symmetry, foot_duty, phase_match all share this one definition).
-        foot_heights_for_contact = self.data.site_xpos[self._foot_site_ids, 2]
-        touches = foot_heights_for_contact < self.ground_height_threshold
+        # "touches" = real foot-floor contact with normal force > contact_force_threshold (1 N),
+        # shared by every term below (gait, trot_symmetry, foot_duty, phase_match, air_time).
+        # A 1 N threshold ignores momentary grazes. (An earlier height-based definition used a
+        # threshold below the foot's resting height, so standing feet were counted as airborne.)
+        foot_heights_for_contact = self.data.site_xpos[self._foot_site_ids, 2] - self._foot_radius  # sole height
+        touches = self._foot_contacts()
         n_contacts = touches.sum()
 
         # 6b. Feet air-time reward (Rudin et al. 2022 "Learning to Walk in Minutes" style):

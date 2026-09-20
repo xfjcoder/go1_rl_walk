@@ -161,38 +161,11 @@ class RewardComponentLoggingCallback(BaseCallback):
         return True
 
 
-def make_env(rank: int, seed: int = 0, target_speed: float = 1.0,
-             trot_symmetry_weight: float = 0.15, foot_clearance_weight: float = 0.08,
-             heading_weight: float = 0.5, lateral_position_weight: float = 0.3,
-             max_foot_duty_cycle: float = 0.75, min_foot_duty_cycle: float = 0.2,
-             foot_duty_weight: float = 0.3, gait_period: float = 0.7, gait_style: str = "trot",
-             phase_match_weight: float = 0.0,
-             air_time_weight: float = 1.0, target_air_time: float = 0.2,
-             use_gait_reference: bool = False, use_calf_reference: bool = False,
-             gait_swing_amplitude: float = 0.35,
-             thigh_residual_scale: float = 0.15, calf_lift_amplitude: float = 0.3,
-             calf_residual_scale: float = 0.15, kp: float = 40.0, kd: float = 1.0):
+def make_env(rank: int, seed: int, env_kwargs: dict):
+    """Factory for one training env. env_kwargs are Go1FlatEnv kwargs (also saved to the run dir
+    as env_kwargs.json so play.py / eval_policy.py rebuild the exact same env)."""
     def _init():
-        env = Go1FlatEnv(render_mode=None, target_speed=target_speed, domain_randomize=True,
-                          trot_symmetry_weight=trot_symmetry_weight,
-                          foot_clearance_weight=foot_clearance_weight,
-                          heading_weight=heading_weight,
-                          lateral_position_weight=lateral_position_weight,
-                          max_foot_duty_cycle=max_foot_duty_cycle,
-                          min_foot_duty_cycle=min_foot_duty_cycle,
-                          foot_duty_weight=foot_duty_weight,
-                          gait_period=gait_period,
-                          gait_style=gait_style,
-                          phase_match_weight=phase_match_weight,
-                          air_time_weight=air_time_weight,
-                          target_air_time=target_air_time,
-                          use_gait_reference=use_gait_reference,
-                          use_calf_reference=use_calf_reference,
-                          gait_swing_amplitude=gait_swing_amplitude,
-                          thigh_residual_scale=thigh_residual_scale,
-                          calf_lift_amplitude=calf_lift_amplitude,
-                          calf_residual_scale=calf_residual_scale,
-                          kp=kp, kd=kd)
+        env = Go1FlatEnv(render_mode=None, domain_randomize=True, **env_kwargs)
         env.reset(seed=seed + rank)
         return env
     set_random_seed(seed)
@@ -334,7 +307,21 @@ def main():
                          help="Peak learning rate. Decays linearly to ~0 over the run (see "
                               "linear_schedule) to counteract the approx_kl/clip_fraction blowup "
                               "seen late in every run so far once action std shrinks.")
+    parser.add_argument("--run-name", type=str, default=None,
+                         help="Write everything for this run to runs/<name>/{checkpoints,logs} plus "
+                              "args.json and env_kwargs.json, so runs never overwrite each other and "
+                              "play.py / eval_policy.py can rebuild the exact env with --run-dir. "
+                              "Without it, the legacy shared checkpoints/ and logs/ are used.")
     args = parser.parse_args()
+
+    global CKPT_DIR, LOG_DIR
+    run_dir = None
+    if args.run_name:
+        run_dir = os.path.join("runs", args.run_name)
+        if os.path.exists(run_dir) and not args.resume:
+            raise SystemExit(f"{run_dir} already exists -- pick a new --run-name (or use --resume).")
+        CKPT_DIR = os.path.join(run_dir, "checkpoints")
+        LOG_DIR = os.path.join(run_dir, "logs")
 
     os.makedirs(CKPT_DIR, exist_ok=True)
     os.makedirs(LOG_DIR, exist_ok=True)
@@ -364,18 +351,25 @@ def main():
     # correctly jump straight to (or near) full strength rather than resetting.
     initial_phase_match_weight = 0.0 if args.phase_match_warmup_steps > 0 else args.phase_match_weight
 
-    env = SubprocVecEnv([make_env(i, args.seed, args.target_speed, args.trot_weight,
-                                   args.foot_clearance_weight, args.heading_weight,
-                                   args.lateral_position_weight, args.max_foot_duty_cycle,
-                                   args.min_foot_duty_cycle, args.foot_duty_weight, args.gait_period,
-                                   args.gait_style,
-                                   initial_phase_match_weight, args.air_time_weight, args.target_air_time,
-                                   args.use_gait_reference,
-                                   args.use_calf_reference, args.gait_swing_amplitude,
-                                   args.thigh_residual_scale,
-                                   args.calf_lift_amplitude, args.calf_residual_scale,
-                                   args.kp, args.kd)
-                          for i in range(args.n_envs)])
+    env_kwargs = dict(
+        target_speed=args.target_speed, trot_symmetry_weight=args.trot_weight,
+        foot_clearance_weight=args.foot_clearance_weight, heading_weight=args.heading_weight,
+        lateral_position_weight=args.lateral_position_weight,
+        max_foot_duty_cycle=args.max_foot_duty_cycle, min_foot_duty_cycle=args.min_foot_duty_cycle,
+        foot_duty_weight=args.foot_duty_weight, gait_period=args.gait_period, gait_style=args.gait_style,
+        phase_match_weight=initial_phase_match_weight, air_time_weight=args.air_time_weight,
+        target_air_time=args.target_air_time, use_gait_reference=args.use_gait_reference,
+        use_calf_reference=args.use_calf_reference, gait_swing_amplitude=args.gait_swing_amplitude,
+        thigh_residual_scale=args.thigh_residual_scale, calf_lift_amplitude=args.calf_lift_amplitude,
+        calf_residual_scale=args.calf_residual_scale, kp=args.kp, kd=args.kd,
+    )
+    if run_dir:
+        import json
+        with open(os.path.join(run_dir, "args.json"), "w") as f:
+            json.dump(vars(args), f, indent=2)
+        with open(os.path.join(run_dir, "env_kwargs.json"), "w") as f:
+            json.dump(env_kwargs, f, indent=2)
+    env = SubprocVecEnv([make_env(i, args.seed, env_kwargs) for i in range(args.n_envs)])
     env = VecMonitor(env)
     env = VecNormalize(env, norm_obs=True, norm_reward=True, clip_obs=10.0, gamma=0.99)
 
@@ -443,8 +437,8 @@ def main():
     stamped_name = f"go1_flat_final_{model.num_timesteps}"
     model.save(os.path.join(CKPT_DIR, stamped_name))
     env.save(os.path.join(CKPT_DIR, f"vecnormalize_{model.num_timesteps}.pkl"))
-    print(f"Training complete. Saved to checkpoints/go1_flat_final.zip "
-          f"(and checkpoints/{stamped_name}.zip, which won't be overwritten by future runs)")
+    print(f"Training complete. Saved to {CKPT_DIR}/go1_flat_final.zip "
+          f"(and {CKPT_DIR}/{stamped_name}.zip, which won't be overwritten by future runs)")
 
 
 if __name__ == "__main__":
