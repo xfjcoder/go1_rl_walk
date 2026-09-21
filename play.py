@@ -66,6 +66,7 @@ def main():
         model_path = args.model
     if args.target_speed is not None:
         env_kwargs["target_speed"] = args.target_speed
+    env_kwargs["command_speed_range"] = None      # play at one fixed command (--target-speed, else the run's)
     env_kwargs.setdefault("target_speed", 1.0)
 
     def make_env():

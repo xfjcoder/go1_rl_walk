@@ -13,6 +13,9 @@ After training, watch the policy:
 """
 import argparse
 import os
+import re
+
+import numpy as np
 
 from stable_baselines3 import PPO
 from stable_baselines3.common.vec_env import SubprocVecEnv, VecNormalize, VecMonitor
@@ -121,6 +124,44 @@ class RewardWarmupCallback(BaseCallback):
         return True
 
 
+class SpeedCurriculumCallback(BaseCallback):
+    """
+    Ramp the upper end of the per-episode command-speed range from `v_start` to `v_final`
+    over `ramp_steps` (counted from the start of THIS run, so it also works on --resume).
+    Each env samples target_speed ~ U(range_min, speed_max_current) at every reset.
+    """
+    def __init__(self, v_start: float, v_final: float, ramp_steps: int, check_every: int = 4096):
+        super().__init__(0)
+        self.v_start, self.v_final = v_start, v_final
+        self.ramp_steps, self.check_every = max(ramp_steps, 1), check_every
+        self._t0 = 0
+
+    def _on_training_start(self) -> None:
+        self._t0 = self.num_timesteps
+
+    def _on_step(self) -> bool:
+        if self.n_calls % self.check_every == 0:
+            progress = min(1.0, (self.num_timesteps - self._t0) / self.ramp_steps)
+            v = self.v_start + progress * (self.v_final - self.v_start)
+            self.training_env.set_attr("speed_max_current", v)
+            self.logger.record("curriculum/speed_max", v)
+        return True
+
+
+def vecnormalize_path_for(checkpoint_zip: str):
+    """Matching VecNormalize stats file for a checkpoint zip saved by this script."""
+    d, base = os.path.split(checkpoint_zip)
+    m = re.match(r"go1_flat_(\d+)_steps\.zip$", base)
+    if m:
+        return os.path.join(d, f"go1_flat_vecnormalize_{m.group(1)}_steps.pkl")
+    m = re.match(r"go1_flat_final_(\d+)\.zip$", base)
+    if m:
+        return os.path.join(d, f"vecnormalize_{m.group(1)}.pkl")
+    if base == "go1_flat_final.zip":
+        return os.path.join(d, "vecnormalize_final.pkl")
+    return None
+
+
 class RewardComponentLoggingCallback(BaseCallback):
     """
     Logs the mean of each individual reward term (velocity, torque, gait,
@@ -217,6 +258,24 @@ def main():
     parser.add_argument("--body-frame-velocity", action=argparse.BooleanOptionalAction, default=False,
                          help="Track forward velocity / penalize sideways velocity in the body frame "
                               "instead of the world frame (stops rewarding off-axis drift).")
+    parser.add_argument("--speed-range-min", type=float, default=None,
+                         help="Enable per-episode command sampling: target_speed ~ U(min, speed_max_current). "
+                              "Needs --speed-range-max. Default: fixed --target-speed.")
+    parser.add_argument("--speed-range-max", type=float, default=1.0,
+                         help="Final upper end of the sampled command range (m/s).")
+    parser.add_argument("--speed-curriculum-start", type=float, default=0.3,
+                         help="Upper end of the command range at the start of the run; ramps linearly to "
+                              "--speed-range-max over --speed-curriculum-steps.")
+    parser.add_argument("--speed-curriculum-steps", type=int, default=8_000_000)
+    parser.add_argument("--gait-period-fast", type=float, default=None,
+                         help="Trot-clock period (s) at 1.0 m/s; the period interpolates linearly from "
+                              "--gait-period (at 0.3 m/s) to this. Default: fixed period.")
+    parser.add_argument("--lateral-tracking-weight", type=float, default=0.0,
+                         help="Reward exp(-(v_side/sigma)^2) for zero sideways velocity (fixes crabbing).")
+    parser.add_argument("--lateral-tracking-sigma", type=float, default=0.1)
+    parser.add_argument("--resume-log-std", type=float, default=None,
+                         help="On --resume, reset the policy's log action std to this value (re-opens "
+                              "exploration when the task changes, e.g. -1.6 = std 0.2).")
     parser.add_argument("--air-time-cap", action=argparse.BooleanOptionalAction, default=False,
                          help="Cap the touchdown air-time credit at --target-air-time so a single long "
                               "lift can't out-earn normal steps.")
@@ -376,6 +435,11 @@ def main():
         lateral_position_weight=args.lateral_position_weight,
         body_frame_velocity=args.body_frame_velocity, yaw_rate_weight=args.yaw_rate_weight,
         air_time_cap=args.air_time_cap,
+        command_speed_range=([args.speed_range_min, args.speed_range_max]
+                             if args.speed_range_min is not None else None),
+        gait_period_fast=args.gait_period_fast,
+        lateral_tracking_weight=args.lateral_tracking_weight,
+        lateral_tracking_sigma=args.lateral_tracking_sigma,
         max_foot_duty_cycle=args.max_foot_duty_cycle, min_foot_duty_cycle=args.min_foot_duty_cycle,
         foot_duty_weight=args.foot_duty_weight, gait_period=args.gait_period, gait_style=args.gait_style,
         phase_match_weight=initial_phase_match_weight, air_time_weight=args.air_time_weight,
@@ -391,8 +455,20 @@ def main():
         with open(os.path.join(run_dir, "env_kwargs.json"), "w") as f:
             json.dump(env_kwargs, f, indent=2)
     env = SubprocVecEnv([make_env(i, args.seed, env_kwargs) for i in range(args.n_envs)])
+    if args.speed_range_min is not None:
+        env.set_attr("speed_max_current", args.speed_curriculum_start)
     env = VecMonitor(env)
-    env = VecNormalize(env, norm_obs=True, norm_reward=True, clip_obs=10.0, gamma=0.99)
+    vec_path = vecnormalize_path_for(args.resume) if args.resume else None
+    if vec_path and os.path.exists(vec_path):
+        # Keep the observation/reward normalization the policy was trained with; a fresh VecNormalize
+        # would feed a resumed policy differently scaled inputs until its running stats caught up.
+        env = VecNormalize.load(vec_path, env)
+        env.training, env.norm_obs, env.norm_reward = True, True, True
+        print(f"Loaded VecNormalize stats from {vec_path}")
+    else:
+        if args.resume:
+            print("WARNING: no VecNormalize stats found next to the resume checkpoint; starting fresh.")
+        env = VecNormalize(env, norm_obs=True, norm_reward=True, clip_obs=10.0, gamma=0.99)
 
     policy_kwargs = dict(net_arch=dict(pi=[256, 256, 128], vf=[256, 256, 128]),
                          log_std_init=args.log_std_init)
@@ -402,6 +478,9 @@ def main():
         model.ent_coef = args.ent_coef  # allow overriding exploration on resume, e.g. to fix a
                                          # gait that converged asymmetrically due to ent_coef=0.0
         model.lr_schedule = get_schedule_fn(linear_schedule(args.learning_rate))
+        if args.resume_log_std is not None:
+            model.policy.log_std.data.fill_(args.resume_log_std)
+            print(f"Reset policy log_std to {args.resume_log_std} (std {np.exp(args.resume_log_std):.2f})")
         print(f"Resumed from {args.resume} (ent_coef={args.ent_coef}, "
               f"learning_rate decaying from {args.learning_rate} over this resume's steps). "
               f"NOTE: --use-sde is ignored on resume -- SDE on/off is part of the loaded "
@@ -437,6 +516,9 @@ def main():
     std_guard = StdGuardCallback(max_std=1.5)
     reward_logger = RewardComponentLoggingCallback()
     callbacks = [checkpoint_callback, std_guard, reward_logger]
+    if args.speed_range_min is not None:
+        callbacks.append(SpeedCurriculumCallback(args.speed_curriculum_start, args.speed_range_max,
+                                                 args.speed_curriculum_steps))
     if args.phase_match_warmup_steps > 0:
         callbacks.append(RewardWarmupCallback(
             attr_name="phase_match_weight",

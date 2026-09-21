@@ -81,7 +81,9 @@ def main():
     ap.add_argument("--model", default=None, help="checkpoint name inside <run-dir>/checkpoints (no .zip)")
     ap.add_argument("--episodes", type=int, default=16)
     ap.add_argument("--seconds", type=float, default=20.0)
-    ap.add_argument("--target-speed", type=float, default=None, help="override the run's command speed")
+    ap.add_argument("--target-speed", type=float, nargs="+", default=None,
+                    help="command speed(s) to evaluate at. Default: the run's fixed speed, or 0.3 0.5 0.8 1.0 "
+                         "for a run trained with a command-speed range.")
     args = ap.parse_args()
 
     ckpt_dir = os.path.join(args.run_dir, "checkpoints")
@@ -92,12 +94,18 @@ def main():
     with open(os.path.join(args.run_dir, "env_kwargs.json")) as f:
         env_kwargs = json.load(f)
     if args.target_speed is not None:
-        env_kwargs["target_speed"] = args.target_speed
-    print(f"model={model_path}.zip  target_speed={env_kwargs['target_speed']}  kp={env_kwargs['kp']} kd={env_kwargs['kd']}")
-    e = evaluate(model_path, vec, env_kwargs, args.episodes, args.seconds)
-    print(f"episodes={e['episodes']}  fall_rate={e['fall_rate']:.2f}  survival={e['mean_survival_s']:.1f}s/{args.seconds:.0f}s")
-    print(f"forward speed (m/s): mean={e['speed_mean']:+.3f} median={e['speed_median']:+.3f} survivors={e['speed_survivors']:+.3f}"
-          f"   |y|={e['abs_y_mean']:.2f} m  |yaw|={e['abs_yaw_mean']:.1f} deg")
+        speeds = args.target_speed
+    elif env_kwargs.get("command_speed_range"):
+        speeds = [0.3, 0.5, 0.8, 1.0]
+    else:
+        speeds = [env_kwargs["target_speed"]]
+    print(f"model={model_path}.zip  kp={env_kwargs['kp']} kd={env_kwargs['kd']}")
+    for v in speeds:
+        kw = dict(env_kwargs, target_speed=v, command_speed_range=None)   # fixed command per evaluation
+        e = evaluate(model_path, vec, kw, args.episodes, args.seconds)
+        print(f"command {v:.2f} m/s: episodes={e['episodes']}  fall_rate={e['fall_rate']:.2f}  survival={e['mean_survival_s']:.1f}s/{args.seconds:.0f}s"
+              f"  speed mean={e['speed_mean']:+.3f} median={e['speed_median']:+.3f}"
+              f"  |y|={e['abs_y_mean']:.2f} m  |yaw|={e['abs_yaw_mean']:.1f} deg")
 
 
 if __name__ == "__main__":

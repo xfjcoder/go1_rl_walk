@@ -91,6 +91,16 @@ class Go1FlatEnv(gym.Env):
                                                # the trunk points) instead of world x/y. With world-frame
                                                # tracking a policy can veer off-axis (pilot D ended at -19 deg
                                                # yaw) and still be rewarded for world-x progress.
+        command_speed_range: tuple | None = None,  # (lo, hi): sample target_speed ~ U(lo, hi_now) every reset.
+                                               # hi_now starts at hi and can be ramped by a curriculum callback
+                                               # via the speed_max_current attribute. None = fixed target_speed.
+        gait_period_fast: float | None = None,  # if set, the trot clock period shrinks linearly from gait_period
+                                               # (at 0.3 m/s) to this value (at 1.0 m/s), clipped outside, so faster
+                                               # commands get a faster step rate. None = fixed gait_period.
+        lateral_tracking_weight: float = 0.0,  # reward exp(-(v_side/sigma)^2) for zero sideways velocity (body frame
+                                               # if body_frame_velocity). Fixes crabbing: h_clock drifted 4.6 cm/s
+                                               # sideways while heading stayed straight.
+        lateral_tracking_sigma: float = 0.1,
         air_time_cap: bool = False,            # cap the touchdown air-time credit at target_air_time
                                                # (credit = min(air, target) - target <= 0). Uncapped, one long
                                                # 457 ms lift of a single leg out-earned several normal steps
@@ -216,6 +226,12 @@ class Go1FlatEnv(gym.Env):
         self.body_frame_velocity = body_frame_velocity
         self.yaw_rate_weight = yaw_rate_weight
         self.air_time_cap = air_time_cap
+        self.command_speed_range = tuple(command_speed_range) if command_speed_range else None
+        self.speed_max_current = self.command_speed_range[1] if self.command_speed_range else None
+        self.gait_period_fast = gait_period_fast
+        self.lateral_tracking_weight = lateral_tracking_weight
+        self.lateral_tracking_sigma = lateral_tracking_sigma
+        self._episode_gait_period = gait_period
         self.lateral_position_weight = lateral_position_weight
         self.max_foot_duty_cycle = max_foot_duty_cycle
         self.min_foot_duty_cycle = min_foot_duty_cycle
@@ -318,6 +334,11 @@ class Go1FlatEnv(gym.Env):
         super().reset(seed=seed)
         if seed is not None:
             self._rng = np.random.default_rng(seed)
+
+        if self.command_speed_range is not None:
+            lo = self.command_speed_range[0]
+            self.target_speed = float(self._rng.uniform(lo, max(self.speed_max_current, lo)))
+        self._episode_gait_period = self._period_for_speed(self.target_speed)
 
         mujoco.mj_resetData(self.model, self.data)
         key_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_KEY, "stand")
@@ -425,10 +446,16 @@ class Go1FlatEnv(gym.Env):
                     touches[hit[0]] = True
         return touches
 
+    def _period_for_speed(self, speed: float) -> float:
+        if self.gait_period_fast is None:
+            return self.gait_period
+        f = float(np.clip((speed - 0.3) / 0.7, 0.0, 1.0))
+        return (1 - f) * self.gait_period + f * self.gait_period_fast
+
     def _gait_phase(self) -> float:
         """Where we are in the prescribed stride cycle, in [0, 1)."""
         episode_time = self._step_count / self.control_hz
-        return (episode_time % self.gait_period) / self.gait_period
+        return (episode_time % self._episode_gait_period) / self._episode_gait_period
 
     # ------------------------------------------------------------------ #
     # Observation
@@ -478,6 +505,7 @@ class Go1FlatEnv(gym.Env):
         # 2. Penalize lateral / vertical VELOCITY drift
         r_lateral = -0.5 * (lin_vel[1] ** 2 + lin_vel[2] ** 2)
         r_yaw_rate = -self.yaw_rate_weight * ang_vel[2] ** 2
+        r_lat_track = self.lateral_tracking_weight * float(np.exp(-(lin_vel[1] / self.lateral_tracking_sigma) ** 2))
 
         # 2b. Penalize lateral / heading POSITION drift directly. The velocity term
         # above only discourages instantaneous sideways speed -- a small, constant
@@ -644,6 +672,7 @@ class Go1FlatEnv(gym.Env):
             velocity=r_velocity * 1.5,
             lateral=r_lateral,
             yaw_rate=r_yaw_rate,
+            lateral_tracking=r_lat_track,
             heading=r_heading,
             orientation=r_orientation,
             ang_vel=r_ang_vel,

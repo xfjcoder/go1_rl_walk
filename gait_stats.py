@@ -26,6 +26,7 @@ def main():
     ap.add_argument("--run-dir", required=True)
     ap.add_argument("--model", default=None)
     ap.add_argument("--seed", type=int, default=1)
+    ap.add_argument("--target-speed", type=float, default=None, help="fixed command speed (default: the run's)")
     ap.add_argument("--seconds", type=float, default=20.0)
     args = ap.parse_args()
 
@@ -34,6 +35,9 @@ def main():
     m = re.search(r"go1_flat_(\d+)_steps$", os.path.basename(path))
     vec = os.path.join(ckpt, f"go1_flat_vecnormalize_{m.group(1)}_steps.pkl") if m else os.path.join(ckpt, "vecnormalize_final.pkl")
     kw = json.load(open(os.path.join(args.run_dir, "env_kwargs.json")))
+    if args.target_speed is not None:
+        kw["target_speed"] = args.target_speed
+    kw["command_speed_range"] = None      # fixed command for diagnostics
     model = PPO.load(path, device="cpu")
     env = DummyVecEnv([lambda: Go1FlatEnv(render_mode=None, domain_randomize=True, **kw)])
     env.seed(args.seed)
@@ -56,7 +60,7 @@ def main():
                                      e.data.sensordata[e._imu_vel_adr:e._imu_vel_adr + 3]))
     T, fx, fz, vb = np.array(touch), np.array(fx), np.array(fz), np.array(vb)
     n = len(T)
-    print(f"{path}.zip  seed={args.seed}  steps={n}  x={info[0]['base_pos'][0]:+.2f} y={ys[-1]:+.2f} yaw={yaws[-1]:+.1f}deg  "
+    print(f"command={kw['target_speed']:.2f} m/s  {path}.zip  seed={args.seed}  steps={n}  x={info[0]['base_pos'][0]:+.2f} y={ys[-1]:+.2f} yaw={yaws[-1]:+.1f}deg  "
           f"body vx={vb[:, 0].mean():+.3f} vy={vb[:, 1].mean():+.3f}")
     print("contact timeline (1 char = 0.02 s, # = on ground), t=10..11.5 s:")
     for k in range(4):
