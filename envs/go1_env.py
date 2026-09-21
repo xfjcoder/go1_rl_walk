@@ -21,6 +21,15 @@ from gymnasium import spaces
 ASSET_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "assets")
 DEFAULT_XML = os.path.join(ASSET_DIR, "go1.xml")
 
+# Rough-terrain heightfield (only injected into the model when terrain is enabled; the flat env is unchanged).
+# Grid covers x in [-2.5, 22.5] m and y in [-3, 3] m at 5 cm cells, so a 20 s episode at 1 m/s stays on it.
+HF_CELL = 0.05
+HF_CX = 10.0          # hfield geom centre x (m)
+HF_HALF_X = 12.5
+HF_HALF_Y = 3.0
+HF_ELEV = 0.15        # elevation_z: max terrain height (m); hfield_data in [0,1] scales to [0, HF_ELEV]
+HF_PAD_START, HF_PAD_END = 0.5, 1.5   # x range over which terrain fades in (flat start pad before it)
+
 JOINT_NAMES = [
     "FR_hip_joint", "FR_thigh_joint", "FR_calf_joint",
     "FL_hip_joint", "FL_thigh_joint", "FL_calf_joint",
@@ -91,6 +100,14 @@ class Go1FlatEnv(gym.Env):
                                                # the trunk points) instead of world x/y. With world-frame
                                                # tracking a policy can veer off-axis (pilot D ended at -19 deg
                                                # yaw) and still be rewarded for world-x progress.
+        terrain_amplitude_range: tuple | None = None,  # (lo, hi): enable a random heightfield; each reset samples
+                                               # amplitude ~ U(lo, terrain_amp_max_current). The current max
+                                               # starts at hi and can be ramped by a curriculum callback.
+        terrain_amplitude: float | None = None,  # fixed amplitude (m, peak-to-peak) -- for evaluation
+        friction_range: tuple = (0.6, 1.1),    # floor / terrain sliding friction sampled each reset
+        mass_scale_range: tuple | None = None,  # trunk mass (and inertia) scale sampled each reset
+        push_velocity: float = 0.0,            # m/s: every 3-6 s add a random horizontal velocity kick of up
+                                               # to +-this to the trunk (0 = off)
         command_speed_range: tuple | None = None,  # (lo, hi): sample target_speed ~ U(lo, hi_now) every reset.
                                                # hi_now starts at hi and can be ramped by a curriculum callback
                                                # via the speed_max_current attribute. None = fixed target_speed.
@@ -227,6 +244,13 @@ class Go1FlatEnv(gym.Env):
         self.yaw_rate_weight = yaw_rate_weight
         self.air_time_cap = air_time_cap
         self.command_speed_range = tuple(command_speed_range) if command_speed_range else None
+        self.terrain_amplitude_range = tuple(terrain_amplitude_range) if terrain_amplitude_range else None
+        self.terrain_amplitude = terrain_amplitude
+        self.terrain_amp_max_current = self.terrain_amplitude_range[1] if self.terrain_amplitude_range else None
+        self.terrain_enabled = self.terrain_amplitude_range is not None or terrain_amplitude is not None
+        self.friction_range = tuple(friction_range)
+        self.mass_scale_range = tuple(mass_scale_range) if mass_scale_range else None
+        self.push_velocity = push_velocity
         self.speed_max_current = self.command_speed_range[1] if self.command_speed_range else None
         self.gait_period_fast = gait_period_fast
         self.lateral_tracking_weight = lateral_tracking_weight
@@ -252,7 +276,10 @@ class Go1FlatEnv(gym.Env):
         self._kd_value = kd
         self.camera = camera
 
-        self.model = mujoco.MjModel.from_xml_path(xml_path)
+        if self.terrain_enabled:
+            self.model = mujoco.MjModel.from_xml_string(self._terrain_xml(xml_path))
+        else:
+            self.model = mujoco.MjModel.from_xml_path(xml_path)
         self.data = mujoco.MjData(self.model)
 
         self.sim_dt = self.model.opt.timestep
@@ -319,6 +346,22 @@ class Go1FlatEnv(gym.Env):
                                                                     # on the very first step after reset
         self._rng = np.random.default_rng()
 
+        # terrain / randomization state
+        self._floor_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_GEOM, "floor")
+        self._trunk_body = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, "trunk")
+        self._nominal_trunk_mass = float(self.model.body_mass[self._trunk_body])
+        self._nominal_trunk_inertia = self.model.body_inertia[self._trunk_body].copy()
+        self._terrain_h = None                    # (nrow, ncol) heights in metres, None on flat ground
+        self._terrain_geom = None
+        if self.terrain_enabled:
+            self._terrain_geom = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_GEOM, "terrain")
+            hid = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_HFIELD, "terrain")
+            self._hf_nrow, self._hf_ncol = int(self.model.hfield_nrow[hid]), int(self.model.hfield_ncol[hid])
+            self._hf_adr = int(self.model.hfield_adr[hid])
+            self._hf_x0, self._hf_y0 = HF_CX - HF_HALF_X, -HF_HALF_Y
+            self._terrain_h = np.zeros((self._hf_nrow, self._hf_ncol))
+        self._next_push_step = 10**9
+
         self._viewer = None
         if render_mode == "human":
             from mujoco import viewer as mj_viewer
@@ -340,6 +383,20 @@ class Go1FlatEnv(gym.Env):
             self.target_speed = float(self._rng.uniform(lo, max(self.speed_max_current, lo)))
         self._episode_gait_period = self._period_for_speed(self.target_speed)
 
+        if self.mass_scale_range is not None:
+            sc = float(self._rng.uniform(*self.mass_scale_range))
+            self.model.body_mass[self._trunk_body] = self._nominal_trunk_mass * sc
+            self.model.body_inertia[self._trunk_body] = self._nominal_trunk_inertia * sc
+            mujoco.mj_setConst(self.model, self.data)
+        if self.terrain_enabled:
+            if self.terrain_amplitude is not None:
+                amp = self.terrain_amplitude
+            else:
+                amp = float(self._rng.uniform(self.terrain_amplitude_range[0],
+                                              max(self.terrain_amp_max_current, self.terrain_amplitude_range[0])))
+            self._generate_terrain(amp)
+        self._next_push_step = int(self._rng.integers(150, 300)) if self.push_velocity > 0 else 10**9
+
         mujoco.mj_resetData(self.model, self.data)
         key_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_KEY, "stand")
         mujoco.mj_resetDataKeyframe(self.model, self.data, key_id)
@@ -353,10 +410,27 @@ class Go1FlatEnv(gym.Env):
             yaw = self._rng.uniform(-0.1, 0.1)
             self.data.qpos[3:7] = self._quat_from_yaw(yaw)
             # Randomize floor friction slightly (helps sim-to-real transfer)
-            floor_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_GEOM, "floor")
-            self.model.geom_friction[floor_id, 0] = self._rng.uniform(0.6, 1.1)
+            mu = self._rng.uniform(*self.friction_range)
+            self.model.geom_friction[self._floor_id, 0] = mu
+            if self._terrain_geom is not None:
+                self.model.geom_friction[self._terrain_geom, 0] = mu
+                # The foot geoms have priority=1, so THEIR friction (1.0) overrides the floor's in every
+                # foot contact -- randomizing only the floor never touched the feet. On terrain runs randomize
+                # the foot friction too (flat runs keep the old behaviour so they stay reproducible).
+                self.model.geom_friction[self._foot_geom_ids, 0] = mu
 
         mujoco.mj_forward(self.model, self.data)
+        if self.terrain_enabled:
+            # The stand keyframe (and its random joint jitter) leaves the foot-sphere centres BELOW the surface
+            # (z = -0.002 .. -0.012 m). A plane pushes buried feet out gently, but a heightfield contact reacts
+            # violently (37 contacts, ~11 kN per foot on step 0). Lift the trunk so every sole starts just above
+            # the local terrain.
+            foot = self.data.site_xpos[self._foot_site_ids]
+            sole = foot[:, 2] - self._foot_radius - self._terrain_height(foot[:, 0], foot[:, 1])
+            lift = 0.004 - float(sole.min())
+            if lift > 0:
+                self.data.qpos[2] += lift
+                mujoco.mj_forward(self.model, self.data)
         self._prev_action[:] = 0.0
         self._step_count = 0
         self._foot_contact_ema[:] = 0.0
@@ -369,6 +443,9 @@ class Go1FlatEnv(gym.Env):
 
     def step(self, action):
         action = np.clip(action, -1.0, 1.0).astype(np.float32)
+        if self._step_count == self._next_push_step:
+            self.data.qvel[0:2] += self._rng.uniform(-self.push_velocity, self.push_velocity, 2)
+            self._next_push_step += int(self._rng.integers(150, 300))
         target_qpos = DEFAULT_JOINT_POS + self.action_scale * action
 
         if self.use_gait_reference:
@@ -436,15 +513,70 @@ class Go1FlatEnv(gym.Env):
     def _foot_contacts(self) -> np.ndarray:
         """bool[4] (FR, FL, RR, RL): foot has a contact with normal force > contact_force_threshold.
         Uses real MuJoCo contacts, so it stays correct on rough terrain (unlike a height threshold)."""
-        touches = np.zeros(4, dtype=bool)
+        force = np.zeros(4)
         for i in range(self.data.ncon):
             c = self.data.contact[i]
             hit = np.flatnonzero((self._foot_geom_ids == c.geom1) | (self._foot_geom_ids == c.geom2))
-            if hit.size and not touches[hit[0]]:
+            if hit.size:
                 mujoco.mj_contactForce(self.model, self.data, i, self._contact_force)
-                if self._contact_force[0] > self.contact_force_threshold:
-                    touches[hit[0]] = True
-        return touches
+                force[hit[0]] += self._contact_force[0]     # a foot on a heightfield can have several contact points
+        return force > self.contact_force_threshold
+
+    # ------------------------------------------------------------------ #
+    # Rough terrain (heightfield)
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def _terrain_xml(xml_path: str) -> str:
+        """The flat model with a random-heightfield geom injected. The floor plane drops 5 cm as a safety net so
+        it never coincides with the terrain surface (heights are >= 0)."""
+        with open(xml_path) as f:
+            xml = f.read()
+        nrow, ncol = int(round(2 * HF_HALF_Y / HF_CELL)) + 1, int(round(2 * HF_HALF_X / HF_CELL)) + 1
+        edits = [
+            ("</asset>", f'<hfield name="terrain" nrow="{nrow}" ncol="{ncol}" '
+                         f'size="{HF_HALF_X} {HF_HALF_Y} {HF_ELEV} 0.1"/>\n  </asset>'),
+            ('<geom name="floor" type="plane"', '<geom name="floor" pos="0 0 -0.05" type="plane"'),
+            ('<light name="sun"', f'<geom name="terrain" type="hfield" hfield="terrain" pos="{HF_CX} 0 0" '
+                                  f'rgba="0.36 0.5 0.36 1" friction="0.9 0.02 0.01" condim="3"/>\n    <light name="sun"'),
+        ]
+        for old, new in edits:
+            assert xml.count(old) == 1, f"cannot inject terrain: {old!r} not found exactly once in {xml_path}"
+            xml = xml.replace(old, new)
+        return xml
+
+    def _generate_terrain(self, amp: float):
+        """New random terrain: bilinearly-interpolated uniform noise in [0, amp] with a random feature size
+        (15 cm bumps up to 1 m undulations), faded in after a flat start pad."""
+        assert amp <= HF_ELEV, f"terrain amplitude {amp} exceeds the hfield's max elevation {HF_ELEV}"
+        nrow, ncol = self._hf_nrow, self._hf_ncol
+        if amp <= 1e-6:
+            h = np.zeros((nrow, ncol))
+        else:
+            spacing = float(np.exp(self._rng.uniform(np.log(0.15), np.log(1.0))))
+            xs, ys = np.arange(ncol) * HF_CELL / spacing, np.arange(nrow) * HF_CELL / spacing
+            coarse = self._rng.uniform(0.0, 1.0, (int(ys[-1]) + 2, int(xs[-1]) + 2))
+            i0 = np.floor(xs).astype(int)
+            tmp = coarse[:, i0] * (1 - (xs - i0)) + coarse[:, i0 + 1] * (xs - i0)
+            j0 = np.floor(ys).astype(int)
+            wy = (ys - j0)[:, None]
+            h01 = tmp[j0, :] * (1 - wy) + tmp[j0 + 1, :] * wy
+            xw = self._hf_x0 + np.arange(ncol) * HF_CELL
+            t = np.clip((xw - HF_PAD_START) / (HF_PAD_END - HF_PAD_START), 0.0, 1.0)
+            h = amp * h01 * (t * t * (3 - 2 * t))[None, :]
+        self._terrain_h = h
+        self.model.hfield_data[self._hf_adr:self._hf_adr + nrow * ncol] = (h / HF_ELEV).ravel()
+
+    def _terrain_height(self, x, y):
+        """Terrain surface height (m) at world (x, y); scalars or arrays. Zero on flat ground."""
+        if self._terrain_h is None:
+            return np.zeros(np.shape(x)) if np.ndim(x) else 0.0
+        fx = np.clip((np.asarray(x) - self._hf_x0) / HF_CELL, 0.0, self._hf_ncol - 1 - 1e-9)
+        fy = np.clip((np.asarray(y) - self._hf_y0) / HF_CELL, 0.0, self._hf_nrow - 1 - 1e-9)
+        c0, r0 = np.floor(fx).astype(int), np.floor(fy).astype(int)
+        wx, wy = fx - c0, fy - r0
+        h = self._terrain_h
+        return (h[r0, c0] * (1 - wx) * (1 - wy) + h[r0, c0 + 1] * wx * (1 - wy)
+                + h[r0 + 1, c0] * (1 - wx) * wy + h[r0 + 1, c0 + 1] * wx * wy)
 
     def _period_for_speed(self, speed: float) -> float:
         if self.gait_period_fast is None:
@@ -546,7 +678,8 @@ class Go1FlatEnv(gym.Env):
         # shared by every term below (gait, trot_symmetry, foot_duty, phase_match, air_time).
         # A 1 N threshold ignores momentary grazes. (An earlier height-based definition used a
         # threshold below the foot's resting height, so standing feet were counted as airborne.)
-        foot_heights_for_contact = self.data.site_xpos[self._foot_site_ids, 2] - self._foot_radius  # sole height
+        foot_xyz = self.data.site_xpos[self._foot_site_ids]
+        foot_heights_for_contact = foot_xyz[:, 2] - self._foot_radius - self._terrain_height(foot_xyz[:, 0], foot_xyz[:, 1])  # sole height above the ground
         touches = self._foot_contacts()
         n_contacts = touches.sum()
 
@@ -665,7 +798,7 @@ class Go1FlatEnv(gym.Env):
         r_alive = 0.2
 
         # 9. Height maintenance (target ~0.30-0.33m standing height)
-        height = self.data.qpos[2]
+        height = self.data.qpos[2] - self._terrain_height(self.data.qpos[0], self.data.qpos[1])
         r_height = -2.0 * (height - 0.30) ** 2 if height < 0.30 else 0.0
 
         weights_applied = dict(
@@ -697,8 +830,9 @@ class Go1FlatEnv(gym.Env):
         quat = self.data.sensordata[self._imu_quat_adr:self._imu_quat_adr + 4]
         gravity_vec = self._quat_rotate_inv(quat, np.array([0.0, 0.0, -1.0]))
         fell_over = gravity_vec[2] > -0.5  # trunk tilted past ~60 deg from vertical
-        too_low = self.data.qpos[2] < 0.15
-        too_high = self.data.qpos[2] > 0.6
+        trunk_h = self.data.qpos[2] - self._terrain_height(self.data.qpos[0], self.data.qpos[1])
+        too_low = trunk_h < 0.15
+        too_high = trunk_h > 0.6
         return bool(fell_over or too_low or too_high)
 
     # ------------------------------------------------------------------ #

@@ -26,6 +26,7 @@ def main():
     ap.add_argument("--run-dir", required=True)
     ap.add_argument("--model", default=None)
     ap.add_argument("--seed", type=int, default=1)
+    ap.add_argument("--terrain-amplitude", type=float, default=None, help="evaluate on rough terrain of this amplitude (m)")
     ap.add_argument("--target-speed", type=float, default=None, help="fixed command speed (default: the run's)")
     ap.add_argument("--seconds", type=float, default=20.0)
     args = ap.parse_args()
@@ -38,6 +39,8 @@ def main():
     if args.target_speed is not None:
         kw["target_speed"] = args.target_speed
     kw["command_speed_range"] = None      # fixed command for diagnostics
+    kw["terrain_amplitude_range"] = None
+    kw["terrain_amplitude"] = args.terrain_amplitude
     model = PPO.load(path, device="cpu")
     env = DummyVecEnv([lambda: Go1FlatEnv(render_mode=None, domain_randomize=True, **kw)])
     env.seed(args.seed)

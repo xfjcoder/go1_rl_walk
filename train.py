@@ -124,14 +124,17 @@ class RewardWarmupCallback(BaseCallback):
         return True
 
 
-class SpeedCurriculumCallback(BaseCallback):
+class RampCallback(BaseCallback):
     """
-    Ramp the upper end of the per-episode command-speed range from `v_start` to `v_final`
-    over `ramp_steps` (counted from the start of THIS run, so it also works on --resume).
-    Each env samples target_speed ~ U(range_min, speed_max_current) at every reset.
+    Linearly ramp an env attribute from `v_start` to `v_final` over `ramp_steps`, counted from
+    the start of THIS run (so it also works on --resume), and log it as curriculum/<log_name>.
+    Used for the upper end of the sampled command-speed range (speed_max_current) and of the
+    sampled terrain amplitude (terrain_amp_max_current); envs sample U(range_min, current) at each reset.
     """
-    def __init__(self, v_start: float, v_final: float, ramp_steps: int, check_every: int = 4096):
+    def __init__(self, attr: str, log_name: str, v_start: float, v_final: float, ramp_steps: int,
+                 check_every: int = 4096):
         super().__init__(0)
+        self.attr, self.log_name = attr, log_name
         self.v_start, self.v_final = v_start, v_final
         self.ramp_steps, self.check_every = max(ramp_steps, 1), check_every
         self._t0 = 0
@@ -143,8 +146,8 @@ class SpeedCurriculumCallback(BaseCallback):
         if self.n_calls % self.check_every == 0:
             progress = min(1.0, (self.num_timesteps - self._t0) / self.ramp_steps)
             v = self.v_start + progress * (self.v_final - self.v_start)
-            self.training_env.set_attr("speed_max_current", v)
-            self.logger.record("curriculum/speed_max", v)
+            self.training_env.set_attr(self.attr, v)
+            self.logger.record(f"curriculum/{self.log_name}", v)
         return True
 
 
@@ -267,6 +270,18 @@ def main():
                          help="Upper end of the command range at the start of the run; ramps linearly to "
                               "--speed-range-max over --speed-curriculum-steps.")
     parser.add_argument("--speed-curriculum-steps", type=int, default=8_000_000)
+    parser.add_argument("--terrain-amp-max", type=float, default=None,
+                         help="Enable rough terrain: each episode samples a heightfield amplitude "
+                              "(peak-to-peak, m) ~ U(0, current max). Final max amplitude, e.g. 0.08.")
+    parser.add_argument("--terrain-curriculum-start", type=float, default=0.0,
+                         help="Terrain amplitude max at the start of the run (m); ramps to --terrain-amp-max.")
+    parser.add_argument("--terrain-curriculum-steps", type=int, default=10_000_000)
+    parser.add_argument("--friction-range", type=float, nargs=2, default=(0.6, 1.1), metavar=("LO", "HI"),
+                         help="Floor/terrain friction sampled each episode.")
+    parser.add_argument("--mass-scale-range", type=float, nargs=2, default=None, metavar=("LO", "HI"),
+                         help="Trunk mass scale sampled each episode, e.g. 0.9 1.1.")
+    parser.add_argument("--push-velocity", type=float, default=0.0,
+                         help="Random horizontal velocity kick (+-m/s) applied to the trunk every 3-6 s.")
     parser.add_argument("--gait-period-fast", type=float, default=None,
                          help="Trot-clock period (s) at 1.0 m/s; the period interpolates linearly from "
                               "--gait-period (at 0.3 m/s) to this. Default: fixed period.")
@@ -438,6 +453,10 @@ def main():
         command_speed_range=([args.speed_range_min, args.speed_range_max]
                              if args.speed_range_min is not None else None),
         gait_period_fast=args.gait_period_fast,
+        terrain_amplitude_range=([0.0, args.terrain_amp_max] if args.terrain_amp_max is not None else None),
+        friction_range=list(args.friction_range),
+        mass_scale_range=list(args.mass_scale_range) if args.mass_scale_range else None,
+        push_velocity=args.push_velocity,
         lateral_tracking_weight=args.lateral_tracking_weight,
         lateral_tracking_sigma=args.lateral_tracking_sigma,
         max_foot_duty_cycle=args.max_foot_duty_cycle, min_foot_duty_cycle=args.min_foot_duty_cycle,
@@ -457,6 +476,8 @@ def main():
     env = SubprocVecEnv([make_env(i, args.seed, env_kwargs) for i in range(args.n_envs)])
     if args.speed_range_min is not None:
         env.set_attr("speed_max_current", args.speed_curriculum_start)
+    if args.terrain_amp_max is not None:
+        env.set_attr("terrain_amp_max_current", args.terrain_curriculum_start)
     env = VecMonitor(env)
     vec_path = vecnormalize_path_for(args.resume) if args.resume else None
     if vec_path and os.path.exists(vec_path):
@@ -517,8 +538,11 @@ def main():
     reward_logger = RewardComponentLoggingCallback()
     callbacks = [checkpoint_callback, std_guard, reward_logger]
     if args.speed_range_min is not None:
-        callbacks.append(SpeedCurriculumCallback(args.speed_curriculum_start, args.speed_range_max,
-                                                 args.speed_curriculum_steps))
+        callbacks.append(RampCallback("speed_max_current", "speed_max", args.speed_curriculum_start,
+                                      args.speed_range_max, args.speed_curriculum_steps))
+    if args.terrain_amp_max is not None:
+        callbacks.append(RampCallback("terrain_amp_max_current", "terrain_amp_max", args.terrain_curriculum_start,
+                                      args.terrain_amp_max, args.terrain_curriculum_steps))
     if args.phase_match_warmup_steps > 0:
         callbacks.append(RewardWarmupCallback(
             attr_name="phase_match_weight",
