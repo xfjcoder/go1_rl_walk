@@ -91,6 +91,10 @@ class Go1FlatEnv(gym.Env):
                                                # the trunk points) instead of world x/y. With world-frame
                                                # tracking a policy can veer off-axis (pilot D ended at -19 deg
                                                # yaw) and still be rewarded for world-x progress.
+        air_time_cap: bool = False,            # cap the touchdown air-time credit at target_air_time
+                                               # (credit = min(air, target) - target <= 0). Uncapped, one long
+                                               # 457 ms lift of a single leg out-earned several normal steps
+                                               # (run e_long_d: RR hovered, front feet shuffled 1-2 cm high).
         yaw_rate_weight: float = 0.0,          # penalty weight on yaw rate^2 (turning); ang_vel term already
                                                # covers roll/pitch/yaw rates weakly (0.05)
         max_foot_duty_cycle: float = 0.75,    # a foot averaging more ground-contact time than
@@ -211,6 +215,7 @@ class Go1FlatEnv(gym.Env):
         self.heading_weight = heading_weight
         self.body_frame_velocity = body_frame_velocity
         self.yaw_rate_weight = yaw_rate_weight
+        self.air_time_cap = air_time_cap
         self.lateral_position_weight = lateral_position_weight
         self.max_foot_duty_cycle = max_foot_duty_cycle
         self.min_foot_duty_cycle = min_foot_duty_cycle
@@ -525,8 +530,9 @@ class Go1FlatEnv(gym.Env):
         # up too long). The policy is free to find its own step frequency and timing, rather
         # than matching a fixed clock we picked without empirical grounding.
         touchdown = touches & (~self._prev_touches)
+        air = np.minimum(self._foot_air_time, self.target_air_time) if self.air_time_cap else self._foot_air_time
         r_air_time = self.air_time_weight * float(
-            np.sum(touchdown.astype(np.float32) * (self._foot_air_time - self.target_air_time))
+            np.sum(touchdown.astype(np.float32) * (air - self.target_air_time))
         )
         dt_control = 1.0 / self.control_hz
         self._foot_air_time = np.where(touches, 0.0, self._foot_air_time + dt_control)
