@@ -293,7 +293,13 @@ def main():
                               "run) -- a stiffer gain amplifies a still-learning policy's noisy "
                               "actions into violent torque. Back to the original safe default.")
     parser.add_argument("--kd", type=float, default=1.0, help="PD velocity gain, N*m*s/rad.")
-    parser.add_argument("--use-sde", action=argparse.BooleanOptionalAction, default=True,
+    parser.add_argument("--use-sde", action=argparse.BooleanOptionalAction, default=False,
+                         # NOTE (2026-09-20): default flipped to False. Measured on an UNTRAINED policy:
+                         # gSDE at log_std_init=0 knocked the robot over in ~0.7 s (its effective noise is
+                         # exp(log_std) x the 128-dim latent features, far larger than the logged std),
+                         # while plain Gaussian noise at std 0.22 stayed up ~19 s. Pilots with gSDE only
+                         # learned to lunge forward and fall. Turn it back on only with a much lower
+                         # --log-std-init (about -3).
                          help="Generalized State-Dependent Exploration: samples noise once per "
                               "sde-sample-freq steps as a function of state, producing temporally-"
                               "correlated exploration instead of independent per-step jitter. "
@@ -303,6 +309,11 @@ def main():
                          help="Resample SDE noise every N control steps. Lower = less risk of a "
                               "sustained bad-noise streak causing a fall; higher = more coherent "
                               "exploration of longer behaviors. At 50Hz, 4 steps = 0.08s.")
+    parser.add_argument("--log-std-init", type=float, default=-1.5,
+                         help="Initial log of the action std (std = exp(value)). The robot stands stably "
+                              "with zero action but is fragile to noise: untrained-policy survival was "
+                              "1.1 s at std 1.0, 4 s at 0.37, 19 s at 0.22 (no gSDE). -1.5 lets the policy "
+                              "start near the standing pose; PPO then widens/narrows it as needed.")
     parser.add_argument("--learning-rate", type=float, default=3e-4,
                          help="Peak learning rate. Decays linearly to ~0 over the run (see "
                               "linear_schedule) to counteract the approx_kl/clip_fraction blowup "
@@ -373,7 +384,8 @@ def main():
     env = VecMonitor(env)
     env = VecNormalize(env, norm_obs=True, norm_reward=True, clip_obs=10.0, gamma=0.99)
 
-    policy_kwargs = dict(net_arch=dict(pi=[256, 256, 128], vf=[256, 256, 128]))
+    policy_kwargs = dict(net_arch=dict(pi=[256, 256, 128], vf=[256, 256, 128]),
+                         log_std_init=args.log_std_init)
 
     if args.resume:
         model = PPO.load(args.resume, env=env, tensorboard_log=tb_log_dir)
