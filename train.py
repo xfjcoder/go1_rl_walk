@@ -214,6 +214,11 @@ def main():
                          help="Penalizes y-position drift from the start line, on top of the "
                               "existing lateral-velocity penalty (which only discourages "
                               "instantaneous sideways speed, not accumulated drift).")
+    parser.add_argument("--body-frame-velocity", action=argparse.BooleanOptionalAction, default=False,
+                         help="Track forward velocity / penalize sideways velocity in the body frame "
+                              "instead of the world frame (stops rewarding off-axis drift).")
+    parser.add_argument("--yaw-rate-weight", type=float, default=0.0,
+                         help="Penalty weight on yaw rate squared (discourages turning/veering).")
     parser.add_argument("--max-foot-duty-cycle", type=float, default=0.75,
                          help="A foot averaging more ground-contact time than this fraction "
                               "gets penalized regardless of other gait terms. Prevents a foot "
@@ -366,6 +371,7 @@ def main():
         target_speed=args.target_speed, trot_symmetry_weight=args.trot_weight,
         foot_clearance_weight=args.foot_clearance_weight, heading_weight=args.heading_weight,
         lateral_position_weight=args.lateral_position_weight,
+        body_frame_velocity=args.body_frame_velocity, yaw_rate_weight=args.yaw_rate_weight,
         max_foot_duty_cycle=args.max_foot_duty_cycle, min_foot_duty_cycle=args.min_foot_duty_cycle,
         foot_duty_weight=args.foot_duty_weight, gait_period=args.gait_period, gait_style=args.gait_style,
         phase_match_weight=initial_phase_match_weight, air_time_weight=args.air_time_weight,

@@ -87,6 +87,12 @@ class Go1FlatEnv(gym.Env):
         target_clearance: float = 0.04,       # target foot lift height (m) during swing phase
         heading_weight: float = 0.5,          # penalize yaw deviation from straight-ahead
         lateral_position_weight: float = 0.3,  # penalize y-position drift from the start line
+        body_frame_velocity: bool = False,     # track / penalize velocity in the BODY frame (forward = where
+                                               # the trunk points) instead of world x/y. With world-frame
+                                               # tracking a policy can veer off-axis (pilot D ended at -19 deg
+                                               # yaw) and still be rewarded for world-x progress.
+        yaw_rate_weight: float = 0.0,          # penalty weight on yaw rate^2 (turning); ang_vel term already
+                                               # covers roll/pitch/yaw rates weakly (0.05)
         max_foot_duty_cycle: float = 0.75,    # a foot averaging more ground-contact time than
                                                # this gets penalized, regardless of other gait
                                                # terms -- directly prevents a foot from just
@@ -203,6 +209,8 @@ class Go1FlatEnv(gym.Env):
         self.foot_clearance_weight = foot_clearance_weight
         self.target_clearance = target_clearance
         self.heading_weight = heading_weight
+        self.body_frame_velocity = body_frame_velocity
+        self.yaw_rate_weight = yaw_rate_weight
         self.lateral_position_weight = lateral_position_weight
         self.max_foot_duty_cycle = max_foot_duty_cycle
         self.min_foot_duty_cycle = min_foot_duty_cycle
@@ -457,12 +465,14 @@ class Go1FlatEnv(gym.Env):
         # target_speed=0.2: standing still scored 0.923/1.0, removing most of the
         # incentive to move at all. Normalizing keeps "standing still" penalized
         # to the same relative degree (~0.135) regardless of target_speed.
-        vel_error = self.target_speed - lin_vel_world[0]
+        lin_vel = self._quat_rotate_inv(quat, lin_vel_world) if self.body_frame_velocity else lin_vel_world
+        vel_error = self.target_speed - lin_vel[0]
         normalized_error = vel_error / max(self.target_speed, 0.1)
         r_velocity = np.exp(-2.0 * normalized_error ** 2)
 
         # 2. Penalize lateral / vertical VELOCITY drift
-        r_lateral = -0.5 * (lin_vel_world[1] ** 2 + lin_vel_world[2] ** 2)
+        r_lateral = -0.5 * (lin_vel[1] ** 2 + lin_vel[2] ** 2)
+        r_yaw_rate = -self.yaw_rate_weight * ang_vel[2] ** 2
 
         # 2b. Penalize lateral / heading POSITION drift directly. The velocity term
         # above only discourages instantaneous sideways speed -- a small, constant
@@ -627,6 +637,7 @@ class Go1FlatEnv(gym.Env):
         weights_applied = dict(
             velocity=r_velocity * 1.5,
             lateral=r_lateral,
+            yaw_rate=r_yaw_rate,
             heading=r_heading,
             orientation=r_orientation,
             ang_vel=r_ang_vel,
