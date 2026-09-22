@@ -270,6 +270,9 @@ def main():
                          help="Upper end of the command range at the start of the run; ramps linearly to "
                               "--speed-range-max over --speed-curriculum-steps.")
     parser.add_argument("--speed-curriculum-steps", type=int, default=8_000_000)
+    parser.add_argument("--terrain-amp-min", type=float, default=0.0,
+                         help="Lower end of the sampled terrain-amplitude range (m). Default 0 (mixes in flat "
+                              "ground); raise this to bias/hard-mine training toward rougher terrain.")
     parser.add_argument("--terrain-amp-max", type=float, default=None,
                          help="Enable rough terrain: each episode samples a heightfield amplitude "
                               "(peak-to-peak, m) ~ U(0, current max). Final max amplitude, e.g. 0.08.")
@@ -453,7 +456,7 @@ def main():
         command_speed_range=([args.speed_range_min, args.speed_range_max]
                              if args.speed_range_min is not None else None),
         gait_period_fast=args.gait_period_fast,
-        terrain_amplitude_range=([0.0, args.terrain_amp_max] if args.terrain_amp_max is not None else None),
+        terrain_amplitude_range=([args.terrain_amp_min, args.terrain_amp_max] if args.terrain_amp_max is not None else None),
         friction_range=list(args.friction_range),
         mass_scale_range=list(args.mass_scale_range) if args.mass_scale_range else None,
         push_velocity=args.push_velocity,
