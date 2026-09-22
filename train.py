@@ -1,15 +1,23 @@
 """
-Train Go1 to walk forward on flat terrain with PPO (Stable-Baselines3).
+Train Go1 to walk with PPO (Stable-Baselines3): flat terrain first, then a
+0.2-1.0 m/s speed range, then rough terrain (a random heightfield up to
++-12 cm). Each stage --resume's from the previous stage's checkpoint.
 
-Usage:
-    python train.py --timesteps 20000000 --n-envs 16
-    python train.py --resume checkpoints/go1_flat_10000000_steps.zip
+    python train.py --run-name my_run --timesteps 6000000 --n-envs 8 \\
+        --target-speed 0.3 --kp 80 --kd 2 --log-std-init -1.0
+    python train.py --run-name my_run_2 \\
+        --resume runs/my_run/checkpoints/go1_flat_final_<steps>.zip
 
-Monitor progress:
-    tensorboard --logdir logs/
+The full staged recipe (exact flags for each stage, and why) that produced
+the current best checkpoint (runs/k_hardmine) is in README.md -- start
+there rather than guessing flag combinations from scratch. Every run also
+writes its own resolved args.json / env_kwargs.json to runs/<name>/, so any
+past run's exact settings are always recoverable from that run's directory.
 
-After training, watch the policy:
-    python play.py --model checkpoints/go1_flat_final.zip
+    tensorboard --logdir runs                              # monitor progress
+    python eval_policy.py --run-dir runs/my_run             # fall rate / speed / drift
+    python gait_stats.py  --run-dir runs/my_run             # per-foot step rate / duty / clearance
+    python play.py --run-dir runs/my_run --record out.gif   # watch it
 """
 import argparse
 import os
@@ -218,196 +226,188 @@ def make_env(rank: int, seed: int, env_kwargs: dict):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--timesteps", type=int, default=20_000_000,
-                         help="Total env steps. Flat-terrain trot typically emerges "
-                              "around 5-15M steps; push to 20-30M for a clean gait.")
-    parser.add_argument("--n-envs", type=int, default=16, help="Parallel MuJoCo envs")
-    parser.add_argument("--n-steps", type=int, default=1024,
-                         help="Rollout steps PER ENV before each PPO update. "
-                              "Rollout buffer size = n_steps * n_envs; batch_size must divide it evenly.")
-    parser.add_argument("--batch-size", type=int, default=4096,
-                         help="Must evenly divide n_steps * n_envs (checked below).")
-    parser.add_argument("--ent-coef", type=float, default=0.0,
-                         help="Entropy bonus coefficient. 0.0 (default/original) lets action noise "
-                              "collapse quickly and can converge to lopsided/asymmetric gaits; "
-                              "0.005-0.01 keeps exploration alive longer. CAUTION: this bonus is "
-                              "unbounded above for continuous actions -- if the policy-gradient "
-                              "signal goes quiet (e.g. right after changing --trot-weight or other "
-                              "reward terms mid-run), entropy can dominate and std can blow up "
-                              "uncontrolled. Prefer changing ent_coef and reward-shaping weights in "
-                              "SEPARATE runs, not the same resume. The StdGuardCallback below will "
-                              "auto-stop training if this happens, but it's better to avoid it.")
-    parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--resume", type=str, default=None, help="Path to a .zip checkpoint to resume from")
-    parser.add_argument("--target-speed", type=float, default=1.0, help="Target forward speed (m/s)")
-    parser.add_argument("--trot-weight", type=float, default=0.15,
-                         help="Weight of the diagonal trot-symmetry reward bonus. Raise (e.g. 0.3) "
-                              "to push harder for a canonical FR+RL/FL+RR diagonal trot; set to 0.0 "
-                              "to let any gait emerge unconstrained (the original behavior).")
-    parser.add_argument("--foot-clearance-weight", type=float, default=0.08,
-                         help="Weight of the swing-foot lift bonus. Without this, tiny/fast "
-                              "low-clearance shuffling can score as well as a bold, visible "
-                              "stride, since the other gait terms only check ground contact, "
-                              "not lift height. Raise (e.g. 0.15) to push for bigger, more "
-                              "visible steps; set to 0.0 to disable.")
-    parser.add_argument("--heading-weight", type=float, default=0.5,
-                         help="Penalizes yaw deviation from straight-ahead. Without this, a slow "
-                              "constant yaw drift costs almost nothing per step and compounds into "
-                              "the robot visibly curving off a straight line over a long episode.")
-    parser.add_argument("--lateral-position-weight", type=float, default=0.3,
-                         help="Penalizes y-position drift from the start line, on top of the "
-                              "existing lateral-velocity penalty (which only discourages "
-                              "instantaneous sideways speed, not accumulated drift).")
-    parser.add_argument("--body-frame-velocity", action=argparse.BooleanOptionalAction, default=False,
-                         help="Track forward velocity / penalize sideways velocity in the body frame "
-                              "instead of the world frame (stops rewarding off-axis drift).")
-    parser.add_argument("--speed-range-min", type=float, default=None,
-                         help="Enable per-episode command sampling: target_speed ~ U(min, speed_max_current). "
-                              "Needs --speed-range-max. Default: fixed --target-speed.")
-    parser.add_argument("--speed-range-max", type=float, default=1.0,
-                         help="Final upper end of the sampled command range (m/s).")
-    parser.add_argument("--speed-curriculum-start", type=float, default=0.3,
-                         help="Upper end of the command range at the start of the run; ramps linearly to "
-                              "--speed-range-max over --speed-curriculum-steps.")
-    parser.add_argument("--speed-curriculum-steps", type=int, default=8_000_000)
-    parser.add_argument("--terrain-amp-min", type=float, default=0.0,
-                         help="Lower end of the sampled terrain-amplitude range (m). Default 0 (mixes in flat "
-                              "ground); raise this to bias/hard-mine training toward rougher terrain.")
-    parser.add_argument("--terrain-amp-max", type=float, default=None,
-                         help="Enable rough terrain: each episode samples a heightfield amplitude "
-                              "(peak-to-peak, m) ~ U(0, current max). Final max amplitude, e.g. 0.08.")
-    parser.add_argument("--terrain-curriculum-start", type=float, default=0.0,
-                         help="Terrain amplitude max at the start of the run (m); ramps to --terrain-amp-max.")
-    parser.add_argument("--terrain-curriculum-steps", type=int, default=10_000_000)
-    parser.add_argument("--friction-range", type=float, nargs=2, default=(0.6, 1.1), metavar=("LO", "HI"),
-                         help="Floor/terrain friction sampled each episode.")
-    parser.add_argument("--mass-scale-range", type=float, nargs=2, default=None, metavar=("LO", "HI"),
-                         help="Trunk mass scale sampled each episode, e.g. 0.9 1.1.")
-    parser.add_argument("--push-velocity", type=float, default=0.0,
-                         help="Random horizontal velocity kick (+-m/s) applied to the trunk every 3-6 s.")
-    parser.add_argument("--gait-period-fast", type=float, default=None,
-                         help="Trot-clock period (s) at 1.0 m/s; the period interpolates linearly from "
-                              "--gait-period (at 0.3 m/s) to this. Default: fixed period.")
-    parser.add_argument("--lateral-tracking-weight", type=float, default=0.0,
-                         help="Reward exp(-(v_side/sigma)^2) for zero sideways velocity (fixes crabbing).")
-    parser.add_argument("--lateral-tracking-sigma", type=float, default=0.1)
-    parser.add_argument("--resume-log-std", type=float, default=None,
-                         help="On --resume, reset the policy's log action std to this value (re-opens "
-                              "exploration when the task changes, e.g. -1.6 = std 0.2).")
-    parser.add_argument("--air-time-cap", action=argparse.BooleanOptionalAction, default=False,
-                         help="Cap the touchdown air-time credit at --target-air-time so a single long "
-                              "lift can't out-earn normal steps.")
-    parser.add_argument("--yaw-rate-weight", type=float, default=0.0,
-                         help="Penalty weight on yaw rate squared (discourages turning/veering).")
-    parser.add_argument("--max-foot-duty-cycle", type=float, default=0.75,
-                         help="A foot averaging more ground-contact time than this fraction "
-                              "gets penalized regardless of other gait terms. Prevents a foot "
-                              "from permanently opting out of the gait (e.g. dragging rear legs).")
-    parser.add_argument("--min-foot-duty-cycle", type=float, default=0.2,
-                         help="A foot averaging LESS ground-contact time than this is ALSO "
-                              "penalized -- symmetric to max-foot-duty-cycle. Without this, a foot "
-                              "can opt out the opposite way by staying permanently lifted, never "
-                              "touching down, which is just as dysfunctional as constant dragging.")
-    parser.add_argument("--foot-duty-weight", type=float, default=0.3,
-                         help="Weight of the per-foot duty-cycle penalty above.")
-    parser.add_argument("--gait-period", type=float, default=0.7,
-                         help="Seconds per full stride cycle for the prescribed gait-phase clock. "
-                              "Only relevant if --phase-match-weight > 0 or --use-gait-reference.")
-    parser.add_argument("--gait-style", type=str, default="trot", choices=["trot", "bound"],
-                         help="'trot': diagonal pairs together (FR+RL, FL+RR), the default. "
-                              "'bound': front pair + rear pair alternating (like a gallop/bound). "
-                              "Try 'bound' if the policy seems to strain toward a gallop-like "
-                              "coordination despite trot being enforced -- this robot's dynamics "
-                              "may make a bound more natural than a trot. Affects the mechanical "
-                              "thigh reference, phase_match, and trot_symmetry together.")
-    parser.add_argument("--phase-match-weight", type=float, default=0.0,
-                         help="Reward for matching a PRESCRIBED diagonal-trot timing against a "
-                              "fixed external clock. Defaulted to 0.0 -- hand-picked clock "
-                              "parameters either partially worked or made things worse depending on "
-                              "the guess, since they impose a rhythm from outside rather than "
-                              "letting the policy find one consistent with the robot's own "
-                              "dynamics. See --air-time-weight for the alternative (proven "
-                              "approach: Rudin et al. 'Learning to Walk in Minutes', ETH Zurich "
-                              "2022) that shapes rhythm without imposing a fixed clock.")
-    parser.add_argument("--phase-match-warmup-steps", type=int, default=8_000_000,
-                         help="Linearly ramp phase-match-weight from 0 up to its target value over "
-                              "this many steps, instead of imposing it at full strength immediately. "
-                              "Only relevant if --phase-match-weight > 0.")
-    parser.add_argument("--air-time-weight", type=float, default=1.0,
-                         help="Reward, on touchdown, for how long that foot was airborne relative "
-                              "to --target-air-time. Unlike phase-match, this doesn't impose WHEN a "
-                              "foot should swing -- only that completed swings last a reasonable "
-                              "duration. Lets the policy discover its own step frequency.")
-    parser.add_argument("--target-air-time", type=float, default=0.2,
-                         help="Seconds. Touchdowns faster than this are penalized (discourages "
-                              "shuffling), slower are rewarded up to this point.")
-    parser.add_argument("--use-gait-reference", action=argparse.BooleanOptionalAction, default=False,
-                         help="Bake a prescribed thigh-swing oscillation directly into the physics, "
-                              "so no leg can ever fully 'opt out' of stepping. Defaulted OFF now in "
-                              "favor of --air-time-weight: hard-forcing a rhythm reliably fixed the "
-                              "'some legs drag' problem, but then fought the policy on balance for "
-                              "every gait_period value tried. Re-enable with --use-gait-reference if "
-                              "air_time alone proves insufficient to keep all four legs "
-                              "participating.")
-    parser.add_argument("--use-calf-reference", action=argparse.BooleanOptionalAction, default=False,
-                         help="ALSO force a prescribed calf-flexion oscillation, on top of the "
-                              "thigh reference. Defaulted OFF: a first attempt caused a "
-                              "catastrophic regression (ep_len_mean ~29/1000 from the very first "
-                              "checkpoint), most likely from a wrong sign guess on which calf "
-                              "direction lifts the foot. Verify visually via smoke_test.py --record "
-                              "before re-enabling this for real training.")
-    parser.add_argument("--gait-swing-amplitude", type=float, default=0.35,
-                         help="Radians of prescribed thigh oscillation around the default pose.")
-    parser.add_argument("--thigh-residual-scale", type=float, default=0.15,
-                         help="Policy's residual authority (rad) over the thigh target, on top of "
-                              "the prescribed oscillation. Kept below gait-swing-amplitude so the "
-                              "reference always dominates and can't be cancelled out.")
-    parser.add_argument("--calf-lift-amplitude", type=float, default=0.3,
-                         help="Radians of prescribed extra calf flexion during the swing half of "
-                              "the cycle, completing the leg reference so a foot can't opt out by "
-                              "holding the calf fixed at one extreme (always extended = dragging, "
-                              "always flexed = permanently lifted) regardless of forced thigh "
-                              "motion. Sign is inferred from the model, not empirically verified -- "
-                              "flip if clearance happens on the wrong half of the cycle.")
-    parser.add_argument("--calf-residual-scale", type=float, default=0.15,
-                         help="Policy's residual authority (rad) over the calf target.")
-    parser.add_argument("--kp", type=float, default=40.0,
-                         help="PD position gain, N*m/rad. A scripted-walking test showed 80.0 "
-                              "fixes open-loop tracking error, but transferring that value to RL "
-                              "caused catastrophic tumbling (ang_vel ~10x worse than any prior "
-                              "run) -- a stiffer gain amplifies a still-learning policy's noisy "
-                              "actions into violent torque. Back to the original safe default.")
-    parser.add_argument("--kd", type=float, default=1.0, help="PD velocity gain, N*m*s/rad.")
-    parser.add_argument("--use-sde", action=argparse.BooleanOptionalAction, default=False,
-                         # NOTE (2026-09-20): default flipped to False. Measured on an UNTRAINED policy:
-                         # gSDE at log_std_init=0 knocked the robot over in ~0.7 s (its effective noise is
-                         # exp(log_std) x the 128-dim latent features, far larger than the logged std),
-                         # while plain Gaussian noise at std 0.22 stayed up ~19 s. Pilots with gSDE only
-                         # learned to lunge forward and fall. Turn it back on only with a much lower
-                         # --log-std-init (about -3).
-                         help="Generalized State-Dependent Exploration: samples noise once per "
-                              "sde-sample-freq steps as a function of state, producing temporally-"
-                              "correlated exploration instead of independent per-step jitter. "
-                              "Much better at discovering coordinated multi-step behaviors (like "
-                              "a full leg swing) than default per-step Gaussian noise.")
-    parser.add_argument("--sde-sample-freq", type=int, default=4,
-                         help="Resample SDE noise every N control steps. Lower = less risk of a "
-                              "sustained bad-noise streak causing a fall; higher = more coherent "
-                              "exploration of longer behaviors. At 50Hz, 4 steps = 0.08s.")
-    parser.add_argument("--log-std-init", type=float, default=-1.5,
-                         help="Initial log of the action std (std = exp(value)). The robot stands stably "
-                              "with zero action but is fragile to noise: untrained-policy survival was "
-                              "1.1 s at std 1.0, 4 s at 0.37, 19 s at 0.22 (no gSDE). -1.5 lets the policy "
-                              "start near the standing pose; PPO then widens/narrows it as needed.")
-    parser.add_argument("--learning-rate", type=float, default=3e-4,
-                         help="Peak learning rate. Decays linearly to ~0 over the run (see "
-                              "linear_schedule) to counteract the approx_kl/clip_fraction blowup "
-                              "seen late in every run so far once action std shrinks.")
-    parser.add_argument("--run-name", type=str, default=None,
-                         help="Write everything for this run to runs/<name>/{checkpoints,logs} plus "
-                              "args.json and env_kwargs.json, so runs never overwrite each other and "
-                              "play.py / eval_policy.py can rebuild the exact env with --run-dir. "
-                              "Without it, the legacy shared checkpoints/ and logs/ are used.")
+
+    # ---- run bookkeeping ----
+    g = parser.add_argument_group("run bookkeeping")
+    g.add_argument("--run-name", type=str, default=None,
+                    help="Write everything for this run to runs/<name>/{checkpoints,logs} plus "
+                         "args.json and env_kwargs.json, so runs never overwrite each other and "
+                         "play.py / eval_policy.py / gait_stats.py can rebuild the exact env with "
+                         "--run-dir. Without it, the legacy shared checkpoints/ and logs/ are used.")
+    g.add_argument("--resume", type=str, default=None, help="Path to a .zip checkpoint to resume from")
+    g.add_argument("--resume-log-std", type=float, default=None,
+                    help="On --resume, reset the policy's log action std to this value (re-opens "
+                         "exploration when the task changes, e.g. -1.6 = std 0.2).")
+    g.add_argument("--seed", type=int, default=0)
+
+    # ---- PPO / exploration ----
+    g = parser.add_argument_group("PPO / exploration")
+    g.add_argument("--timesteps", type=int, default=20_000_000,
+                    help="Total env steps for THIS run (on top of any --resume checkpoint's steps).")
+    g.add_argument("--n-envs", type=int, default=16, help="Parallel MuJoCo envs")
+    g.add_argument("--n-steps", type=int, default=1024,
+                    help="Rollout steps PER ENV before each PPO update. "
+                         "Rollout buffer size = n_steps * n_envs; batch_size must divide it evenly.")
+    g.add_argument("--batch-size", type=int, default=4096,
+                    help="Must evenly divide n_steps * n_envs (checked below).")
+    g.add_argument("--learning-rate", type=float, default=3e-4,
+                    help="Peak learning rate. Decays linearly to ~0 over the run (see "
+                         "linear_schedule) to counteract the approx_kl/clip_fraction blowup "
+                         "seen late in every run so far once action std shrinks.")
+    g.add_argument("--ent-coef", type=float, default=0.0,
+                    help="Entropy bonus coefficient. 0.0 (default) lets action noise collapse "
+                         "quickly; 0.005-0.01 keeps exploration alive longer. CAUTION: unbounded "
+                         "above for continuous actions -- if the policy-gradient signal goes quiet "
+                         "(e.g. right after changing a reward-shaping weight mid-run), entropy can "
+                         "dominate and std can blow up uncontrolled. Change ent_coef and reward "
+                         "weights in SEPARATE runs, not the same resume. StdGuardCallback below "
+                         "auto-stops training if this happens, but it's better to avoid it.")
+    g.add_argument("--use-sde", action=argparse.BooleanOptionalAction, default=False,
+                    # Measured on an UNTRAINED policy: gSDE at log_std_init=0 knocked the robot over
+                    # in ~0.7s (its effective noise is exp(log_std) x the 128-dim latent features,
+                    # far larger than the logged std), while plain Gaussian noise at std 0.22 stayed
+                    # up ~19s. Pilots with gSDE only learned to lunge forward and fall. Turn it back
+                    # on only with a much lower --log-std-init (about -3).
+                    help="Generalized State-Dependent Exploration: samples noise once per "
+                         "sde-sample-freq steps as a function of state, producing temporally-"
+                         "correlated exploration instead of independent per-step jitter.")
+    g.add_argument("--sde-sample-freq", type=int, default=4,
+                    help="Resample SDE noise every N control steps. Only used if --use-sde.")
+    g.add_argument("--log-std-init", type=float, default=-1.5,
+                    help="Initial log of the action std (std = exp(value)). The robot stands stably "
+                         "with zero action but is fragile to noise: untrained-policy survival was "
+                         "1.1s at std 1.0, 4s at 0.37, 19s at 0.22 (no gSDE). -1.5 lets the policy "
+                         "start near the standing pose; PPO then widens/narrows it as needed.")
+
+    # ---- physics / control ----
+    g = parser.add_argument_group("physics / control")
+    g.add_argument("--kp", type=float, default=40.0,
+                    help="PD position gain, N*m/rad. A scripted-walking test showed 80.0 fixes "
+                         "open-loop tracking error, but transferring that straight to an untrained "
+                         "RL policy caused catastrophic tumbling -- a stiffer gain amplifies noisy "
+                         "actions into violent torque. 80 is fine once a gait is already learned "
+                         "(every runs/* checkpoint uses --kp 80 --kd 2); keep the low default for a "
+                         "from-scratch run.")
+    g.add_argument("--kd", type=float, default=1.0, help="PD velocity gain, N*m*s/rad.")
+
+    # ---- command speed ----
+    g = parser.add_argument_group("command speed")
+    g.add_argument("--target-speed", type=float, default=1.0,
+                    help="Fixed target forward speed (m/s). Ignored if --speed-range-min is set.")
+    g.add_argument("--speed-range-min", type=float, default=None,
+                    help="Enable per-episode command sampling: target_speed ~ U(min, speed_max_current). "
+                         "Needs --speed-range-max. Default: fixed --target-speed.")
+    g.add_argument("--speed-range-max", type=float, default=1.0,
+                    help="Final upper end of the sampled command range (m/s).")
+    g.add_argument("--speed-curriculum-start", type=float, default=0.3,
+                    help="Upper end of the command range at the start of the run; ramps linearly to "
+                         "--speed-range-max over --speed-curriculum-steps.")
+    g.add_argument("--speed-curriculum-steps", type=int, default=8_000_000)
+
+    # ---- gait clock (prescribed diagonal-trot timing) ----
+    g = parser.add_argument_group("gait clock")
+    g.add_argument("--gait-period", type=float, default=0.7,
+                    help="Seconds per full stride cycle for the prescribed gait-phase clock. "
+                         "Only relevant if --phase-match-weight > 0.")
+    g.add_argument("--gait-period-fast", type=float, default=None,
+                    help="Trot-clock period (s) at 1.0 m/s; the period interpolates linearly from "
+                         "--gait-period (at 0.3 m/s) to this, so faster commands get a faster step "
+                         "rate. Default: fixed period regardless of speed.")
+    g.add_argument("--gait-style", type=str, default="trot", choices=["trot", "bound"],
+                    help="'trot': diagonal pairs together (FR+RL, FL+RR), the default and the only "
+                         "style used in any working run so far. 'bound' (front pair / rear pair "
+                         "alternating) is wired through phase_match and trot_symmetry but untested.")
+    g.add_argument("--phase-match-weight", type=float, default=0.0,
+                    help="Reward for matching the prescribed diagonal-trot timing above. This is "
+                         "what actually fixed the front/rear step-rate mismatch (see README) -- "
+                         "0.5 with an 8M-step warmup is the proven setting. Ramp it in rather than "
+                         "applying it at full strength from step 0 (see --phase-match-warmup-steps): "
+                         "on an untrained policy, full strength immediately made it fall more, not "
+                         "less, since it demands precisely-timed lifts before the policy can balance.")
+    g.add_argument("--phase-match-warmup-steps", type=int, default=8_000_000,
+                    help="Linearly ramp phase-match-weight from 0 up to its target value over "
+                         "this many steps. Only relevant if --phase-match-weight > 0.")
+
+    # ---- reward shaping: gait quality ----
+    g = parser.add_argument_group("reward shaping: gait quality")
+    g.add_argument("--air-time-weight", type=float, default=1.0,
+                    help="Reward, on touchdown, for how long that foot was airborne relative to "
+                         "--target-air-time. Lets the policy discover its own step frequency.")
+    g.add_argument("--air-time-cap", action=argparse.BooleanOptionalAction, default=False,
+                    help="Cap the touchdown air-time credit at --target-air-time so a single long "
+                         "lift can't out-earn several normal steps (this is what fixed one run's "
+                         "front-leg double-stepping: an uncapped credit let a single leg hover for "
+                         "457ms and out-earn multiple short, correct steps elsewhere).")
+    g.add_argument("--target-air-time", type=float, default=0.2,
+                    help="Seconds. Touchdowns faster than this are penalized (discourages "
+                         "shuffling), slower are rewarded up to this point.")
+    g.add_argument("--foot-clearance-weight", type=float, default=0.08,
+                    help="Weight of the swing-foot lift bonus. Without this, tiny/fast low-clearance "
+                         "shuffling scores as well as a bold, visible stride.")
+    g.add_argument("--trot-weight", type=float, default=0.15,
+                    help="Weight of the diagonal trot-symmetry reward bonus. CAUTION: a heavier "
+                         "weight (tried at 0.3 alongside body-frame velocity / yaw-rate shaping) "
+                         "was gamed into a hobble on a single diagonal pair, not a real trot -- "
+                         "the working recipe uses --phase-match-weight for gait timing and leaves "
+                         "this at 0.")
+    g.add_argument("--max-foot-duty-cycle", type=float, default=0.75,
+                    help="A foot averaging more ground-contact time than this fraction gets "
+                         "penalized regardless of other gait terms (stops a foot from permanently "
+                         "opting out by dragging).")
+    g.add_argument("--min-foot-duty-cycle", type=float, default=0.2,
+                    help="Symmetric to --max-foot-duty-cycle: penalizes a foot that stays "
+                         "permanently lifted, never touching down.")
+    g.add_argument("--foot-duty-weight", type=float, default=0.3,
+                    help="Weight of the per-foot duty-cycle penalty above. The working recipe "
+                         "leaves this at 0 (--phase-match-weight handles gait timing instead).")
+
+    # ---- reward shaping: heading / drift ----
+    g = parser.add_argument_group("reward shaping: heading / drift")
+    g.add_argument("--body-frame-velocity", action=argparse.BooleanOptionalAction, default=False,
+                    help="Track forward velocity / penalize sideways velocity in the body frame "
+                         "instead of the world frame (stops rewarding off-axis drift).")
+    g.add_argument("--lateral-tracking-weight", type=float, default=0.0,
+                    help="Reward exp(-(v_side/sigma)^2) for zero sideways velocity. This is what "
+                         "fixed a run that walked straight (good yaw) but crabbed sideways at "
+                         "0.046 m/s -- pair with --body-frame-velocity.")
+    g.add_argument("--lateral-tracking-sigma", type=float, default=0.1)
+    g.add_argument("--yaw-rate-weight", type=float, default=0.0,
+                    help="Penalty weight on yaw rate squared (discourages turning/veering).")
+    g.add_argument("--heading-weight", type=float, default=0.5,
+                    help="Penalizes yaw deviation from straight-ahead. Without this, a slow "
+                         "constant yaw drift costs almost nothing per step and compounds into "
+                         "visible curving over a long episode.")
+    g.add_argument("--lateral-position-weight", type=float, default=0.3,
+                    help="Penalizes y-position drift from the start line, on top of the lateral-"
+                         "velocity penalty (which only discourages instantaneous sideways speed, "
+                         "not accumulated drift).")
+
+    # ---- rough terrain ----
+    g = parser.add_argument_group("rough terrain")
+    g.add_argument("--terrain-amp-max", type=float, default=None,
+                    help="Enable rough terrain: each episode samples a heightfield amplitude "
+                         "(peak-to-peak, m) ~ U(terrain-amp-min, current max). Final max amplitude, "
+                         "e.g. 0.12. Unset = flat ground (a single plane, as before terrain support).")
+    g.add_argument("--terrain-amp-min", type=float, default=0.0,
+                    help="Lower end of the sampled terrain-amplitude range (m). Raise this (with "
+                         "--terrain-curriculum-steps 1, i.e. no ramp) to hard-mine training toward "
+                         "rougher terrain once the full 0..max curriculum has already run once -- "
+                         "sampling from 0 even late in a curriculum under-trains the hardest corner "
+                         "(large bumps + high speed together), since it's still a small slice of "
+                         "what a uniform-from-0 distribution actually shows the policy.")
+    g.add_argument("--terrain-curriculum-start", type=float, default=0.0,
+                    help="Terrain amplitude max at the start of the run (m); ramps to --terrain-amp-max.")
+    g.add_argument("--terrain-curriculum-steps", type=int, default=10_000_000)
+
+    # ---- domain randomization ----
+    g = parser.add_argument_group("domain randomization")
+    g.add_argument("--friction-range", type=float, nargs=2, default=(0.6, 1.1), metavar=("LO", "HI"),
+                    help="Floor/terrain (and, on terrain runs, foot) friction sampled each episode.")
+    g.add_argument("--mass-scale-range", type=float, nargs=2, default=None, metavar=("LO", "HI"),
+                    help="Trunk mass scale sampled each episode, e.g. 0.9 1.1.")
+    g.add_argument("--push-velocity", type=float, default=0.0,
+                    help="Random horizontal velocity kick (+-m/s) applied to the trunk every 3-6s.")
+
     args = parser.parse_args()
 
     global CKPT_DIR, LOG_DIR
@@ -465,10 +465,7 @@ def main():
         max_foot_duty_cycle=args.max_foot_duty_cycle, min_foot_duty_cycle=args.min_foot_duty_cycle,
         foot_duty_weight=args.foot_duty_weight, gait_period=args.gait_period, gait_style=args.gait_style,
         phase_match_weight=initial_phase_match_weight, air_time_weight=args.air_time_weight,
-        target_air_time=args.target_air_time, use_gait_reference=args.use_gait_reference,
-        use_calf_reference=args.use_calf_reference, gait_swing_amplitude=args.gait_swing_amplitude,
-        thigh_residual_scale=args.thigh_residual_scale, calf_lift_amplitude=args.calf_lift_amplitude,
-        calf_residual_scale=args.calf_residual_scale, kp=args.kp, kd=args.kd,
+        target_air_time=args.target_air_time, kp=args.kp, kd=args.kd,
     )
     if run_dir:
         import json
