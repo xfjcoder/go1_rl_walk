@@ -1,39 +1,118 @@
-# Stage 1: Flat terrain — reference config (values are mirrored in code;
-# this file documents the choices so you can tune/reproduce easily).
+# Reference config — documents the settings actually used to produce the current
+# best checkpoint (runs/k_hardmine), for reading rather than loading: nothing in
+# this repo parses this file: train.py takes every value as a CLI flag instead, so
+# it can't drift from what a run actually did (each run's exact resolved flags are
+# also saved to runs/<name>/args.json). See README.md "How this was trained" for
+# the runnable --resume commands this file mirrors, stage by stage.
+#
+# The task outgrew a single flat config as training progressed in stages (flat,
+# fixed speed -> speed curriculum -> rough terrain -> hard-mining), each
+# `--resume`-ing the last with a different env/reward configuration -- so, unlike
+# the original one-shot version of this file, values below are grouped by the
+# stage that introduced them rather than given once.
 
 env:
-  target_speed: 1.0          # m/s forward walking speed to track
-  control_hz: 50              # policy decision frequency
-  sim_dt: 0.002                # physics timestep (250 Hz internally)
+  control_hz: 50               # policy decision frequency
+  sim_dt: 0.002                 # physics timestep (250 Hz internally)
   max_episode_seconds: 20.0
-  action_scale: 0.5           # policy output -> radians offset from default pose
-  domain_randomize: true      # light noise even on flat ground (recommended)
-
-reward_weights:
-  velocity_tracking: 1.5
-  lateral_penalty: 1.0
-  orientation_penalty: 1.0
-  angular_velocity_penalty: 0.05
-  torque_penalty: 0.0002
-  action_rate_penalty: 0.01
-  gait_bonus: 0.05
-  alive_bonus: 0.5
-  height_penalty: 2.0
+  action_scale: 0.5            # policy output -> radians offset from default pose
+  domain_randomize: true       # joint/height/yaw jitter + floor/foot friction every reset (recommended)
 
 ppo:
-  learning_rate: 3.0e-4
-  n_envs: 16
+  learning_rate: 3.0e-4         # peak LR for a from-scratch run (stage 1a); decayed to 1.5e-4 by stage 2b
+  n_envs: 16                    # 8 for the first, cheapest stage (1a); 16 from stage 1b on
+  n_steps: 1024
   batch_size: 4096
   n_epochs: 10
   gamma: 0.99
   gae_lambda: 0.95
   clip_range: 0.2
-  total_timesteps: 20_000_000
+  ent_coef: 0.0                 # unbounded above for continuous actions -- see README's entropy-blowup note
+  use_sde: false                 # gSDE toppled an untrained policy in ~0.7s; plain Gaussian noise instead
+  log_std_init: -1.5             # std 0.22 -- untrained-policy survival was ~19s at this std vs ~1s at std 1.0
   net_arch_pi: [256, 256, 128]
   net_arch_vf: [256, 256, 128]
 
-# Rough milestones to expect (varies by hardware/seed):
-#   0 - 1M steps    : robot learns not to fall immediately, flails
-#   1M - 5M steps   : discovers stable standing, starts shuffling forward
-#   5M - 12M steps  : consistent quadrupedal gait (often a trot) emerges
-#   12M - 20M steps : gait smooths out, better velocity tracking, robust to init noise
+physics_control:
+  kp: 80.0                      # N*m/rad. 40 is safer for a from-scratch policy; 80 once a gait is learned
+  kd: 2.0                       # N*m*s/rad
+
+# --- stage 1a: flat, fixed 0.3 m/s, diagonal-trot clock (runs/h_clock) ---
+stage_1a_flat_fixed_speed:
+  target_speed: 0.3
+  gait_period: 0.7               # seconds per stride cycle for the prescribed gait-phase clock
+  gait_style: trot                # diagonal pairs together (FR+RL, FL+RR)
+  phase_match_weight: 0.5         # reward for matching the clock -- fixed the front/rear step-rate mismatch
+  phase_match_warmup_steps: 1_000_000  # ramp in; full strength from step 0 makes an untrained policy fall MORE
+  air_time_cap: true               # cap touchdown air-time credit at target_air_time (else one long lift
+                                    #   out-earns several correct steps -- this caused a lopsided gait once)
+  air_time_weight: 1.0
+  target_air_time: 0.2
+  foot_clearance_weight: 0.3
+  timesteps: 6_000_000
+
+# --- stage 1b: speed curriculum, 0.2-1.0 m/s (runs/i_speed_curriculum, --resume from 1a) ---
+stage_1b_speed_curriculum:
+  speed_range: [0.2, 1.0]          # sampled per episode: target_speed ~ U(0.2, current upper bound)
+  speed_curriculum: {start: 0.3, ramp_steps: 8_000_000}  # upper bound ramps 0.3 -> 1.0
+  gait_period_fast: 0.45            # trot-clock period at 1.0 m/s (interpolates from gait_period at 0.3 m/s)
+  body_frame_velocity: true         # track forward / penalize sideways velocity in the body frame
+  lateral_tracking_weight: 0.5      # reward zero sideways velocity -- fixed a run that walked straight but crabbed
+  resume_log_std: -1.6              # re-open exploration a little for the new, wider task
+  learning_rate: 2.0e-4
+  timesteps: 12_000_000
+
+# --- stage 2a: rough terrain, 0-12cm heightfield (runs/j_terrain, --resume from 1b) ---
+stage_2a_rough_terrain:
+  terrain_amplitude_range: [0.0, 0.12]   # sampled per episode; upper bound ramps to 0.12 (peak-to-peak, m)
+  terrain_curriculum: {start: 0.04, ramp_steps: 8_000_000}
+  friction_range: [0.5, 1.25]             # floor/terrain AND foot friction (foot geoms have priority=1 in
+                                           #   assets/go1.xml, so randomizing only the floor never touches them)
+  mass_scale_range: [0.9, 1.1]            # trunk mass scale, sampled per episode
+  push_velocity: 0.3                       # m/s horizontal kick to the trunk every 3-6s
+  resume_log_std: -1.8
+  learning_rate: 2.0e-4
+  timesteps: 14_000_000
+
+# --- stage 2b: hard-mine the worst corner, large bumps + high speed (runs/k_hardmine, --resume from 2a) ---
+stage_2b_hard_mining:
+  # The stage-2a curriculum only ramps the amplitude's UPPER bound, so episodes keep sampling
+  # amplitude ~U(0, 0.12) even late in training -- the truly hard case (large bumps at high speed
+  # together) stays a thin slice of what the policy ever sees. Bias the distribution at it directly
+  # instead of widening the curriculum further (no ramp: start = max immediately on both axes).
+  terrain_amplitude_range: [0.06, 0.12]
+  speed_range: [0.5, 1.0]
+  resume_log_std: -1.8
+  learning_rate: 1.5e-4
+  timesteps: 8_000_000
+
+reward_weights:
+  # Shared by every stage above unless noted. Full list/definitions: Go1FlatEnv._compute_reward.
+  velocity_tracking: 1.5
+  lateral_tracking: 0.5             # see stage 1b (zero-sideways-velocity reward, not just a penalty)
+  heading_penalty: 0.5              # yaw^2 deviation from straight-ahead
+  lateral_position_penalty: 0.3     # y-position drift from the start line
+  orientation_penalty: 1.0
+  angular_velocity_penalty: 0.05
+  torque_penalty: 0.0002
+  action_rate_penalty: 0.03
+  foot_clearance: 0.3
+  air_time: 1.0
+  phase_match: 0.5                  # 0 on stage 1a before its warmup completes; see phase_match_warmup_steps
+  alive_bonus: 0.2
+  height_penalty: 2.0
+  # Wired but left at weight 0 in this recipe -- see README "false starts" and train.py --help
+  # for why (trot-symmetry was gamed into a hobble; foot-duty wasn't needed once phase_match worked):
+  trot_symmetry: 0.0
+  foot_duty: 0.0
+  yaw_rate: 0.0
+
+# Milestones actually observed (this hardware, these seeds -- expect variation):
+#   stage 1a (0.3 m/s, fixed):        full-length (1000-step) episodes by ~2-3M steps, clean
+#                                      symmetric trot (all 4 feet same step rate) by 6M.
+#   stage 1b (0.2-1.0 m/s curriculum): speed tracking within ~5-10% of command across the whole
+#                                      range by the end of 12M steps, trot stays symmetric at every speed.
+#   stage 2a (0-12cm terrain):        0% falls at every amplitude x 0.3/0.8 m/s except a residual
+#                                      ~4% at the hardest corner (12cm / 0.8 m/s) after 14M steps.
+#   stage 2b (hard-mining):           that residual corner falls -> 0% after 8M more steps, with
+#                                      no regression anywhere else in the tested grid.

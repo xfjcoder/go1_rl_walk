@@ -20,8 +20,8 @@ go1_rl_walk/
 ├── assets/go1.xml         # MJCF model (self-contained, capsule-based)
 ├── envs/go1_env.py        # Gymnasium env: obs, action, reward, termination, terrain
 ├── scripted_gait.py       # Hand-designed crawl gait (stage 0, no RL)
-├── configs/flat_terrain.yaml  # original reward-weight defaults (historical reference —
-│                          #   the actual tuned recipe is in this README, not this file)
+├── configs/flat_terrain.yaml  # settings behind runs/k_hardmine, by stage (read-only reference —
+│                          #   train.py takes flags, not this file; see "How this was trained")
 ├── train.py               # PPO training entrypoint (--run-name writes to runs/<name>/)
 ├── eval_policy.py         # Randomized multi-episode eval: fall rate, speed, drift
 ├── gait_stats.py          # Per-foot diagnostics: step rate, duty, swing height
