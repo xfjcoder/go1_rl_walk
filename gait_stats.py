@@ -59,8 +59,9 @@ def main():
         if done[0]:
             break
         touch.append(e._foot_contacts())
-        fx.append(e.data.site_xpos[e._foot_site_ids, 0] - e.data.qpos[0])
-        fz.append(e.data.site_xpos[e._foot_site_ids, 2] - e._foot_radius)
+        foot_xyz = e.data.site_xpos[e._foot_site_ids]
+        fx.append(foot_xyz[:, 0] - e.data.qpos[0])
+        fz.append(foot_xyz[:, 2] - e._foot_radius - e._terrain_height(foot_xyz[:, 0], foot_xyz[:, 1]))
         ys.append(info[0]["base_pos"][1]); yaws.append(np.degrees(info[0]["yaw"]))
         vb.append(e._quat_rotate_inv(e.data.sensordata[e._imu_quat_adr:e._imu_quat_adr + 4],
                                      e.data.sensordata[e._imu_vel_adr:e._imu_vel_adr + 3]))
