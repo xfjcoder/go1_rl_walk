@@ -7,6 +7,9 @@ __pycache__/
 *.pyc
 MUJOCO_LOG.TXT
 
+# Claude Code worktrees, if created inside the repo (git worktree add .claude/worktrees/...)
+.claude/
+
 # ...except the one committed pretrained checkpoint (small, deliberately tracked)
 !pretrained/
 !pretrained/**
