@@ -412,6 +412,21 @@ def main():
     g.add_argument("--ramp-length", type=float, default=8.0,
                     help="Horizontal distance (m) a slope climbs/descends over before leveling into a "
                          "plateau. Longer = gentler effective grade at the same angle.")
+    g.add_argument("--stair-height-min", type=float, default=0.0,
+                    help="Lower end of the sampled stair riser height range (m). Raise for hard-mining, "
+                         "same idea as --terrain-amp-min.")
+    g.add_argument("--stair-height-max", type=float, default=None,
+                    help="Enable stairs: each episode samples a riser height (m) ~ U(stair-height-min, "
+                         "current max) and a random ascending/descending direction -- flat pad, then "
+                         "--num-stairs steps, then a flat plateau. Unset = no stairs (independent of "
+                         "--terrain-amp-max/--slope-max-deg; all three combine if set together).")
+    g.add_argument("--stair-curriculum-start", type=float, default=0.0,
+                    help="Stair riser height max at the start of the run (m); ramps to --stair-height-max.")
+    g.add_argument("--stair-curriculum-steps", type=int, default=10_000_000)
+    g.add_argument("--stair-depth", type=float, default=0.25,
+                    help="Tread depth (m) of each stair. Kept a multiple of the 5cm heightfield cell "
+                         "size for a crisp riser edge.")
+    g.add_argument("--num-stairs", type=int, default=8, help="Number of steps before leveling into a plateau.")
 
     # ---- domain randomization ----
     g = parser.add_argument_group("domain randomization")
@@ -473,6 +488,8 @@ def main():
         terrain_amplitude_range=([args.terrain_amp_min, args.terrain_amp_max] if args.terrain_amp_max is not None else None),
         slope_range=([args.slope_min_deg, args.slope_max_deg] if args.slope_max_deg is not None else None),
         ramp_length=args.ramp_length,
+        stair_height_range=([args.stair_height_min, args.stair_height_max] if args.stair_height_max is not None else None),
+        stair_depth=args.stair_depth, num_stairs=args.num_stairs,
         friction_range=list(args.friction_range),
         mass_scale_range=list(args.mass_scale_range) if args.mass_scale_range else None,
         push_velocity=args.push_velocity,
@@ -496,6 +513,8 @@ def main():
         env.set_attr("terrain_amp_max_current", args.terrain_curriculum_start)
     if args.slope_max_deg is not None:
         env.set_attr("slope_deg_max_current", args.slope_curriculum_start)
+    if args.stair_height_max is not None:
+        env.set_attr("stair_height_max_current", args.stair_curriculum_start)
     env = VecMonitor(env)
     vec_path = vecnormalize_path_for(args.resume) if args.resume else None
     if vec_path and os.path.exists(vec_path):
@@ -564,6 +583,9 @@ def main():
     if args.slope_max_deg is not None:
         callbacks.append(RampCallback("slope_deg_max_current", "slope_max_deg", args.slope_curriculum_start,
                                       args.slope_max_deg, args.slope_curriculum_steps))
+    if args.stair_height_max is not None:
+        callbacks.append(RampCallback("stair_height_max_current", "stair_height_max", args.stair_curriculum_start,
+                                      args.stair_height_max, args.stair_curriculum_steps))
     if args.phase_match_warmup_steps > 0:
         callbacks.append(RewardWarmupCallback(
             attr_name="phase_match_weight",

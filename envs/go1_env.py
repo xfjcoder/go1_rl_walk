@@ -113,6 +113,16 @@ class Go1FlatEnv(gym.Env):
                                                # like terrain_amplitude_range (U(lo, slope_deg_max_current)).
         slope_deg: float | None = None,        # fixed slope (deg, signed: + uphill, - downhill) -- for evaluation
         ramp_length: float = DEFAULT_RAMP_LENGTH,  # metres of horizontal run to reach the target slope height
+        stair_height_range: tuple | None = None,  # (lo, hi) metres: enable stairs -- flat pad, then num_stairs
+                                               # steps of stair_depth tread x this riser height (random direction
+                                               # each episode), then a flat plateau. Sampled like slope_range
+                                               # (U(lo, stair_height_max_current)). Additive with slope/bumps.
+        stair_height: float | None = None,     # fixed riser height (m, signed: + ascending, - descending) -- eval
+        stair_depth: float = 0.25,             # tread depth (m); kept a multiple of HF_CELL (0.05m) for a crisp
+                                               # riser edge -- a heightfield can only change height within one
+                                               # grid cell, not a true vertical face, so a riser is a steep ramp
+                                               # over one HF_CELL (5 cm), not a perfect right angle.
+        num_stairs: int = 8,                   # number of steps before leveling into a plateau
         friction_range: tuple = (0.6, 1.1),    # floor / terrain sliding friction sampled each reset
         mass_scale_range: tuple | None = None,  # trunk mass (and inertia) scale sampled each reset
         push_velocity: float = 0.0,            # m/s: every 3-6 s add a random horizontal velocity kick of up
@@ -260,8 +270,14 @@ class Go1FlatEnv(gym.Env):
         self.slope_deg = slope_deg
         self.slope_deg_max_current = self.slope_range[1] if self.slope_range else None
         self.ramp_length = ramp_length
+        self.stair_height_range = tuple(stair_height_range) if stair_height_range else None
+        self.stair_height = stair_height
+        self.stair_height_max_current = self.stair_height_range[1] if self.stair_height_range else None
+        self.stair_depth = stair_depth
+        self.num_stairs = num_stairs
         self.terrain_enabled = (self.terrain_amplitude_range is not None or terrain_amplitude is not None
-                                or self.slope_range is not None or slope_deg is not None)
+                                or self.slope_range is not None or slope_deg is not None
+                                or self.stair_height_range is not None or stair_height is not None)
         self.friction_range = tuple(friction_range)
         self.mass_scale_range = tuple(mass_scale_range) if mass_scale_range else None
         self.push_velocity = push_velocity
@@ -418,7 +434,15 @@ class Go1FlatEnv(gym.Env):
                 uphill = bool(self._rng.integers(0, 2))
             else:
                 slope_deg, uphill = 0.0, True
-            self._generate_terrain(amp, slope_deg, uphill)
+            if self.stair_height is not None:
+                stair_h, ascending = abs(self.stair_height), self.stair_height >= 0
+            elif self.stair_height_range is not None:
+                stair_h = float(self._rng.uniform(self.stair_height_range[0],
+                                                  max(self.stair_height_max_current, self.stair_height_range[0])))
+                ascending = bool(self._rng.integers(0, 2))
+            else:
+                stair_h, ascending = 0.0, True
+            self._generate_terrain(amp, slope_deg, uphill, stair_h, ascending)
         self._next_push_step = int(self._rng.integers(150, 300)) if self.push_velocity > 0 else 10**9
 
         mujoco.mj_resetData(self.model, self.data)
@@ -568,8 +592,9 @@ class Go1FlatEnv(gym.Env):
             xml = xml.replace(old, new)
         return xml
 
-    def _generate_terrain(self, amp: float, slope_deg: float = 0.0, uphill: bool = True):
-        """Terrain height (m), combining two independent, additive components:
+    def _generate_terrain(self, amp: float, slope_deg: float = 0.0, uphill: bool = True,
+                          stair_h: float = 0.0, ascending: bool = True):
+        """Terrain height (m), combining three independent, additive components:
 
         1. Random bumps: bilinearly-interpolated uniform noise in [0, amp] with a random feature size
            (15 cm bumps up to 1 m undulations), faded in over the flat start pad (HF_PAD_START..HF_PAD_END).
@@ -577,8 +602,12 @@ class Go1FlatEnv(gym.Env):
            metres, then a flat plateau at the resulting height for the rest of the course. `uphill=False`
            reverses which end is elevated (flat pad starts high, plateau ends at 0) rather than using a
            negative height -- a MuJoCo hfield can't represent height below its own z=0 reference plane.
+        3. Stairs: flat at 0 up to HF_PAD_END, then num_stairs steps of stair_depth tread x stair_h riser,
+           then a flat plateau at num_stairs*stair_h. `ascending=False` mirrors direction the same way
+           `uphill` does for the slope. Each riser is a step function quantized to HF_CELL, so it's a
+           steep ramp within one grid cell (5 cm), not a true vertical face -- see the ctor docstring.
 
-        Both default to 0 (flat ground), and can be nonzero at the same time (a sloped, bumpy ramp).
+        All three default to 0 (flat ground), and any combination can be nonzero at once (e.g. bumpy stairs).
         """
         nrow, ncol = self._hf_nrow, self._hf_ncol
         xw = self._hf_x0 + np.arange(ncol) * HF_CELL
@@ -603,7 +632,14 @@ class Go1FlatEnv(gym.Env):
             rise = np.tan(np.radians(slope_deg)) * np.clip(xw - HF_PAD_END, 0.0, self.ramp_length)
             slope = rise if uphill else rise.max() - rise   # downhill: start elevated, descend to 0
 
-        h = np.clip(bumps + slope[None, :], 0.0, HF_ELEV)
+        if stair_h <= 1e-6:
+            stairs = np.zeros(ncol)
+        else:
+            step_num = np.clip(np.floor((xw - HF_PAD_END) / self.stair_depth), 0, self.num_stairs)
+            rise = stair_h * step_num
+            stairs = rise if ascending else rise.max() - rise   # descending: start elevated, step down to 0
+
+        h = np.clip(bumps + slope[None, :] + stairs[None, :], 0.0, HF_ELEV)
         self._terrain_h = h
         self.model.hfield_data[self._hf_adr:self._hf_adr + nrow * ncol] = (h / HF_ELEV).ravel()
 
