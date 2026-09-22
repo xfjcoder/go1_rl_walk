@@ -36,6 +36,8 @@ def main():
     parser.add_argument("--episodes", type=int, default=5)
     parser.add_argument("--terrain-amplitude", type=float, default=None,
                          help="Play on rough terrain of this amplitude (m, peak-to-peak).")
+    parser.add_argument("--slope-deg", type=float, default=None,
+                         help="Play on a slope of this angle (deg, signed: + uphill, - downhill).")
     parser.add_argument("--target-speed", type=float, default=None,
                          help="Command speed (m/s). Default: the run's own with --run-dir, else 1.0.")
     parser.add_argument("--record", type=str, default=None,
@@ -71,6 +73,8 @@ def main():
     env_kwargs["command_speed_range"] = None      # play at one fixed command (--target-speed, else the run's)
     env_kwargs["terrain_amplitude_range"] = None
     env_kwargs["terrain_amplitude"] = args.terrain_amplitude
+    env_kwargs["slope_range"] = None
+    env_kwargs["slope_deg"] = args.slope_deg
     env_kwargs.setdefault("target_speed", 1.0)
 
     def make_env():

@@ -398,6 +398,20 @@ def main():
     g.add_argument("--terrain-curriculum-start", type=float, default=0.0,
                     help="Terrain amplitude max at the start of the run (m); ramps to --terrain-amp-max.")
     g.add_argument("--terrain-curriculum-steps", type=int, default=10_000_000)
+    g.add_argument("--slope-min-deg", type=float, default=0.0,
+                    help="Lower end of the sampled slope range (deg). Raise for hard-mining, same idea "
+                         "as --terrain-amp-min.")
+    g.add_argument("--slope-max-deg", type=float, default=None,
+                    help="Enable slopes: each episode samples a slope angle (deg) ~ U(slope-min-deg, "
+                         "current max) and a random uphill/downhill direction -- flat pad, then a "
+                         "constant grade over --ramp-length, then a flat plateau. Unset = no slope "
+                         "(independent of --terrain-amp-max; the two combine if both are set).")
+    g.add_argument("--slope-curriculum-start", type=float, default=0.0,
+                    help="Slope angle max at the start of the run (deg); ramps to --slope-max-deg.")
+    g.add_argument("--slope-curriculum-steps", type=int, default=10_000_000)
+    g.add_argument("--ramp-length", type=float, default=8.0,
+                    help="Horizontal distance (m) a slope climbs/descends over before leveling into a "
+                         "plateau. Longer = gentler effective grade at the same angle.")
 
     # ---- domain randomization ----
     g = parser.add_argument_group("domain randomization")
@@ -457,6 +471,8 @@ def main():
                              if args.speed_range_min is not None else None),
         gait_period_fast=args.gait_period_fast,
         terrain_amplitude_range=([args.terrain_amp_min, args.terrain_amp_max] if args.terrain_amp_max is not None else None),
+        slope_range=([args.slope_min_deg, args.slope_max_deg] if args.slope_max_deg is not None else None),
+        ramp_length=args.ramp_length,
         friction_range=list(args.friction_range),
         mass_scale_range=list(args.mass_scale_range) if args.mass_scale_range else None,
         push_velocity=args.push_velocity,
@@ -478,6 +494,8 @@ def main():
         env.set_attr("speed_max_current", args.speed_curriculum_start)
     if args.terrain_amp_max is not None:
         env.set_attr("terrain_amp_max_current", args.terrain_curriculum_start)
+    if args.slope_max_deg is not None:
+        env.set_attr("slope_deg_max_current", args.slope_curriculum_start)
     env = VecMonitor(env)
     vec_path = vecnormalize_path_for(args.resume) if args.resume else None
     if vec_path and os.path.exists(vec_path):
@@ -543,6 +561,9 @@ def main():
     if args.terrain_amp_max is not None:
         callbacks.append(RampCallback("terrain_amp_max_current", "terrain_amp_max", args.terrain_curriculum_start,
                                       args.terrain_amp_max, args.terrain_curriculum_steps))
+    if args.slope_max_deg is not None:
+        callbacks.append(RampCallback("slope_deg_max_current", "slope_max_deg", args.slope_curriculum_start,
+                                      args.slope_max_deg, args.slope_curriculum_steps))
     if args.phase_match_warmup_steps > 0:
         callbacks.append(RewardWarmupCallback(
             attr_name="phase_match_weight",

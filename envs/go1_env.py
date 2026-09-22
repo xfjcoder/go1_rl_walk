@@ -27,7 +27,10 @@ HF_CELL = 0.05
 HF_CX = 10.0          # hfield geom centre x (m)
 HF_HALF_X = 12.5
 HF_HALF_Y = 3.0
-HF_ELEV = 0.15        # elevation_z: max terrain height (m); hfield_data in [0,1] scales to [0, HF_ELEV]
+HF_ELEV = 6.0          # elevation_z: max terrain height (m); hfield_data in [0,1] scales to [0, HF_ELEV].
+                       # Generous headroom for slopes (e.g. 20 deg over a 10 m ramp needs ~3.6 m) --
+                       # doesn't cost anything for the much smaller rough-terrain bump amplitudes (<=0.12 m).
+DEFAULT_RAMP_LENGTH = 8.0   # horizontal distance (m) a slope climbs/descends over, before leveling into a plateau
 HF_PAD_START, HF_PAD_END = 0.5, 1.5   # x range over which terrain fades in (flat start pad before it)
 
 JOINT_NAMES = [
@@ -104,6 +107,12 @@ class Go1FlatEnv(gym.Env):
                                                # amplitude ~ U(lo, terrain_amp_max_current). The current max
                                                # starts at hi and can be ramped by a curriculum callback.
         terrain_amplitude: float | None = None,  # fixed amplitude (m, peak-to-peak) -- for evaluation
+        slope_range: tuple | None = None,      # (lo, hi) degrees: enable a ramp -- flat pad, then a
+                                               # constant-grade climb/descent (random direction each
+                                               # episode) over ramp_length, then a flat plateau. Sampled
+                                               # like terrain_amplitude_range (U(lo, slope_deg_max_current)).
+        slope_deg: float | None = None,        # fixed slope (deg, signed: + uphill, - downhill) -- for evaluation
+        ramp_length: float = DEFAULT_RAMP_LENGTH,  # metres of horizontal run to reach the target slope height
         friction_range: tuple = (0.6, 1.1),    # floor / terrain sliding friction sampled each reset
         mass_scale_range: tuple | None = None,  # trunk mass (and inertia) scale sampled each reset
         push_velocity: float = 0.0,            # m/s: every 3-6 s add a random horizontal velocity kick of up
@@ -247,7 +256,12 @@ class Go1FlatEnv(gym.Env):
         self.terrain_amplitude_range = tuple(terrain_amplitude_range) if terrain_amplitude_range else None
         self.terrain_amplitude = terrain_amplitude
         self.terrain_amp_max_current = self.terrain_amplitude_range[1] if self.terrain_amplitude_range else None
-        self.terrain_enabled = self.terrain_amplitude_range is not None or terrain_amplitude is not None
+        self.slope_range = tuple(slope_range) if slope_range else None
+        self.slope_deg = slope_deg
+        self.slope_deg_max_current = self.slope_range[1] if self.slope_range else None
+        self.ramp_length = ramp_length
+        self.terrain_enabled = (self.terrain_amplitude_range is not None or terrain_amplitude is not None
+                                or self.slope_range is not None or slope_deg is not None)
         self.friction_range = tuple(friction_range)
         self.mass_scale_range = tuple(mass_scale_range) if mass_scale_range else None
         self.push_velocity = push_velocity
@@ -391,10 +405,20 @@ class Go1FlatEnv(gym.Env):
         if self.terrain_enabled:
             if self.terrain_amplitude is not None:
                 amp = self.terrain_amplitude
-            else:
+            elif self.terrain_amplitude_range is not None:
                 amp = float(self._rng.uniform(self.terrain_amplitude_range[0],
                                               max(self.terrain_amp_max_current, self.terrain_amplitude_range[0])))
-            self._generate_terrain(amp)
+            else:
+                amp = 0.0
+            if self.slope_deg is not None:
+                slope_deg, uphill = abs(self.slope_deg), self.slope_deg >= 0
+            elif self.slope_range is not None:
+                slope_deg = float(self._rng.uniform(self.slope_range[0],
+                                                    max(self.slope_deg_max_current, self.slope_range[0])))
+                uphill = bool(self._rng.integers(0, 2))
+            else:
+                slope_deg, uphill = 0.0, True
+            self._generate_terrain(amp, slope_deg, uphill)
         self._next_push_step = int(self._rng.integers(150, 300)) if self.push_velocity > 0 else 10**9
 
         mujoco.mj_resetData(self.model, self.data)
@@ -544,13 +568,23 @@ class Go1FlatEnv(gym.Env):
             xml = xml.replace(old, new)
         return xml
 
-    def _generate_terrain(self, amp: float):
-        """New random terrain: bilinearly-interpolated uniform noise in [0, amp] with a random feature size
-        (15 cm bumps up to 1 m undulations), faded in after a flat start pad."""
-        assert amp <= HF_ELEV, f"terrain amplitude {amp} exceeds the hfield's max elevation {HF_ELEV}"
+    def _generate_terrain(self, amp: float, slope_deg: float = 0.0, uphill: bool = True):
+        """Terrain height (m), combining two independent, additive components:
+
+        1. Random bumps: bilinearly-interpolated uniform noise in [0, amp] with a random feature size
+           (15 cm bumps up to 1 m undulations), faded in over the flat start pad (HF_PAD_START..HF_PAD_END).
+        2. A slope: flat at 0 up to HF_PAD_END, then a constant grade (tan(slope_deg)) over ramp_length
+           metres, then a flat plateau at the resulting height for the rest of the course. `uphill=False`
+           reverses which end is elevated (flat pad starts high, plateau ends at 0) rather than using a
+           negative height -- a MuJoCo hfield can't represent height below its own z=0 reference plane.
+
+        Both default to 0 (flat ground), and can be nonzero at the same time (a sloped, bumpy ramp).
+        """
         nrow, ncol = self._hf_nrow, self._hf_ncol
+        xw = self._hf_x0 + np.arange(ncol) * HF_CELL
+
         if amp <= 1e-6:
-            h = np.zeros((nrow, ncol))
+            bumps = np.zeros((nrow, ncol))
         else:
             spacing = float(np.exp(self._rng.uniform(np.log(0.15), np.log(1.0))))
             xs, ys = np.arange(ncol) * HF_CELL / spacing, np.arange(nrow) * HF_CELL / spacing
@@ -560,9 +594,16 @@ class Go1FlatEnv(gym.Env):
             j0 = np.floor(ys).astype(int)
             wy = (ys - j0)[:, None]
             h01 = tmp[j0, :] * (1 - wy) + tmp[j0 + 1, :] * wy
-            xw = self._hf_x0 + np.arange(ncol) * HF_CELL
-            t = np.clip((xw - HF_PAD_START) / (HF_PAD_END - HF_PAD_START), 0.0, 1.0)
-            h = amp * h01 * (t * t * (3 - 2 * t))[None, :]
+            fade = np.clip((xw - HF_PAD_START) / (HF_PAD_END - HF_PAD_START), 0.0, 1.0)
+            bumps = amp * h01 * (fade * fade * (3 - 2 * fade))[None, :]
+
+        if slope_deg <= 1e-6:
+            slope = np.zeros(ncol)
+        else:
+            rise = np.tan(np.radians(slope_deg)) * np.clip(xw - HF_PAD_END, 0.0, self.ramp_length)
+            slope = rise if uphill else rise.max() - rise   # downhill: start elevated, descend to 0
+
+        h = np.clip(bumps + slope[None, :], 0.0, HF_ELEV)
         self._terrain_h = h
         self.model.hfield_data[self._hf_adr:self._hf_adr + nrow * ncol] = (h / HF_ELEV).ravel()
 
