@@ -15,6 +15,13 @@ falls across the whole tested grid (0/4/8/12 cm terrain amplitude × 0.3/0.8/1.0
 m/s commands). See [Current status](#current-status) for the full results and
 [How this was trained](#how-this-was-trained) to reproduce it from scratch.
 
+A ready-to-run copy of that checkpoint is committed at `pretrained/k_hardmine/`
+(2.7 MB), so you can watch it walk right after cloning, no training needed:
+```bash
+pip install -r requirements.txt
+python play.py --run-dir pretrained/k_hardmine --target-speed 0.8 --terrain-amplitude 0.12 --record out.gif
+```
+
 ```
 go1_rl_walk/
 ├── assets/go1.xml         # MJCF model (self-contained, capsule-based)
@@ -28,7 +35,11 @@ go1_rl_walk/
 ├── play.py                # Load a checkpoint (--run-dir) and watch it walk
 ├── smoke_test.py          # Sanity-check the model with no RL deps; also runs the crawl gait
 ├── runs/<name>/           # One dir per training run: checkpoints/, logs/, args.json, env_kwargs.json
-└── requirements.txt
+│                          #   (gitignored — see pretrained/ for a committed checkpoint)
+├── pretrained/k_hardmine/  # Committed copy of the current best checkpoint (same layout as a run
+│                          #   dir, minus logs/) — a valid --run-dir with no training required
+├── requirements.txt
+└── LICENSE                # MIT
 ```
 
 ## 1. Setup
