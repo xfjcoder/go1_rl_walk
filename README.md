@@ -1,7 +1,7 @@
 # Go1 Quadruped Locomotion
 
 Trains a Unitree Go1 to walk with MuJoCo physics + PPO (Stable-Baselines3).
-The pipeline has three stages, each building on the last:
+The pipeline has four stages, each building on the last:
 
 0. **Scripted crawl** (no RL) — a hand-designed gait, to check the model and
    physics can walk at all before trusting RL to discover one.
@@ -9,18 +9,26 @@ The pipeline has three stages, each building on the last:
    0.2–1.0 m/s with a clean, symmetric trot.
 2. **RL, rough terrain** — fine-tuned on a random heightfield up to ±12 cm,
    plus friction/mass/push randomization.
+3. **RL, slopes and stairs** (this branch, `stage3-terrain-envelope`, not yet
+   merged to `main`) — fine-tuned further on ramp slopes (±20°) and stairs
+   (risers up to 12 cm), on top of everything from stages 1-2.
 
-All three are done. The current best checkpoint is `runs/k_hardmine`: 0%
-falls across the whole tested grid (0/4/8/12 cm terrain amplitude × 0.3/0.8/1.0
-m/s commands). See [Current status](#current-status) for the full results and
-[How this was trained](#how-this-was-trained) to reproduce it from scratch.
+Stages 0-2 are on `main` (best checkpoint `runs/k_hardmine`, see `main`'s
+README). Stage 3 adds slopes and stairs on top of that — see
+[Stage 3: slopes and stairs](#stage-3-slopes-and-stairs) for the full
+results and known limits. Current best overall checkpoint: `runs/p_stairs`
+(handles everything from stages 1-2, plus slopes to ±20° and stairs to
+6 cm cleanly; ascending stairs above ~8 cm is a known, documented limit).
 
-A ready-to-run copy of that checkpoint is committed at `pretrained/k_hardmine/`
-(2.7 MB), so you can watch it walk right after cloning, no training needed:
+A ready-to-run copy is committed at `pretrained/p_stairs/` so you can watch
+it walk right after cloning, no training needed:
 ```bash
 pip install -r requirements.txt
-python play.py --run-dir pretrained/k_hardmine --target-speed 0.8 --terrain-amplitude 0.12 --record out.gif
+python play.py --run-dir pretrained/p_stairs --target-speed 0.5 --stair-height 0.06 --record out.gif
 ```
+(`pretrained/o_slope_consolidate/` — slopes and terrain, no stairs yet — and
+`pretrained/k_hardmine/` from `main` — terrain only — are also committed, in
+case you want an earlier stage's checkpoint specifically.)
 
 ```
 go1_rl_walk/
@@ -36,8 +44,10 @@ go1_rl_walk/
 ├── smoke_test.py          # Sanity-check the model with no RL deps; also runs the crawl gait
 ├── runs/<name>/           # One dir per training run: checkpoints/, logs/, args.json, env_kwargs.json
 │                          #   (gitignored — see pretrained/ for a committed checkpoint)
-├── pretrained/k_hardmine/  # Committed copy of the current best checkpoint (same layout as a run
-│                          #   dir, minus logs/) — a valid --run-dir with no training required
+├── pretrained/             # Committed, ready-to-run checkpoints (same layout as a run dir, minus
+│   ├── k_hardmine/         #   logs/) -- each is a valid --run-dir with no training required:
+│   ├── o_slope_consolidate/ #  k_hardmine (stages 1-2), o_slope_consolidate (+slopes),
+│   └── p_stairs/            #  p_stairs (+stairs -- current overall best)
 ├── requirements.txt
 └── LICENSE                # MIT
 ```
@@ -173,6 +183,56 @@ python train.py --run-name my_hardmine --n-envs 16 --timesteps 8000000 \
     --kp 80 --kd 2 --air-time-cap --air-time-weight 1.0 --foot-clearance-weight 0.3
 ```
 
+**Stage 3a — slopes.** The actual result (`runs/o_slope_consolidate`) took
+4 chained fine-tunes from `k_hardmine`, not one step — `l_slopes` (14M
+steps, introduced the slope curriculum, but regressed flat-ground drift and
+gait symmetry once it reached its hardest angle) → `m_slope_hardmine` (+8M,
+hard-mined the hard region, fixed the drift but only partly fixed the
+symmetry) → `n_slope_steep_hardmine` (+10M, narrowed further, fixed some
+angles and broke others — 3rd occurrence of narrow hard-mining trading one
+corner's quality for another's) → `o_slope_consolidate` (+12M, a single
+broad pass: full ranges, no narrowing, less reopened exploration noise —
+this is what finally gave a clean win on every metric at once). See
+[Stage 3: slopes and stairs](#stage-3-slopes-and-stairs) for the full story.
+**Untested shortcut:** if starting fresh, the broad-pass command below run
+directly from `k_hardmine` for more steps (order 40M+, matching the total
+above) would be worth trying before repeating the narrow intermediate
+steps — but this hasn't actually been verified as a substitute for the real
+chain, so don't assume it reproduces the same result:
+```bash
+python train.py --run-name my_slopes --n-envs 16 --timesteps 12000000 \
+    --resume pretrained/k_hardmine/checkpoints/go1_flat_final.zip \
+    --resume-log-std -2.0 --learning-rate 1.2e-4 \
+    --speed-range-min 0.2 --speed-range-max 1.0 --speed-curriculum-start 1.0 --speed-curriculum-steps 1 \
+    --terrain-amp-min 0.0 --terrain-amp-max 0.12 --terrain-curriculum-start 0.12 --terrain-curriculum-steps 1 \
+    --slope-min-deg 0 --slope-max-deg 20 --slope-curriculum-start 20 --slope-curriculum-steps 1 --ramp-length 8.0 \
+    --friction-range 0.5 1.25 --mass-scale-range 0.9 1.1 --push-velocity 0.3 \
+    --gait-period 0.7 --gait-period-fast 0.45 --gait-style trot \
+    --phase-match-weight 0.5 --phase-match-warmup-steps 1 \
+    --lateral-tracking-weight 0.7 --body-frame-velocity \
+    --kp 80 --kd 2 --air-time-cap --air-time-weight 1.0 --foot-clearance-weight 0.3
+```
+
+**Stage 3b — stairs** (`runs/p_stairs`, resumed from `o_slope_consolidate`,
+14M steps): every axis kept at its full existing range from the start —
+narrowing while introducing a new axis reliably eroded other capabilities in
+stage 3a, so this stage deliberately didn't repeat that mistake:
+```bash
+python train.py --run-name my_stairs --n-envs 16 --timesteps 14000000 \
+    --resume pretrained/o_slope_consolidate/checkpoints/go1_flat_final.zip \
+    --resume-log-std -1.8 --learning-rate 2e-4 \
+    --speed-range-min 0.2 --speed-range-max 1.0 --speed-curriculum-start 1.0 --speed-curriculum-steps 1 \
+    --terrain-amp-min 0.0 --terrain-amp-max 0.12 --terrain-curriculum-start 0.12 --terrain-curriculum-steps 1 \
+    --slope-min-deg 0 --slope-max-deg 20 --slope-curriculum-start 20 --slope-curriculum-steps 1 --ramp-length 8.0 \
+    --stair-height-min 0.0 --stair-height-max 0.12 --stair-curriculum-start 0.0 --stair-curriculum-steps 8000000 \
+    --stair-depth 0.25 --num-stairs 8 \
+    --friction-range 0.5 1.25 --mass-scale-range 0.9 1.1 --push-velocity 0.3 \
+    --gait-period 0.7 --gait-period-fast 0.45 --gait-style trot \
+    --phase-match-weight 0.5 --phase-match-warmup-steps 1 \
+    --lateral-tracking-weight 0.7 --body-frame-velocity \
+    --kp 80 --kd 2 --air-time-cap --air-time-weight 1.0 --foot-clearance-weight 0.3
+```
+
 Monitor any of these with `tensorboard --logdir runs` (`rollout/ep_len_mean`
 climbing to 1000 = full-length episodes; `reward_components/*` breaks the
 total down by term; `curriculum/*` shows the speed/terrain ramps).
@@ -219,7 +279,9 @@ weights) from that run's saved `env_kwargs.json`.
   heading/lateral-position drift penalties + torque/energy cost +
   action-rate smoothness + a diagonal-trot timing bonus against a
   speed-scaled clock (`--phase-match-weight`) + a capped foot air-time
-  bonus + foot-clearance bonus + survival bonus. Optional but currently
+  bonus + a foot-clearance bonus (its target scales up per-episode to
+  clear the current stair height, `max(target_clearance, stair_h+0.03)`)
+  + survival bonus. Optional but currently
   unused (0 weight) in the working recipe: trot-symmetry bonus and
   per-foot duty-cycle penalties — see `train.py --help` for why. Weights
   are in `Go1FlatEnv._compute_reward`.
@@ -234,11 +296,23 @@ weights) from that run's saved `env_kwargs.json`.
 - **Domain randomization**: joint/height/yaw jitter and floor+foot friction
   on every run; trunk mass scale and random horizontal pushes on terrain
   runs (`--mass-scale-range`, `--push-velocity`).
-- **Rough terrain** (`--terrain-amp-max`): a MuJoCo heightfield, regenerated
-  every episode (interpolated random noise, feature size randomized 15 cm-1
-  m, flat start pad, amplitude sampled per episode and ramped by a
-  curriculum). Only built into the model when enabled — the flat env is
-  bit-identical to before terrain support existed.
+- **Rough terrain, slopes, stairs** (`--terrain-amp-max`/`--slope-max-deg`/
+  `--stair-height-max`): all three share one MuJoCo heightfield, regenerated
+  every episode and additive (any combination can be nonzero at once — a
+  sloped, bumpy staircase). Bumps are interpolated random noise (feature
+  size 15 cm-1 m); a slope is a flat pad, then a constant grade over
+  `--ramp-length`, then a flat plateau; stairs are the same shape with a
+  step function instead. Direction (uphill/downhill, ascending/descending)
+  is represented by which end of the pad is elevated, not a negative
+  height — a heightfield can't go below its own z=0 plane. A stair riser
+  is a steep ramp within one 5 cm grid cell, not a true vertical face.
+  The terrain-generating code is only built into the model when at least
+  one of these is enabled — the flat env is bit-identical to before any
+  terrain support existed.
+- **Gait clock timing** (`--gait-period-fast`/`--gait-period-stair-stretch`):
+  the trot clock's period shortens for higher commanded speed and
+  lengthens for a taller current-episode stair, giving a big lift more
+  real time to complete instead of being rushed by a fixed rhythm.
 
 ## Current status
 
@@ -278,25 +352,120 @@ extending this:
   sampling is still uniform from 0. Fixed with a `--terrain-amp-min`
   hard-mining fine-tune once the full curriculum has already run.
 
+## Stage 3: slopes and stairs
+
+Both reuse the rough-terrain heightfield end to end (same spawn-safety lift,
+terrain-relative height/contact/termination) — see `Go1FlatEnv._generate_terrain`.
+A slope is a flat pad, then a constant grade over a configurable run, then a
+flat plateau (`--slope-min-deg`/`--slope-max-deg`/`--ramp-length`). Stairs are
+the same shape with a step function instead of a ramp (`--stair-height-min`/
+`--stair-height-max`/`--stair-depth`/`--num-stairs`); both directions
+("uphill"/"downhill", "ascending"/"descending") are represented by which end
+of the pad is elevated, since a MuJoCo heightfield can't go below its own
+z=0 plane. **Known approximation:** a heightfield can only change height
+within one 5 cm grid cell, so a stair riser is a steep ramp (~63° for a
+12 cm step), not a true vertical face.
+
+**Results, `runs/p_stairs`** (resumed from `runs/o_slope_consolidate`, full
+0.2-1.0 m/s / 0-12 cm terrain / 0-20° slope / 0-12 cm stairs ranges, all kept
+at their full extent rather than narrowed — see the whack-a-mole note below):
+
+| | Falls |
+|---|---|
+| Slopes alone, ±20°, flat ground | 0% |
+| Slopes + 12 cm rough terrain, ±20° | 0-6% |
+| Stairs alone, ≤6 cm, either direction | 0% |
+| Stairs alone, 12 cm ascending | 6% falls, but see the limitation below |
+| Stairs alone, 12 cm descending | 31% |
+| Descending 12 cm stairs + any steep downhill slope | ~100% (an extreme, rarely-occurring compound corner) |
+
+**Known limitation, not resolved: ascending stairs above ~8 cm.** Fall rate
+alone is misleading here — the robot mostly doesn't fall, it gets physically
+*stuck*, planting itself at the first or second step and making no further
+forward progress (confirmed by a user manually testing 12 cm ascending stairs,
+then traced numerically: trunk x-position plateaus and oscillates in a ~6 cm
+range for the rest of the episode; visually confirmed in a GIF). Two
+different, reasonable fixes were tried and both failed to help:
+1. The foot-clearance reward capped its benefit at a fixed 4 cm lift
+   regardless of the actual obstacle, so a foot had no incentive to lift
+   higher even when the stair needed it (median swing height was only
+   6.6 cm on a 12 cm riser). Fixed with a per-episode adaptive target
+   (`_episode_target_clearance = max(target_clearance, stair_h + 0.03)`) —
+   confirmed correctly active, made no difference to the stuck behavior.
+2. The trot clock enforces a fixed ~0.3 s swing regardless of what's
+   underfoot, which might simply not be enough time to lift 12 cm. Added
+   `--gait-period-stair-stretch` to slow the clock on tall steps (mirrors
+   how `--gait-period-fast` already speeds it up for higher commanded
+   speed) — confirmed correctly stretching the period, still no
+   improvement, and speed measurably *degraded* starting around 8 cm even
+   before either fix (0.35 m/s at 8 cm vs. a 0.5 m/s command).
+
+Since two structurally different levers (a missing incentive, and a timing
+constraint) both failed to move this, and the degradation was already
+present before any fix was attempted, this looks like a genuine capability
+boundary rather than a tunable-parameter bug — consistent with the Go1's own
+quoted ~10 cm rated step-climbing spec. The most likely real fix is more
+invasive than reward tuning: completing a much longer single-leg swing
+probably needs active weight-shifting onto the other three legs (the same
+lesson as the stage-0 scripted crawl gait's center-of-mass shift), which the
+current always-diagonal-trot pattern doesn't offer, or genuine exteriorception
+(the policy is blind — no heightmap/vision — so it can't anticipate a tall
+step before touching it; see "Terrain-aware observation" below). Both
+`--gait-period-stair-stretch` and the adaptive clearance target are kept in
+the codebase (default off/unchanged, so they cost nothing) since they're
+reasonable, generically useful levers even though neither solved this case.
+
+**The "broad consolidation" lesson from slopes did not transfer to stairs.**
+For slopes, narrow hard-mining passes reliably traded one corner's quality
+for another's (fixing one angle's gait symmetry regressed another's, or fixed
+falls at the cost of flat-ground drift) across three successive attempts,
+until a single broad pass (full range, longer duration, less reopened
+exploration noise) finally gave a clean win on every metric at once
+(`runs/o_slope_consolidate`). Applying that exact same "broad, full-range,
+lower-noise" strategy to stairs (`runs/q_stairs_consolidate`) did **not**
+repeat that success — it improved some fall-rate corners but made gait
+symmetry and flat-ground drift *worse* than the run before it, without fixing
+the underlying stall. **Don't assume a fix that worked for one terrain type
+generalizes to another — re-verify every time**, and don't assume "more
+training, less narrowing" is a universal fix just because it worked once.
+
+**Two other things worth knowing if you extend this:**
+- Fall-rate metrics alone miss "stuck without falling." `eval_policy.py`'s
+  fall rate only counts termination events; a policy that stalls without
+  tipping over reports a *low* (reassuring) fall rate while completely
+  failing the task. Always sanity-check a policy visually (`play.py
+  --record`) or by tracing trunk position over time, not just by pass/fail
+  statistics — this is exactly how the stairs stall was found (by a human
+  watching it, not by the automated eval).
+- Signed height/angle CLI flags (`--stair-height`, `--slope-deg`) are in
+  metres/degrees, not centimetres. Passing `-6` instead of `-0.06` silently
+  creates absurd multi-metre terrain that clips against the heightfield's
+  elevation cap — the tell is identical-looking stats across different
+  inputs, since both get clamped to the same degenerate geometry.
+
 ## Next stages
 
-Ideas for extending past `runs/k_hardmine`, roughly in order of effort:
+Ideas for extending past `runs/p_stairs`, roughly in order of effort:
 
 1. **Terrain-aware observation** — give the policy some exteroception (a
    small local heightmap or a handful of ray-cast height samples ahead of
    each foot) instead of pure proprioception. Likely the highest-leverage
-   change for anything harder than the current terrain, since right now the
-   policy only reacts to a bump after a foot has already landed on it.
-2. **Slopes** — tilt terrain patches or ramp geoms at increasing angles
-   (5°→20°); add a slope-angle term to the observation.
-3. **Stairs** — stacked box geoms with step heights around the Go1's
-   quoted 10 cm default step-climbing capability, then push beyond it.
-4. **Discrete obstacles / gaps** — random box/cylinder clutter and narrow
+   change for anything harder than the current terrain, and plausibly the
+   real fix for the ascending-stairs limit above, since right now the
+   policy can't tell a tall step apart from a short one before touching it.
+   Requires breaking `--resume` compatibility (the observation shape would
+   grow), so budget for retraining the whole stack from scratch or doing
+   network surgery to preserve existing weights.
+2. **A non-trot gait mode for extreme obstacles** — let the policy fall back
+   to a more statically-stable, weight-shifting pattern (closer to the
+   stage-0 scripted crawl) instead of the always-diagonal trot when facing
+   a very tall stair, rather than forcing the trot clock everywhere.
+3. **Discrete obstacles / gaps** — random box/cylinder clutter and narrow
    gaps, forcing more deliberate foot placement (pairs well with #1).
-5. **Higher top speed** — the current trot always keeps ≥2 feet down; a
+4. **Higher top speed** — the current trot always keeps ≥2 feet down; a
    faster gait needs a flight phase (0 feet down briefly), which the
    `phase_match` clock's stance/swing split would need to change to allow.
-6. **Sim-to-real** — swap in the higher-fidelity mesh model from MuJoCo
+5. **Sim-to-real** — swap in the higher-fidelity mesh model from MuJoCo
    Menagerie (see the model note above), and add the usual sim-to-real
    staples: actuator/observation latency, torque-domain randomization
    (not just PD gains), and observation noise.
