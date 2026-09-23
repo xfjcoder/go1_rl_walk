@@ -344,6 +344,13 @@ def main():
     g.add_argument("--foot-clearance-weight", type=float, default=0.08,
                     help="Weight of the swing-foot lift bonus. Without this, tiny/fast low-clearance "
                          "shuffling scores as well as a bold, visible stride.")
+    g.add_argument("--target-clearance", type=float, default=0.04,
+                    help="Base swing-foot lift target (m); the reward caps its benefit here, so a foot "
+                         "has NO incentive to lift any higher than this even when the terrain needs it. "
+                         "The env raises the EFFECTIVE per-episode target to stair_height+0.03 when "
+                         "stairs are enabled, so this only sets the floor (flat/slope/bump episodes). "
+                         "Confirmed: leaving this at the 4cm default while training 12cm stairs left a "
+                         "policy physically stuck at the first riser (median swing height 6.6cm).")
     g.add_argument("--trot-weight", type=float, default=0.15,
                     help="Weight of the diagonal trot-symmetry reward bonus. CAUTION: a heavier "
                          "weight (tried at 0.3 alongside body-frame velocity / yaw-rate shaping) "
@@ -478,7 +485,8 @@ def main():
 
     env_kwargs = dict(
         target_speed=args.target_speed, trot_symmetry_weight=args.trot_weight,
-        foot_clearance_weight=args.foot_clearance_weight, heading_weight=args.heading_weight,
+        foot_clearance_weight=args.foot_clearance_weight, target_clearance=args.target_clearance,
+        heading_weight=args.heading_weight,
         lateral_position_weight=args.lateral_position_weight,
         body_frame_velocity=args.body_frame_velocity, yaw_rate_weight=args.yaw_rate_weight,
         air_time_cap=args.air_time_cap,

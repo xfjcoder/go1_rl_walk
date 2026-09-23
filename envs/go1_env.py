@@ -96,7 +96,15 @@ class Go1FlatEnv(gym.Env):
         foot_clearance_weight: float = 0.08,  # bonus for lifting a swinging foot toward target_clearance;
                                                # without this, tiny/fast low-clearance shuffling can score
                                                # just as well as a bold, visible stride
-        target_clearance: float = 0.04,       # target foot lift height (m) during swing phase
+        target_clearance: float = 0.04,       # target foot lift height (m) during swing phase; the
+                                               # EFFECTIVE per-episode target is max(this, stair_h + 0.03)
+                                               # -- see _episode_target_clearance -- so a tall stair riser
+                                               # actually raises the reward's incentive to lift higher,
+                                               # instead of capping out at 4cm regardless of the obstacle
+                                               # (confirmed: this cap was why a trained policy got physically
+                                               # stuck at the first stair on a 12cm riser -- median swing
+                                               # height was only 6.6cm, well under what's needed to clear it,
+                                               # because lifting higher than 4cm earned no extra reward).
         heading_weight: float = 0.5,          # penalize yaw deviation from straight-ahead
         lateral_position_weight: float = 0.3,  # penalize y-position drift from the start line
         body_frame_velocity: bool = False,     # track / penalize velocity in the BODY frame (forward = where
@@ -258,6 +266,7 @@ class Go1FlatEnv(gym.Env):
         self.trot_symmetry_weight = trot_symmetry_weight
         self.foot_clearance_weight = foot_clearance_weight
         self.target_clearance = target_clearance
+        self._episode_target_clearance = target_clearance
         self.heading_weight = heading_weight
         self.body_frame_velocity = body_frame_velocity
         self.yaw_rate_weight = yaw_rate_weight
@@ -443,6 +452,7 @@ class Go1FlatEnv(gym.Env):
             else:
                 stair_h, ascending = 0.0, True
             self._generate_terrain(amp, slope_deg, uphill, stair_h, ascending)
+            self._episode_target_clearance = max(self.target_clearance, stair_h + 0.03)
         self._next_push_step = int(self._rng.integers(150, 300)) if self.push_velocity > 0 else 10**9
 
         mujoco.mj_resetData(self.model, self.data)
@@ -861,7 +871,8 @@ class Go1FlatEnv(gym.Env):
         foot_heights = foot_heights_for_contact  # same values, already computed above
         swing = ~touches
         if swing.any():
-            clearance_frac = np.minimum(foot_heights[swing], self.target_clearance) / self.target_clearance
+            tgt = self._episode_target_clearance
+            clearance_frac = np.minimum(foot_heights[swing], tgt) / tgt
             r_foot_clearance = self.foot_clearance_weight * float(np.mean(clearance_frac))
         else:
             r_foot_clearance = 0.0
