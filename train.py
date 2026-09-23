@@ -449,6 +449,12 @@ def main():
                     help="Base radius (m) of each obstacle's footprint (actual radius/height randomized "
                          "+-30% per obstacle).")
     g.add_argument("--num-obstacles", type=int, default=6, help="Obstacles scattered per episode.")
+    g.add_argument("--use-terrain-heightmap", action=argparse.BooleanOptionalAction, default=False,
+                    help="Add a 3x3 local heightmap (9 dims) to the observation -- see "
+                         "Go1FlatEnv.__init__ for the exact layout. Changes obs_dim 51->60, breaking "
+                         "--resume with any pre-existing (blind) checkpoint; use "
+                         "expand_obs_checkpoint.py to warm-start one instead of retraining from "
+                         "scratch. Default False = every prior run's exact behavior, unchanged.")
     g.add_argument("--obstacle-lane-half-width", type=float, default=0.4,
                     help="Metres either side of y=0 that obstacles are placed within. Narrower than the "
                          "full course width so obstacles actually land in the robot's walking path -- "
@@ -528,6 +534,7 @@ def main():
         obstacle_height_range=([args.obstacle_height_min, args.obstacle_height_max] if args.obstacle_height_max is not None else None),
         obstacle_radius=args.obstacle_radius, num_obstacles=args.num_obstacles,
         obstacle_lane_half_width=args.obstacle_lane_half_width,
+        use_terrain_heightmap=args.use_terrain_heightmap,
         friction_range=list(args.friction_range),
         mass_scale_range=list(args.mass_scale_range) if args.mass_scale_range else None,
         push_velocity=args.push_velocity,

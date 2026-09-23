@@ -148,6 +148,17 @@ class Go1FlatEnv(gym.Env):
                                                # cross the robot's path (confirmed: a 12cm-obstacle
                                                # episode's terrain height was exactly 0 along the robot's
                                                # entire walked path) -- a trivial, uninformative test.
+        use_terrain_heightmap: bool = False,   # add a 3x3 local heightmap (9 dims) to the observation:
+                                               # terrain height at points ahead of the trunk (forward
+                                               # 0.15/0.35/0.55m x lateral -0.15/0/0.15m, in the trunk's
+                                               # own frame), relative to the height directly under the
+                                               # trunk. All zero on flat ground -- this is the ONLY
+                                               # terrain-aware channel; everything else stays
+                                               # proprioceptive. Changes obs_dim 51->60, so it breaks
+                                               # --resume with any pre-existing (blind) checkpoint --
+                                               # see expand_obs_checkpoint.py to warm-start one instead
+                                               # of retraining from scratch. Default False = unchanged
+                                               # 51-dim observation, bit-identical to every prior run.
         gait_period_stair_stretch: float = 0.0,  # extra seconds of gait period per metre of the current
                                                # episode's stair riser height, on top of the speed-based
                                                # period. Gives a tall step's swing phase more real time to
@@ -313,6 +324,7 @@ class Go1FlatEnv(gym.Env):
         self.obstacle_radius = obstacle_radius
         self.num_obstacles = num_obstacles
         self.obstacle_lane_half_width = obstacle_lane_half_width
+        self.use_terrain_heightmap = use_terrain_heightmap
         self.terrain_enabled = (self.terrain_amplitude_range is not None or terrain_amplitude is not None
                                 or self.slope_range is not None or slope_deg is not None
                                 or self.stair_height_range is not None or stair_height is not None
@@ -405,6 +417,8 @@ class Go1FlatEnv(gym.Env):
         self._kd = self._kd_value   # PD velocity gain (N*m*s/rad)
 
         obs_dim = 3 + 3 + 4 + 12 + 12 + 12 + 3 + 2  # see _get_obs for layout (+2 for gait-phase clock)
+        if self.use_terrain_heightmap:
+            obs_dim += 9  # 3x3 local heightmap, see _local_heightmap
         self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(obs_dim,), dtype=np.float32)
 
         self._prev_action = np.zeros(12, dtype=np.float32)
@@ -748,6 +762,22 @@ class Go1FlatEnv(gym.Env):
     # ------------------------------------------------------------------ #
     # Observation
     # ------------------------------------------------------------------ #
+    def _local_heightmap(self) -> np.ndarray:
+        """Terrain height (m) at a 3x3 grid of points ahead of the trunk, in the trunk's OWN
+        forward/lateral frame (rotated by current yaw so it's always "what's ahead of me"
+        regardless of heading), relative to the height directly under the trunk. All zero on
+        flat ground / no terrain enabled."""
+        x0, y0 = self.data.qpos[0], self.data.qpos[1]
+        qw, qx, qy, qz = self.data.qpos[3:7]
+        yaw = np.arctan2(2 * (qw * qz + qx * qy), 1 - 2 * (qy ** 2 + qz ** 2))
+        c, s = np.cos(yaw), np.sin(yaw)
+        fwd, lat = np.array([0.15, 0.35, 0.55]), np.array([-0.15, 0.0, 0.15])
+        F, L = np.meshgrid(fwd, lat, indexing="ij")
+        wx = x0 + F * c - L * s
+        wy = y0 + F * s + L * c
+        h = self._terrain_height(wx.ravel(), wy.ravel()) - self._terrain_height(x0, y0)
+        return h.astype(np.float32)
+
     def _get_obs(self):
         quat = self.data.sensordata[self._imu_quat_adr:self._imu_quat_adr + 4]
         gravity_vec = self._quat_rotate_inv(quat, np.array([0.0, 0.0, -1.0]))
@@ -761,11 +791,12 @@ class Go1FlatEnv(gym.Env):
         phase = self._gait_phase()
         phase_clock = np.array([np.sin(2 * np.pi * phase), np.cos(2 * np.pi * phase)], dtype=np.float32)
 
-        # Layout (dim 51): gravity(3) + ang_vel(3) + base_quat(4) + joint_pos(12)
-        #                   + joint_vel(12) + prev_action(12) + command(3) + phase_clock(2)
-        obs = np.concatenate([
-            gravity_vec, ang_vel, quat, joint_pos, joint_vel, self._prev_action, command, phase_clock
-        ]).astype(np.float32)
+        # Layout (dim 51, or 60 with use_terrain_heightmap): gravity(3) + ang_vel(3) + base_quat(4)
+        #   + joint_pos(12) + joint_vel(12) + prev_action(12) + command(3) + phase_clock(2) [+ heightmap(9)]
+        parts = [gravity_vec, ang_vel, quat, joint_pos, joint_vel, self._prev_action, command, phase_clock]
+        if self.use_terrain_heightmap:
+            parts.append(self._local_heightmap())
+        obs = np.concatenate(parts).astype(np.float32)
         return obs
 
 
