@@ -90,6 +90,9 @@ def main():
     ap.add_argument("--stair-height", type=float, nargs="+", default=None,
                     help="stair riser height(s) in m to evaluate at (signed: + ascending, - descending). "
                          "Default: 0 0.06 -0.06 0.12 -0.12 for a run trained with stairs, else flat.")
+    ap.add_argument("--obstacle-height", type=float, nargs="+", default=None,
+                    help="discrete obstacle height(s) in m to evaluate at. Default: 0 0.06 0.12 for a "
+                         "run trained with obstacles, else flat.")
     ap.add_argument("--target-speed", type=float, nargs="+", default=None,
                     help="command speed(s) to evaluate at. Default: the run's fixed speed, or 0.3 0.5 0.8 1.0 "
                          "for a run trained with a command-speed range.")
@@ -105,6 +108,7 @@ def main():
     trained_on_terrain = bool(env_kwargs.get("terrain_amplitude_range"))
     trained_on_slope = bool(env_kwargs.get("slope_range"))
     trained_on_stairs = bool(env_kwargs.get("stair_height_range"))
+    trained_on_obstacles = bool(env_kwargs.get("obstacle_height_range"))
     if args.target_speed is not None:
         speeds = args.target_speed
     elif trained_on_terrain:
@@ -131,23 +135,32 @@ def main():
         stairs = [0.0, 0.06, -0.06, 0.12, -0.12]
     else:
         stairs = [None]
+    if args.obstacle_height is not None:
+        obstacles = args.obstacle_height
+    elif trained_on_obstacles:
+        obstacles = [0.0, 0.06, 0.12]
+    else:
+        obstacles = [None]
     print(f"model={model_path}.zip  kp={env_kwargs['kp']} kd={env_kwargs['kd']}")
     for a in amps:
         for s in slopes:
             for st in stairs:
-                for v in speeds:
-                    # fixed command, terrain amplitude, slope, and stair height per evaluation
-                    kw = dict(env_kwargs, target_speed=v, command_speed_range=None,
-                              terrain_amplitude_range=None, terrain_amplitude=a,
-                              slope_range=None, slope_deg=s,
-                              stair_height_range=None, stair_height=st)
-                    e = evaluate(model_path, vec, kw, args.episodes, args.seconds)
-                    terr = "flat" if a is None else f"terrain {a * 100:.0f} cm"
-                    slope_s = "" if s is None else f" slope {s:+.0f}deg"
-                    stair_s = "" if st is None else f" stairs {st * 100:+.0f}cm"
-                    print(f"{terr:>11s}{slope_s:>11s}{stair_s:>13s} | command {v:.2f} m/s: fall_rate={e['fall_rate']:.2f}  survival={e['mean_survival_s']:5.1f}s/{args.seconds:.0f}s"
-                          f"  speed mean={e['speed_mean']:+.3f} median={e['speed_median']:+.3f}"
-                          f"  |y|={e['abs_y_mean']:.2f} m  |yaw|={e['abs_yaw_mean']:.1f} deg", flush=True)
+                for ob in obstacles:
+                    for v in speeds:
+                        # fixed command, terrain amplitude, slope, stair height, obstacle height per evaluation
+                        kw = dict(env_kwargs, target_speed=v, command_speed_range=None,
+                                  terrain_amplitude_range=None, terrain_amplitude=a,
+                                  slope_range=None, slope_deg=s,
+                                  stair_height_range=None, stair_height=st,
+                                  obstacle_height_range=None, obstacle_height=ob)
+                        e = evaluate(model_path, vec, kw, args.episodes, args.seconds)
+                        terr = "flat" if a is None else f"terrain {a * 100:.0f} cm"
+                        slope_s = "" if s is None else f" slope {s:+.0f}deg"
+                        stair_s = "" if st is None else f" stairs {st * 100:+.0f}cm"
+                        obs_s = "" if ob is None else f" obstacles {ob * 100:.0f}cm"
+                        print(f"{terr:>11s}{slope_s:>11s}{stair_s:>13s}{obs_s:>14s} | command {v:.2f} m/s: fall_rate={e['fall_rate']:.2f}  survival={e['mean_survival_s']:5.1f}s/{args.seconds:.0f}s"
+                              f"  speed mean={e['speed_mean']:+.3f} median={e['speed_median']:+.3f}"
+                              f"  |y|={e['abs_y_mean']:.2f} m  |yaw|={e['abs_yaw_mean']:.1f} deg", flush=True)
 
 
 if __name__ == "__main__":

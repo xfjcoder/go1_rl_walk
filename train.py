@@ -434,6 +434,21 @@ def main():
                     help="Tread depth (m) of each stair. Kept a multiple of the 5cm heightfield cell "
                          "size for a crisp riser edge.")
     g.add_argument("--num-stairs", type=int, default=8, help="Number of steps before leveling into a plateau.")
+    g.add_argument("--obstacle-height-min", type=float, default=0.0,
+                    help="Lower end of the sampled obstacle height range (m). Raise for hard-mining, "
+                         "same idea as --terrain-amp-min.")
+    g.add_argument("--obstacle-height-max", type=float, default=None,
+                    help="Enable discrete obstacles: each episode samples a height (m) ~ U(min, current "
+                         "max) and scatters --num-obstacles isolated round bumps at random positions on "
+                         "otherwise-flat ground (unlike --terrain-amp-max's continuous noise everywhere). "
+                         "Unset = no obstacles; combines with terrain/slope/stairs if set together.")
+    g.add_argument("--obstacle-curriculum-start", type=float, default=0.0,
+                    help="Obstacle height max at the start of the run (m); ramps to --obstacle-height-max.")
+    g.add_argument("--obstacle-curriculum-steps", type=int, default=10_000_000)
+    g.add_argument("--obstacle-radius", type=float, default=0.10,
+                    help="Base radius (m) of each obstacle's footprint (actual radius/height randomized "
+                         "+-30% per obstacle).")
+    g.add_argument("--num-obstacles", type=int, default=6, help="Obstacles scattered per episode.")
     g.add_argument("--gait-period-stair-stretch", type=float, default=0.0,
                     help="Extra seconds of gait period per metre of the current episode's stair riser "
                          "height (0 = off). Gives a tall step's swing phase more real time to complete "
@@ -506,6 +521,8 @@ def main():
         stair_height_range=([args.stair_height_min, args.stair_height_max] if args.stair_height_max is not None else None),
         stair_depth=args.stair_depth, num_stairs=args.num_stairs,
         gait_period_stair_stretch=args.gait_period_stair_stretch,
+        obstacle_height_range=([args.obstacle_height_min, args.obstacle_height_max] if args.obstacle_height_max is not None else None),
+        obstacle_radius=args.obstacle_radius, num_obstacles=args.num_obstacles,
         friction_range=list(args.friction_range),
         mass_scale_range=list(args.mass_scale_range) if args.mass_scale_range else None,
         push_velocity=args.push_velocity,
@@ -531,6 +548,8 @@ def main():
         env.set_attr("slope_deg_max_current", args.slope_curriculum_start)
     if args.stair_height_max is not None:
         env.set_attr("stair_height_max_current", args.stair_curriculum_start)
+    if args.obstacle_height_max is not None:
+        env.set_attr("obstacle_height_max_current", args.obstacle_curriculum_start)
     env = VecMonitor(env)
     vec_path = vecnormalize_path_for(args.resume) if args.resume else None
     if vec_path and os.path.exists(vec_path):
@@ -602,6 +621,9 @@ def main():
     if args.stair_height_max is not None:
         callbacks.append(RampCallback("stair_height_max_current", "stair_height_max", args.stair_curriculum_start,
                                       args.stair_height_max, args.stair_curriculum_steps))
+    if args.obstacle_height_max is not None:
+        callbacks.append(RampCallback("obstacle_height_max_current", "obstacle_height_max", args.obstacle_curriculum_start,
+                                      args.obstacle_height_max, args.obstacle_curriculum_steps))
     if args.phase_match_warmup_steps > 0:
         callbacks.append(RewardWarmupCallback(
             attr_name="phase_match_weight",

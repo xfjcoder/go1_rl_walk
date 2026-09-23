@@ -29,6 +29,7 @@ def main():
     ap.add_argument("--terrain-amplitude", type=float, default=None, help="evaluate on rough terrain of this amplitude (m)")
     ap.add_argument("--slope-deg", type=float, default=None, help="evaluate on a slope of this angle (deg, signed: + uphill, - downhill)")
     ap.add_argument("--stair-height", type=float, default=None, help="evaluate on stairs of this riser height (m, signed: + ascending, - descending)")
+    ap.add_argument("--obstacle-height", type=float, default=None, help="evaluate with discrete obstacles of this height (m)")
     ap.add_argument("--target-speed", type=float, default=None, help="fixed command speed (default: the run's)")
     ap.add_argument("--seconds", type=float, default=20.0)
     args = ap.parse_args()
@@ -47,6 +48,8 @@ def main():
     kw["slope_deg"] = args.slope_deg
     kw["stair_height_range"] = None
     kw["stair_height"] = args.stair_height
+    kw["obstacle_height_range"] = None
+    kw["obstacle_height"] = args.obstacle_height
     model = PPO.load(path, device="cpu")
     env = DummyVecEnv([lambda: Go1FlatEnv(render_mode=None, domain_randomize=True, **kw)])
     env.seed(args.seed)

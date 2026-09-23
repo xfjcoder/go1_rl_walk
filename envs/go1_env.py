@@ -131,6 +131,16 @@ class Go1FlatEnv(gym.Env):
                                                # grid cell, not a true vertical face, so a riser is a steep ramp
                                                # over one HF_CELL (5 cm), not a perfect right angle.
         num_stairs: int = 8,                   # number of steps before leveling into a plateau
+        obstacle_height_range: tuple | None = None,  # (lo, hi) metres: enable discrete obstacles --
+                                               # num_obstacles isolated round bumps of random height and
+                                               # position scattered on otherwise-flat ground (not continuous
+                                               # noise everywhere, unlike terrain_amplitude), each episode.
+                                               # Sampled like slope_range (U(lo, obstacle_height_max_current)).
+                                               # Additive with bumps/slope/stairs.
+        obstacle_height: float | None = None,   # fixed obstacle height (m) -- for evaluation
+        obstacle_radius: float = 0.10,          # metres, base radius of each obstacle's footprint
+                                               # (actual radius/height randomized +-30% per obstacle)
+        num_obstacles: int = 6,                # obstacles scattered per episode
         gait_period_stair_stretch: float = 0.0,  # extra seconds of gait period per metre of the current
                                                # episode's stair riser height, on top of the speed-based
                                                # period. Gives a tall step's swing phase more real time to
@@ -290,9 +300,15 @@ class Go1FlatEnv(gym.Env):
         self.stair_depth = stair_depth
         self.num_stairs = num_stairs
         self.gait_period_stair_stretch = gait_period_stair_stretch
+        self.obstacle_height_range = tuple(obstacle_height_range) if obstacle_height_range else None
+        self.obstacle_height = obstacle_height
+        self.obstacle_height_max_current = self.obstacle_height_range[1] if self.obstacle_height_range else None
+        self.obstacle_radius = obstacle_radius
+        self.num_obstacles = num_obstacles
         self.terrain_enabled = (self.terrain_amplitude_range is not None or terrain_amplitude is not None
                                 or self.slope_range is not None or slope_deg is not None
-                                or self.stair_height_range is not None or stair_height is not None)
+                                or self.stair_height_range is not None or stair_height is not None
+                                or self.obstacle_height_range is not None or obstacle_height is not None)
         self.friction_range = tuple(friction_range)
         self.mass_scale_range = tuple(mass_scale_range) if mass_scale_range else None
         self.push_velocity = push_velocity
@@ -457,7 +473,14 @@ class Go1FlatEnv(gym.Env):
                 ascending = bool(self._rng.integers(0, 2))
             else:
                 stair_h, ascending = 0.0, True
-            self._generate_terrain(amp, slope_deg, uphill, stair_h, ascending)
+            if self.obstacle_height is not None:
+                obstacle_h = self.obstacle_height
+            elif self.obstacle_height_range is not None:
+                obstacle_h = float(self._rng.uniform(self.obstacle_height_range[0],
+                                                     max(self.obstacle_height_max_current, self.obstacle_height_range[0])))
+            else:
+                obstacle_h = 0.0
+            self._generate_terrain(amp, slope_deg, uphill, stair_h, ascending, obstacle_h)
             self._episode_target_clearance = max(self.target_clearance, stair_h + 0.03)
         self._episode_gait_period = self._period_for_speed(self.target_speed, stair_h)
         self._next_push_step = int(self._rng.integers(150, 300)) if self.push_velocity > 0 else 10**9
@@ -610,8 +633,8 @@ class Go1FlatEnv(gym.Env):
         return xml
 
     def _generate_terrain(self, amp: float, slope_deg: float = 0.0, uphill: bool = True,
-                          stair_h: float = 0.0, ascending: bool = True):
-        """Terrain height (m), combining three independent, additive components:
+                          stair_h: float = 0.0, ascending: bool = True, obstacle_h: float = 0.0):
+        """Terrain height (m), combining four independent, additive components:
 
         1. Random bumps: bilinearly-interpolated uniform noise in [0, amp] with a random feature size
            (15 cm bumps up to 1 m undulations), faded in over the flat start pad (HF_PAD_START..HF_PAD_END).
@@ -624,7 +647,14 @@ class Go1FlatEnv(gym.Env):
            `uphill` does for the slope. Each riser is a step function quantized to HF_CELL, so it's a
            steep ramp within one grid cell (5 cm), not a true vertical face -- see the ctor docstring.
 
-        All three default to 0 (flat ground), and any combination can be nonzero at once (e.g. bumpy stairs).
+        4. Discrete obstacles: num_obstacles isolated round bumps (smooth radial falloff, C1-continuous)
+           of random height (obstacle_h +-30%) and radius (obstacle_radius +-30%) at random positions
+           after HF_PAD_END. Unlike the continuous bump noise above, most of the ground stays flat --
+           this is meant to force noticing and stepping around/onto individual objects, not reacting to
+           uniform roughness everywhere.
+
+        All four default to 0 (flat ground), and any combination can be nonzero at once (e.g. bumpy stairs
+        with a few obstacles scattered on the plateau).
         """
         nrow, ncol = self._hf_nrow, self._hf_ncol
         xw = self._hf_x0 + np.arange(ncol) * HF_CELL
@@ -656,7 +686,28 @@ class Go1FlatEnv(gym.Env):
             rise = stair_h * step_num
             stairs = rise if ascending else rise.max() - rise   # descending: start elevated, step down to 0
 
-        h = np.clip(bumps + slope[None, :] + stairs[None, :], 0.0, HF_ELEV)
+        obstacles = np.zeros((nrow, ncol))
+        if obstacle_h > 1e-6 and self.num_obstacles > 0:
+            yw = self._hf_y0 + np.arange(nrow) * HF_CELL
+            x_lo, x_hi = HF_PAD_END + self.obstacle_radius * 1.3, xw[-1] - self.obstacle_radius * 1.3
+            y_lo, y_hi = yw[0] + self.obstacle_radius * 1.3, yw[-1] - self.obstacle_radius * 1.3
+            for _ in range(self.num_obstacles):
+                cx = float(self._rng.uniform(x_lo, x_hi))
+                cy = float(self._rng.uniform(y_lo, y_hi))
+                h_this = obstacle_h * float(self._rng.uniform(0.7, 1.3))
+                r_this = self.obstacle_radius * float(self._rng.uniform(0.7, 1.3))
+                j0, j1 = np.searchsorted(xw, [cx - r_this, cx + r_this])
+                i0, i1 = np.searchsorted(yw, [cy - r_this, cy + r_this])
+                j0, j1 = max(0, j0 - 1), min(ncol, j1 + 1)
+                i0, i1 = max(0, i0 - 1), min(nrow, i1 + 1)
+                dx = xw[j0:j1][None, :] - cx
+                dy = yw[i0:i1][:, None] - cy
+                dist = np.sqrt(dx * dx + dy * dy)
+                falloff = np.clip(1.0 - dist / r_this, 0.0, 1.0)
+                bump = h_this * falloff * falloff * (3 - 2 * falloff)  # smoothstep radial profile
+                obstacles[i0:i1, j0:j1] = np.maximum(obstacles[i0:i1, j0:j1], bump)
+
+        h = np.clip(bumps + slope[None, :] + stairs[None, :] + obstacles, 0.0, HF_ELEV)
         self._terrain_h = h
         self.model.hfield_data[self._hf_adr:self._hf_adr + nrow * ncol] = (h / HF_ELEV).ravel()
 
