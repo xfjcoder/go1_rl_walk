@@ -11,13 +11,15 @@ The pipeline has four stages, each building on the last:
    plus friction/mass/push randomization.
 3. **RL, slopes and stairs** — fine-tuned further on ramp slopes (±20°) and
    stairs (risers up to 12 cm), on top of everything from stages 1-2.
+   Discrete obstacles (isolated bumps) turned out to need no dedicated
+   training at all — the existing rough-terrain skill already generalizes.
 
 All four are done (developed on the `stage3-terrain-envelope` branch, merged
-to `main`). See [Stage 3: slopes and stairs](#stage-3-slopes-and-stairs) for
-the full results and known limits. Current best overall checkpoint:
-`runs/p_stairs` (handles everything from stages 1-2, plus slopes to ±20°
-and stairs to 6 cm cleanly; ascending stairs above ~8 cm is a known,
-documented limit).
+to `main`). See [Stage 3: slopes, stairs, and discrete obstacles](#stage-3-slopes-stairs-and-discrete-obstacles)
+for the full results and known limits. Current best overall checkpoint:
+`runs/p_stairs` (handles everything from stages 1-2, plus slopes to ±20°,
+stairs to 6 cm, and discrete obstacles cleanly; ascending stairs above
+~8 cm is a known, documented limit).
 
 A ready-to-run copy is committed at `pretrained/p_stairs/` so you can watch
 it walk right after cloning, no training needed:
@@ -351,7 +353,7 @@ extending this:
   sampling is still uniform from 0. Fixed with a `--terrain-amp-min`
   hard-mining fine-tune once the full curriculum has already run.
 
-## Stage 3: slopes and stairs
+## Stage 3: slopes, stairs, and discrete obstacles
 
 Both reuse the rough-terrain heightfield end to end (same spawn-safety lift,
 terrain-relative height/contact/termination) — see `Go1FlatEnv._generate_terrain`.
@@ -442,6 +444,39 @@ training, less narrowing" is a universal fix just because it worked once.
   elevation cap — the tell is identical-looking stats across different
   inputs, since both get clamped to the same degenerate geometry.
 
+**Discrete obstacles: already solved, no dedicated training needed.**
+Unlike a slope or staircase, which spans the whole course width and can't be
+avoided, an isolated bump (`--obstacle-height-max`, scattered
+`--num-obstacles` per episode within `--obstacle-lane-half-width` of the
+centerline) can simply be walked around. `pretrained/p_stairs`, with no
+obstacle-specific training at all, handles them cleanly even at absurd
+heights: 0% falls up to 14 cm, 0-6% even at 18-22 cm (taller than the
+robot's own thigh segment) — the same reactive rough-terrain skill it
+already has generalizes fine to sparse bumps. Confirmed visually
+(`play.py --seed 20 --obstacle-height 0.15`, both `--camera track` and
+`--camera topdown`): stable throughout, whether stepping over a small
+bump or drifting around a tall one.
+
+One real bug surfaced while checking this, worth knowing if you extend the
+placement logic: obstacles were originally scattered across the full ±3 m
+course width, but the robot only ever wanders ±0.4-0.5 m off-centerline —
+so almost every obstacle landed completely outside its actual path,
+making the first "0% falls" result trivial rather than a real finding
+(confirmed: an episode's terrain had a 15 cm obstacle, but the terrain
+height was exactly 0 everywhere along the robot's entire walked path).
+Fixed by constraining placement to `--obstacle-lane-half-width` (default
+0.4 m) around the centerline instead. **A "no falls" result is only
+meaningful once you've confirmed the hard part of the terrain was actually
+in the robot's path** — the same lesson as the fall-rate-vs-stuck issue
+above, generalized: an evaluation can look clean for the wrong reason.
+
+If you want obstacles to actually force something new (matching the
+original "deliberate foot placement" idea), they'd need to be genuinely
+unavoidable — spanning the full lane width so stepping over/between them
+is the only option, or narrow gaps that must be jumped rather than bumps
+that can be dodged. Not attempted here since the current (dodgeable)
+design already turned out to need no further work.
+
 ## Next stages
 
 Ideas for extending past `runs/p_stairs`, roughly in order of effort:
@@ -459,8 +494,11 @@ Ideas for extending past `runs/p_stairs`, roughly in order of effort:
    to a more statically-stable, weight-shifting pattern (closer to the
    stage-0 scripted crawl) instead of the always-diagonal trot when facing
    a very tall stair, rather than forcing the trot clock everywhere.
-3. **Discrete obstacles / gaps** — random box/cylinder clutter and narrow
-   gaps, forcing more deliberate foot placement (pairs well with #1).
+3. **Unavoidable obstacles / gaps** — dodgeable discrete obstacles are
+   already solved (see above) and needed no work; a genuinely forcing
+   version would span the full lane width, or use narrow gaps that must be
+   jumped, so stepping over/between them is the only option (pairs well
+   with #1).
 4. **Higher top speed** — the current trot always keeps ≥2 feet down; a
    faster gait needs a flight phase (0 feet down briefly), which the
    `phase_match` clock's stance/swing split would need to change to allow.

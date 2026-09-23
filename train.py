@@ -449,6 +449,10 @@ def main():
                     help="Base radius (m) of each obstacle's footprint (actual radius/height randomized "
                          "+-30% per obstacle).")
     g.add_argument("--num-obstacles", type=int, default=6, help="Obstacles scattered per episode.")
+    g.add_argument("--obstacle-lane-half-width", type=float, default=0.4,
+                    help="Metres either side of y=0 that obstacles are placed within. Narrower than the "
+                         "full course width so obstacles actually land in the robot's walking path -- "
+                         "placing them across the full +-3m course made them almost never cross it.")
     g.add_argument("--gait-period-stair-stretch", type=float, default=0.0,
                     help="Extra seconds of gait period per metre of the current episode's stair riser "
                          "height (0 = off). Gives a tall step's swing phase more real time to complete "
@@ -523,6 +527,7 @@ def main():
         gait_period_stair_stretch=args.gait_period_stair_stretch,
         obstacle_height_range=([args.obstacle_height_min, args.obstacle_height_max] if args.obstacle_height_max is not None else None),
         obstacle_radius=args.obstacle_radius, num_obstacles=args.num_obstacles,
+        obstacle_lane_half_width=args.obstacle_lane_half_width,
         friction_range=list(args.friction_range),
         mass_scale_range=list(args.mass_scale_range) if args.mass_scale_range else None,
         push_velocity=args.push_velocity,

@@ -34,6 +34,9 @@ def main():
     parser.add_argument("--model", type=str, default=None)
     parser.add_argument("--vecnormalize", type=str, default="checkpoints/vecnormalize_final.pkl")
     parser.add_argument("--episodes", type=int, default=5)
+    parser.add_argument("--seed", type=int, default=None,
+                         help="Seed the env for reproducible episodes (episode N uses seed+N). "
+                              "Default: unseeded (a different random episode each run).")
     parser.add_argument("--terrain-amplitude", type=float, default=None,
                          help="Play on rough terrain of this amplitude (m, peak-to-peak).")
     parser.add_argument("--slope-deg", type=float, default=None,
@@ -101,6 +104,8 @@ def main():
     frames = []
     try:
         for ep in range(args.episodes):
+            if args.seed is not None:
+                env.seed(args.seed + ep)
             obs = env.reset()
             done = False
             ep_reward = 0.0

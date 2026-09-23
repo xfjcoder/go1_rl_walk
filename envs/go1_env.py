@@ -141,6 +141,13 @@ class Go1FlatEnv(gym.Env):
         obstacle_radius: float = 0.10,          # metres, base radius of each obstacle's footprint
                                                # (actual radius/height randomized +-30% per obstacle)
         num_obstacles: int = 6,                # obstacles scattered per episode
+        obstacle_lane_half_width: float = 0.4,  # metres either side of y=0 that obstacles are placed
+                                               # within. The course is +-3m wide but the robot only
+                                               # wanders +-0.4-0.5m off centerline, so placing obstacles
+                                               # across the full width made them almost never actually
+                                               # cross the robot's path (confirmed: a 12cm-obstacle
+                                               # episode's terrain height was exactly 0 along the robot's
+                                               # entire walked path) -- a trivial, uninformative test.
         gait_period_stair_stretch: float = 0.0,  # extra seconds of gait period per metre of the current
                                                # episode's stair riser height, on top of the speed-based
                                                # period. Gives a tall step's swing phase more real time to
@@ -305,6 +312,7 @@ class Go1FlatEnv(gym.Env):
         self.obstacle_height_max_current = self.obstacle_height_range[1] if self.obstacle_height_range else None
         self.obstacle_radius = obstacle_radius
         self.num_obstacles = num_obstacles
+        self.obstacle_lane_half_width = obstacle_lane_half_width
         self.terrain_enabled = (self.terrain_amplitude_range is not None or terrain_amplitude is not None
                                 or self.slope_range is not None or slope_deg is not None
                                 or self.stair_height_range is not None or stair_height is not None
@@ -690,7 +698,8 @@ class Go1FlatEnv(gym.Env):
         if obstacle_h > 1e-6 and self.num_obstacles > 0:
             yw = self._hf_y0 + np.arange(nrow) * HF_CELL
             x_lo, x_hi = HF_PAD_END + self.obstacle_radius * 1.3, xw[-1] - self.obstacle_radius * 1.3
-            y_lo, y_hi = yw[0] + self.obstacle_radius * 1.3, yw[-1] - self.obstacle_radius * 1.3
+            y_lo = max(yw[0] + self.obstacle_radius * 1.3, -self.obstacle_lane_half_width)
+            y_hi = min(yw[-1] - self.obstacle_radius * 1.3, self.obstacle_lane_half_width)
             for _ in range(self.num_obstacles):
                 cx = float(self._rng.uniform(x_lo, x_hi))
                 cy = float(self._rng.uniform(y_lo, y_hi))
