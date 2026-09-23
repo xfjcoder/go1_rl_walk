@@ -148,6 +148,24 @@ class Go1FlatEnv(gym.Env):
                                                # cross the robot's path (confirmed: a 12cm-obstacle
                                                # episode's terrain height was exactly 0 along the robot's
                                                # entire walked path) -- a trivial, uninformative test.
+        phase_match_stair_relax: float = 0.0,  # metres: linearly relax phase_match_weight to 0 as the
+                                               # current episode's stair height goes from 0 to this value,
+                                               # so the policy isn't forced into the rigid 2-2 diagonal
+                                               # trot rhythm when facing a stair tall enough to need a
+                                               # different (more statically-stable) support pattern.
+                                               # 0 = off (phase_match_weight always full strength, old
+                                               # behavior). Only affects stair episodes; 0 on flat/bump/
+                                               # slope/obstacle-only episodes regardless of this setting.
+        static_stability_weight: float = 0.0,  # reward weight for having MORE than 2 feet down
+                                               # (n_contacts-2, so +1 for 3 feet, +2 for 4), scaled by
+                                               # how tall the current stair is (0 at stair_h=0, full
+                                               # weight at stair_h >= static_stability_ref_height) --
+                                               # a direct, positive incentive toward a static, weight-
+                                               # shifting stance specifically when a stair demands it,
+                                               # complementing phase_match_stair_relax (which only
+                                               # removes the trot's competing pull, not adds a new one).
+                                               # 0 = off (old behavior).
+        static_stability_ref_height: float = 0.12,
         use_terrain_heightmap: bool = False,   # add a 3x3 local heightmap (9 dims) to the observation:
                                                # terrain height at points ahead of the trunk (forward
                                                # 0.15/0.35/0.55m x lateral -0.15/0/0.15m, in the trunk's
@@ -344,6 +362,11 @@ class Go1FlatEnv(gym.Env):
         self.contact_force_threshold = contact_force_threshold
         self.gait_period = gait_period
         self.phase_match_weight = phase_match_weight
+        self.phase_match_stair_relax = phase_match_stair_relax
+        self.static_stability_weight = static_stability_weight
+        self.static_stability_ref_height = static_stability_ref_height
+        self._episode_stair_h = 0.0
+        self._episode_phase_match_weight = phase_match_weight
         self.air_time_weight = air_time_weight
         self.target_air_time = target_air_time
         self.use_gait_reference = use_gait_reference
@@ -503,6 +526,12 @@ class Go1FlatEnv(gym.Env):
             else:
                 obstacle_h = 0.0
             self._generate_terrain(amp, slope_deg, uphill, stair_h, ascending, obstacle_h)
+            self._episode_stair_h = stair_h
+            if self.phase_match_stair_relax > 1e-6:
+                relax_frac = float(np.clip(1.0 - stair_h / self.phase_match_stair_relax, 0.0, 1.0))
+                self._episode_phase_match_weight = self.phase_match_weight * relax_frac
+            else:
+                self._episode_phase_match_weight = self.phase_match_weight
             self._episode_target_clearance = max(self.target_clearance, stair_h + 0.03)
         self._episode_gait_period = self._period_for_speed(self.target_speed, stair_h)
         self._next_push_step = int(self._rng.integers(150, 300)) if self.push_velocity > 0 else 10**9
@@ -935,7 +964,21 @@ class Go1FlatEnv(gym.Env):
         else:  # "trot"
             fr_rl_stance = phase < 0.5
             desired_stance = np.array([fr_rl_stance, not fr_rl_stance, not fr_rl_stance, fr_rl_stance])  # FR,FL,RR,RL
-        r_phase_match = self.phase_match_weight * float(np.mean(touches == desired_stance))
+        r_phase_match = self._episode_phase_match_weight * float(np.mean(touches == desired_stance))
+
+        # Static-stability bonus: reward having MORE than 2 feet down, scaled by how tall the
+        # current stair is (0 on flat/bump/slope/obstacle-only episodes, or if this weight is 0).
+        # A direct, positive pull toward a weight-shifting stance specifically when a stair demands
+        # it, rather than only removing the trot's competing pull (phase_match_stair_relax above) --
+        # tried after three structurally different fixes (adaptive foot-clearance target, a stair-
+        # height-scaled gait clock, a terrain-aware heightmap observation) all failed to resolve a
+        # policy getting physically stuck on stairs above ~8cm, none of which changed the underlying
+        # always-2-feet-down trot SUPPORT PATTERN itself.
+        if self.static_stability_weight > 1e-6 and self._episode_stair_h > 1e-6:
+            stability_frac = min(1.0, self._episode_stair_h / self.static_stability_ref_height)
+            r_static_stability = self.static_stability_weight * stability_frac * max(0, int(n_contacts) - 2)
+        else:
+            r_static_stability = 0.0
 
         # 7b. Footfall-pattern symmetry bonus (trot: diagonal pairs; bound: front/rear pairs).
         # touches is ordered [FR, FL, RR, RL]. Without this term the reward above only cares
@@ -1003,6 +1046,7 @@ class Go1FlatEnv(gym.Env):
             foot_duty=r_foot_duty,
             air_time=r_air_time,
             phase_match=r_phase_match,
+            static_stability=r_static_stability,
             trot_symmetry=r_trot_symmetry,
             foot_clearance=r_foot_clearance,
             alive=r_alive,

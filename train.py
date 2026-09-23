@@ -327,6 +327,18 @@ def main():
     g.add_argument("--phase-match-warmup-steps", type=int, default=8_000_000,
                     help="Linearly ramp phase-match-weight from 0 up to its target value over "
                          "this many steps. Only relevant if --phase-match-weight > 0.")
+    g.add_argument("--phase-match-stair-relax", type=float, default=0.0,
+                    help="Metres: linearly relax phase_match_weight to 0 as the current episode's "
+                         "stair height goes from 0 to this value, freeing the policy from the rigid "
+                         "2-2 diagonal trot rhythm when a stair is tall enough to need a different "
+                         "support pattern. 0 = off (always full strength). Only affects stair "
+                         "episodes.")
+    g.add_argument("--static-stability-weight", type=float, default=0.0,
+                    help="Reward weight for having MORE than 2 feet down, scaled by how tall the "
+                         "current stair is (0 at stair_h=0, full weight at "
+                         "--static-stability-ref-height). A direct incentive toward a static, "
+                         "weight-shifting stance specifically when a stair demands it. 0 = off.")
+    g.add_argument("--static-stability-ref-height", type=float, default=0.12)
 
     # ---- reward shaping: gait quality ----
     g = parser.add_argument_group("reward shaping: gait quality")
@@ -543,6 +555,9 @@ def main():
         max_foot_duty_cycle=args.max_foot_duty_cycle, min_foot_duty_cycle=args.min_foot_duty_cycle,
         foot_duty_weight=args.foot_duty_weight, gait_period=args.gait_period, gait_style=args.gait_style,
         phase_match_weight=initial_phase_match_weight, air_time_weight=args.air_time_weight,
+        phase_match_stair_relax=args.phase_match_stair_relax,
+        static_stability_weight=args.static_stability_weight,
+        static_stability_ref_height=args.static_stability_ref_height,
         target_air_time=args.target_air_time, kp=args.kp, kd=args.kd,
     )
     if run_dir:
