@@ -131,6 +131,11 @@ class Go1FlatEnv(gym.Env):
                                                # grid cell, not a true vertical face, so a riser is a steep ramp
                                                # over one HF_CELL (5 cm), not a perfect right angle.
         num_stairs: int = 8,                   # number of steps before leveling into a plateau
+        gait_period_stair_stretch: float = 0.0,  # extra seconds of gait period per metre of the current
+                                               # episode's stair riser height, on top of the speed-based
+                                               # period. Gives a tall step's swing phase more real time to
+                                               # complete a big lift, instead of being rushed by a clock
+                                               # tuned for flat/bump/slope terrain. 0 = off (unchanged).
         friction_range: tuple = (0.6, 1.1),    # floor / terrain sliding friction sampled each reset
         mass_scale_range: tuple | None = None,  # trunk mass (and inertia) scale sampled each reset
         push_velocity: float = 0.0,            # m/s: every 3-6 s add a random horizontal velocity kick of up
@@ -284,6 +289,7 @@ class Go1FlatEnv(gym.Env):
         self.stair_height_max_current = self.stair_height_range[1] if self.stair_height_range else None
         self.stair_depth = stair_depth
         self.num_stairs = num_stairs
+        self.gait_period_stair_stretch = gait_period_stair_stretch
         self.terrain_enabled = (self.terrain_amplitude_range is not None or terrain_amplitude is not None
                                 or self.slope_range is not None or slope_deg is not None
                                 or self.stair_height_range is not None or stair_height is not None)
@@ -420,7 +426,7 @@ class Go1FlatEnv(gym.Env):
         if self.command_speed_range is not None:
             lo = self.command_speed_range[0]
             self.target_speed = float(self._rng.uniform(lo, max(self.speed_max_current, lo)))
-        self._episode_gait_period = self._period_for_speed(self.target_speed)
+        stair_h = 0.0   # overwritten below if stairs are enabled; needed here for the gait-period stretch
 
         if self.mass_scale_range is not None:
             sc = float(self._rng.uniform(*self.mass_scale_range))
@@ -453,6 +459,7 @@ class Go1FlatEnv(gym.Env):
                 stair_h, ascending = 0.0, True
             self._generate_terrain(amp, slope_deg, uphill, stair_h, ascending)
             self._episode_target_clearance = max(self.target_clearance, stair_h + 0.03)
+        self._episode_gait_period = self._period_for_speed(self.target_speed, stair_h)
         self._next_push_step = int(self._rng.integers(150, 300)) if self.push_velocity > 0 else 10**9
 
         mujoco.mj_resetData(self.model, self.data)
@@ -665,11 +672,13 @@ class Go1FlatEnv(gym.Env):
         return (h[r0, c0] * (1 - wx) * (1 - wy) + h[r0, c0 + 1] * wx * (1 - wy)
                 + h[r0 + 1, c0] * (1 - wx) * wy + h[r0 + 1, c0 + 1] * wx * wy)
 
-    def _period_for_speed(self, speed: float) -> float:
+    def _period_for_speed(self, speed: float, stair_h: float = 0.0) -> float:
         if self.gait_period_fast is None:
-            return self.gait_period
-        f = float(np.clip((speed - 0.3) / 0.7, 0.0, 1.0))
-        return (1 - f) * self.gait_period + f * self.gait_period_fast
+            period = self.gait_period
+        else:
+            f = float(np.clip((speed - 0.3) / 0.7, 0.0, 1.0))
+            period = (1 - f) * self.gait_period + f * self.gait_period_fast
+        return period + self.gait_period_stair_stretch * stair_h
 
     def _gait_phase(self) -> float:
         """Where we are in the prescribed stride cycle, in [0, 1)."""

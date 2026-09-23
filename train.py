@@ -434,6 +434,13 @@ def main():
                     help="Tread depth (m) of each stair. Kept a multiple of the 5cm heightfield cell "
                          "size for a crisp riser edge.")
     g.add_argument("--num-stairs", type=int, default=8, help="Number of steps before leveling into a plateau.")
+    g.add_argument("--gait-period-stair-stretch", type=float, default=0.0,
+                    help="Extra seconds of gait period per metre of the current episode's stair riser "
+                         "height (0 = off). Gives a tall step's swing phase more real time to complete "
+                         "a big lift instead of being rushed by a clock tuned for flat/bump/slope "
+                         "terrain. Added because a fixed-tempo clock left a policy physically stuck at "
+                         "the first riser on 12cm stairs even after fixing the foot-clearance reward's "
+                         "cap -- e.g. 2.5 adds +0.3s of period (roughly +0.15s of swing time) at 12cm.")
 
     # ---- domain randomization ----
     g = parser.add_argument_group("domain randomization")
@@ -498,6 +505,7 @@ def main():
         ramp_length=args.ramp_length,
         stair_height_range=([args.stair_height_min, args.stair_height_max] if args.stair_height_max is not None else None),
         stair_depth=args.stair_depth, num_stairs=args.num_stairs,
+        gait_period_stair_stretch=args.gait_period_stair_stretch,
         friction_range=list(args.friction_range),
         mass_scale_range=list(args.mass_scale_range) if args.mass_scale_range else None,
         push_velocity=args.push_velocity,
