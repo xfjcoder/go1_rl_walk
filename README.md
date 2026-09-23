@@ -380,41 +380,83 @@ at their full extent rather than narrowed — see the whack-a-mole note below):
 | Stairs alone, 12 cm descending | 31% |
 | Descending 12 cm stairs + any steep downhill slope | ~100% (an extreme, rarely-occurring compound corner) |
 
-**Known limitation, not resolved: ascending stairs above ~8 cm.** Fall rate
-alone is misleading here — the robot mostly doesn't fall, it gets physically
-*stuck*, planting itself at the first or second step and making no further
-forward progress (confirmed by a user manually testing 12 cm ascending stairs,
-then traced numerically: trunk x-position plateaus and oscillates in a ~6 cm
-range for the rest of the episode; visually confirmed in a GIF). Two
-different, reasonable fixes were tried and both failed to help:
-1. The foot-clearance reward capped its benefit at a fixed 4 cm lift
-   regardless of the actual obstacle, so a foot had no incentive to lift
-   higher even when the stair needed it (median swing height was only
-   6.6 cm on a 12 cm riser). Fixed with a per-episode adaptive target
-   (`_episode_target_clearance = max(target_clearance, stair_h + 0.03)`) —
-   confirmed correctly active, made no difference to the stuck behavior.
-2. The trot clock enforces a fixed ~0.3 s swing regardless of what's
-   underfoot, which might simply not be enough time to lift 12 cm. Added
-   `--gait-period-stair-stretch` to slow the clock on tall steps (mirrors
-   how `--gait-period-fast` already speeds it up for higher commanded
-   speed) — confirmed correctly stretching the period, still no
-   improvement, and speed measurably *degraded* starting around 8 cm even
-   before either fix (0.35 m/s at 8 cm vs. a 0.5 m/s command).
+**Known limitation, accepted after four different fixes all failed the same
+way: ascending stairs above ~8 cm.** Fall rate alone is misleading here — the
+robot mostly doesn't fall, it gets physically *stuck*, planting itself at the
+first or second step and making no further forward progress regardless of
+which fix was tried (confirmed by a user manually testing 12 cm ascending
+stairs, then traced numerically: trunk x-position plateaus at ~1.8-1.9 m and
+oscillates there for the rest of the episode; visually confirmed in a GIF).
+Four structurally different fixes were tried, in this order, each building on
+the last (`runs/p_stairs` -> `t_heightmap` -> `u_stair_static`):
 
-Since two structurally different levers (a missing incentive, and a timing
-constraint) both failed to move this, and the degradation was already
-present before any fix was attempted, this looks like a genuine capability
-boundary rather than a tunable-parameter bug — consistent with the Go1's own
-quoted ~10 cm rated step-climbing spec. The most likely real fix is more
-invasive than reward tuning: completing a much longer single-leg swing
-probably needs active weight-shifting onto the other three legs (the same
-lesson as the stage-0 scripted crawl gait's center-of-mass shift), which the
-current always-diagonal-trot pattern doesn't offer, or genuine exteriorception
-(the policy is blind — no heightmap/vision — so it can't anticipate a tall
-step before touching it; see "Terrain-aware observation" below). Both
-`--gait-period-stair-stretch` and the adaptive clearance target are kept in
-the codebase (default off/unchanged, so they cost nothing) since they're
-reasonable, generically useful levers even though neither solved this case.
+1. **Missing incentive**: the foot-clearance reward capped its benefit at a
+   fixed 4 cm lift regardless of the actual obstacle (median swing height was
+   only 6.6 cm on a 12 cm riser). Fixed with a per-episode adaptive target
+   (`_episode_target_clearance = max(target_clearance, stair_h + 0.03)`) —
+   confirmed correctly active. No change to the stuck behavior.
+2. **Missing time**: the trot clock enforces a fixed ~0.3 s swing regardless
+   of what's underfoot. Added `--gait-period-stair-stretch` to slow the clock
+   on tall steps (mirrors how `--gait-period-fast` already speeds it up for
+   higher commanded speed) — confirmed correctly stretching the period. No
+   change; speed also measurably degraded starting around 8 cm even before
+   either fix (0.35 m/s at 8 cm vs. a 0.5 m/s command) — a pre-existing
+   pattern, not something either fix introduced.
+3. **Missing information**: the policy is blind (no exteroception), so it
+   can't anticipate a tall step before touching it, unlike a slope (whose
+   grade gives an advance tilt cue through gravity sensing). Added
+   `--use-terrain-heightmap` (see below) and fine-tuned from a warm-started
+   checkpoint. Result was genuine but double-edged: speed at moderate
+   heights improved measurably (6 cm 0.448→0.512 m/s, 8 cm 0.352→0.454,
+   10 cm 0.146→0.204), but at 12 cm specifically the fall rate got *worse*
+   (≈5%→46% — it tries harder and fails outright more often instead of
+   safely stalling), and the core stuck-at-the-same-position behavior was
+   unchanged.
+4. **Rigid gait pattern**: the trot's always-≥2-feet-down diagonal pattern
+   might not allow the active weight-shifting a very long single-leg swing
+   needs (the same lesson as the stage-0 scripted crawl gait's
+   center-of-mass shift). Added `--phase-match-stair-relax` (removes the
+   trot's pull as stair height grows) and `--static-stability-weight` (a
+   direct reward for >2 feet down, scaled by stair height) — both verified
+   correctly implemented and produced a small, real, correctly-directed
+   effect (mean feet-down during the stall rose 1.64→1.79; moments with 0
+   feet down dropped 11%→4%), but the stall position was *identical* to
+   before — more cautious, not more successful.
+
+A quick kinematic check (`scripted_gait.leg_ik`) rules out the simplest
+explanation: the joint angles needed for a 12 cm (even 18 cm) lift are
+comfortably within the leg's joint-range limits, so this isn't a hard
+kinematic wall. **The real signal is that four unrelated intervention types
+(incentive, timing, information, gait structure) all converged to the
+identical failure** — stronger evidence than any single failure that
+incremental fine-tuning from an already-converged, trot-locked policy keeps
+landing back in the same local optimum, rather than any one specific
+ingredient being missing. Breaking out of it would likely need a
+qualitatively different approach (training a stairs-focused curriculum from
+scratch, or well before the trot fully converges, rather than another reward
+tweak on the current lineage) — a materially bigger undertaking than any of
+the four attempts above, not attempted here. `pretrained/p_stairs` remains
+the accepted checkpoint; all four fixes are kept in the codebase (all
+default off/unchanged) as reasonable, generically useful, well-verified
+levers, even though none solved this specific case.
+
+**Terrain-aware observation** (`--use-terrain-heightmap`, attempt #3 above):
+adds a 3×3 grid (9 dims, observation 51→60) of terrain height ahead of the
+trunk (forward 0.15/0.35/0.55 m × lateral -0.15/0/0.15 m, in the trunk's own
+frame so it's always "ahead of me" regardless of heading), relative to the
+height directly under the trunk — a minimal stand-in for real exteroception.
+All zero on flat ground; verified to match theory exactly on a slope
+(`tan(angle) × distance`) and to correctly read "+10 cm one step ahead, +20 cm
+two steps ahead" near a stair riser. Since growing the observation breaks
+`--resume` for every existing (blind) checkpoint, `expand_obs_checkpoint.py`
+warm-starts a larger-observation policy from an existing one instead of
+retraining the whole staged stack from scratch: it copies every weight except
+the first Linear layer of the policy/value MLPs, zero-initializing the new
+input columns, so the expanded model is mathematically **identical** to the
+original at t=0 regardless of what the new channels contain — verified two
+ways (the script's own check, and cross-checked with `eval_policy.py`: the
+warm-started copy and the original gave numbers matching to the printed
+decimal on flat ground) before trusting it enough to fine-tune.
 
 **The "broad consolidation" lesson from slopes did not transfer to stairs.**
 For slopes, narrow hard-mining passes reliably traded one corner's quality
@@ -479,30 +521,26 @@ design already turned out to need no further work.
 
 ## Next stages
 
-Ideas for extending past `runs/p_stairs`, roughly in order of effort:
+Terrain-aware observation and a non-trot gait mode were both tried already
+(see "Known limitation" above) — neither solved the ascending-stairs limit,
+though the heightmap did measurably help moderate stair heights. Remaining
+ideas for extending past `runs/p_stairs`, roughly in order of effort:
 
-1. **Terrain-aware observation** — give the policy some exteroception (a
-   small local heightmap or a handful of ray-cast height samples ahead of
-   each foot) instead of pure proprioception. Likely the highest-leverage
-   change for anything harder than the current terrain, and plausibly the
-   real fix for the ascending-stairs limit above, since right now the
-   policy can't tell a tall step apart from a short one before touching it.
-   Requires breaking `--resume` compatibility (the observation shape would
-   grow), so budget for retraining the whole stack from scratch or doing
-   network surgery to preserve existing weights.
-2. **A non-trot gait mode for extreme obstacles** — let the policy fall back
-   to a more statically-stable, weight-shifting pattern (closer to the
-   stage-0 scripted crawl) instead of the always-diagonal trot when facing
-   a very tall stair, rather than forcing the trot clock everywhere.
-3. **Unavoidable obstacles / gaps** — dodgeable discrete obstacles are
+1. **A stairs-focused curriculum from scratch** — the four fixes above all
+   fine-tuned on top of an already-converged, trot-locked policy and kept
+   landing in the same local optimum regardless of which reward/observation
+   lever was pulled. Training with stairs introduced much earlier (before
+   the trot fully converges), or from scratch with a stairs-first
+   curriculum, would actually test whether that's the real bottleneck — a
+   materially bigger undertaking than any single fix tried so far.
+2. **Unavoidable obstacles / gaps** — dodgeable discrete obstacles are
    already solved (see above) and needed no work; a genuinely forcing
    version would span the full lane width, or use narrow gaps that must be
-   jumped, so stepping over/between them is the only option (pairs well
-   with #1).
-4. **Higher top speed** — the current trot always keeps ≥2 feet down; a
+   jumped, so stepping over/between them is the only option.
+3. **Higher top speed** — the current trot always keeps ≥2 feet down; a
    faster gait needs a flight phase (0 feet down briefly), which the
    `phase_match` clock's stance/swing split would need to change to allow.
-5. **Sim-to-real** — swap in the higher-fidelity mesh model from MuJoCo
+4. **Sim-to-real** — swap in the higher-fidelity mesh model from MuJoCo
    Menagerie (see the model note above), and add the usual sim-to-real
    staples: actuator/observation latency, torque-domain randomization
    (not just PD gains), and observation noise.
