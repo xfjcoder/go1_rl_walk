@@ -9,16 +9,15 @@ The pipeline has four stages, each building on the last:
    0.2–1.0 m/s with a clean, symmetric trot.
 2. **RL, rough terrain** — fine-tuned on a random heightfield up to ±12 cm,
    plus friction/mass/push randomization.
-3. **RL, slopes and stairs** (this branch, `stage3-terrain-envelope`, not yet
-   merged to `main`) — fine-tuned further on ramp slopes (±20°) and stairs
-   (risers up to 12 cm), on top of everything from stages 1-2.
+3. **RL, slopes and stairs** — fine-tuned further on ramp slopes (±20°) and
+   stairs (risers up to 12 cm), on top of everything from stages 1-2.
 
-Stages 0-2 are on `main` (best checkpoint `runs/k_hardmine`, see `main`'s
-README). Stage 3 adds slopes and stairs on top of that — see
-[Stage 3: slopes and stairs](#stage-3-slopes-and-stairs) for the full
-results and known limits. Current best overall checkpoint: `runs/p_stairs`
-(handles everything from stages 1-2, plus slopes to ±20° and stairs to
-6 cm cleanly; ascending stairs above ~8 cm is a known, documented limit).
+All four are done (developed on the `stage3-terrain-envelope` branch, merged
+to `main`). See [Stage 3: slopes and stairs](#stage-3-slopes-and-stairs) for
+the full results and known limits. Current best overall checkpoint:
+`runs/p_stairs` (handles everything from stages 1-2, plus slopes to ±20°
+and stairs to 6 cm cleanly; ascending stairs above ~8 cm is a known,
+documented limit).
 
 A ready-to-run copy is committed at `pretrained/p_stairs/` so you can watch
 it walk right after cloning, no training needed:
