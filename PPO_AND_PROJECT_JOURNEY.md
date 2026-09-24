@@ -65,7 +65,7 @@ It's also **actor-critic**: alongside the policy ("actor"), it trains a
 value function ("critic") that predicts expected future reward from a
 state, used to compute the advantage estimates that drive the policy
 update. Both networks here are small MLPs, `[256, 256, 128]` for each
-(shared architecture, no shared weights) — plenty for a 51-63-dimensional
+(separate networks, no shared weights) — plenty for a 51–60-dimensional
 observation, more would just cost wall-clock time for no benefit at this
 problem scale.
 
@@ -78,11 +78,12 @@ problem scale.
 - **Physics sim is your training data generator, and it's not free.**
   Every environment step means running MuJoCo's contact solver. PPO's
   on-policy, batch-collect-then-update structure parallelizes cleanly
-  across many simultaneous simulated robots (`SubprocVecEnv`, 16 envs
-  here, each an independent MuJoCo instance), which is how you get enough
-  samples per wall-clock hour to make locomotion RL practical at all —
-  every run in this project used 16-way parallelism, at roughly
-  2000-2800 simulated steps/second combined.
+  across many simultaneous simulated robots (`SubprocVecEnv`, each worker
+  an independent MuJoCo instance), which is how you get enough samples per
+  wall-clock hour to make locomotion RL practical at all — the earliest RL
+  runs used 8-way parallelism, everything from the speed-curriculum stage
+  onward used 16, at roughly 1900–2800 simulated steps/second combined
+  depending on the run and model.
 - **Robustness to reward-shaping churn.** This project's reward function
   changed dozens of times (Section 4). Off-policy methods (SAC, TD3) reuse
   old transitions from a replay buffer under an old reward definition,
@@ -131,6 +132,11 @@ target_qpos = clip(target_qpos, joint_range)
 torque = kp * (target_qpos - q) - kd * dq                      # PD control, in Python
 torque = clip(torque, torque_range)
 ```
+
+(simplified slightly: when `--action-latency-range` is set, `action` above
+is actually the policy's action from `episode_latency` steps ago, pulled
+from a small FIFO buffer — off by default, and not used in any of the
+committed checkpoints, so this simplification is exact for those.)
 
 This is the standard choice in the sim-to-real quadruped literature (the
 Rudin et al. style referenced in the code), and for a good reason: asking
@@ -200,8 +206,9 @@ contact forces and actual survival times, not more reward-tuning guesses.
 ### Base shaping: get it moving, keep it upright
 
 - **`r_velocity`** — Gaussian reward for forward-velocity tracking,
-  `exp(-2 · normalized_error²)`, where the error is normalized by
-  `target_speed` itself, not used as a raw absolute error. This one detail
+  `exp(-2 · normalized_error²)` (weighted ×1.5 in the final sum), where
+  the error is normalized by `target_speed` itself, not used as a raw
+  absolute error. This one detail
   mattered a lot: with an *absolute* error, a low `target_speed` (e.g.
   0.2 m/s) meant standing still (a small absolute error) scored almost as
   well as actually walking — 0.923/1.0 in one measured case — which
@@ -344,9 +351,11 @@ failure mode, fix it, re-verify nothing else broke.
   hypothesis for the stairs limit.
 - **Stage 1a — flat, fixed 0.3 m/s** (`runs/e_long_d`, then `h_clock`).
   First working RL walk: 0% falls, but asymmetric (rear legs at half the
-  front legs' step rate) and, once a fixed gait-phase clock was added to
-  force the trot pattern, still limited to almost exactly the one speed it
-  was trained at (0.086 m/s achieved when *commanded* 0.5 m/s).
+  front legs' step rate). Adding a fixed gait-phase clock (`h_clock`) fixed
+  the asymmetry, but the result generalized poorly to any commanded speed
+  other than the one it was trained on — commanding 0.5 m/s (never seen in
+  training) achieved only 0.086 m/s, since the clock's fixed period baked
+  in a step frequency tuned for 0.3 m/s.
 - **Stage 1 — speed curriculum, 0.2–1.0 m/s** (`runs/i_speed_curriculum`,
   fine-tuned from `h_clock`): ramping the *commanded* speed range during
   training (not just training at one fixed speed) fixed the
@@ -354,9 +363,12 @@ failure mode, fix it, re-verify nothing else broke.
   ~10% short of target at the very top.
 - **Stage 2 — rough terrain** (`runs/j_terrain`): heightfield bumps
   (0→12cm curriculum), floor friction 0.5–1.25×, trunk mass ±10%, random
-  pushes. 0% falls almost everywhere, but 6% falls at the single hardest
-  combined corner (12cm bumps + 0.8 m/s). Root cause, found by inspecting
-  fall traces directly: the terrain curriculum only ramped the sampled
+  pushes. 0% falls almost everywhere, but a real vulnerability at the
+  single hardest combined corner (12cm bumps + 0.8 m/s) — an initial
+  16-episode screen showed 6% falls there; a larger 48-episode resample,
+  run specifically to pin down the true rate before diagnosing further,
+  gave a more precise 4% (2/48). Root cause, found by inspecting fall
+  traces directly: the terrain curriculum only ramped the sampled
   amplitude's *upper bound*, so most training episodes still sampled from
   the easy end of the range even after the ramp finished — the truly hard
   corner was a thin slice of what the policy actually experienced. Fixed
@@ -368,22 +380,23 @@ failure mode, fix it, re-verify nothing else broke.
 - **Stage 3a — slopes** (`runs/l_slopes` → `m_slope_hardmine` →
   `n_slope_steep_hardmine` → `o_slope_consolidate`): took zero-shot
   tolerance (~5–10°) up to 0% falls at every angle to ±20°, but only after
-  three narrow hard-mining fine-tunes kept trading one corner's quality
-  for another's — a **broad** consolidation pass (train on the *entire*
-  range at once, with less reopened exploration noise) is what actually
-  resolved it cleanly, the opposite lesson from the terrain-amplitude fix
-  above. Left one accepted trade-off: flat-ground high-speed drift
-  regressed slightly (~0.6–0.7m) as the cost of across-the-board slope
-  robustness.
+  two successive narrow hard-mining fine-tunes (`m_slope_hardmine`, then
+  `n_slope_steep_hardmine`) each fixed one corner while re-opening another
+  — a **broad** consolidation pass (train on the *entire* range at once,
+  with less reopened exploration noise) is what actually resolved it
+  cleanly, the opposite lesson from the terrain-amplitude fix above. Left
+  one accepted trade-off: flat-ground high-speed drift regressed slightly
+  (~0.55–0.74m) as the cost of across-the-board slope robustness.
 - **Stage 3b — stairs** (`runs/p_stairs`): clean to ±6cm, but ascending
-  stairs above ~8–10cm produces a genuine **stuck-without-falling**
+  stairs above ~8cm produces a genuine **stuck-without-falling**
   failure — the robot plateaus at the first or second step and oscillates
   there for the rest of the episode. This is *not visible in fall-rate
   metrics at all* (the robot doesn't fall — fall rate looked fine), and
   was only found by the user's own manual/visual testing. Four
   structurally different fixes were tried, in order: an adaptive
-  foot-clearance target (fixed a real 4cm-cap bug, no behavior change), a
-  stair-height-scaled gait clock (more swing time, no behavior change), a
+  foot-clearance target (fixed a real 4cm-cap bug, no improvement), a
+  stair-height-scaled gait clock (confirmed more swing time, still no
+  improvement — one seed even fell where it hadn't before), a
   terrain-aware local-heightmap observation (Section "network surgery"
   below — genuinely helped moderate heights, made the extreme case
   *worse*), and a non-trot static-stability reward (Section 4's
@@ -467,10 +480,12 @@ than once, expensively enough the first time to be worth naming.
   too, or do a short hard-mining fine-tune biased at the hard region once
   the main curriculum completes.
 - **Narrow hard-mining can trade one corner's quality for another's,
-  repeatedly** (stage 3a's three-fine-tune slope saga) — if the *same*
-  narrowing trick needs a third application, that's the signal to try the
-  opposite: a broad pass over the *entire* range at once, with less
-  reopened exploration noise. This is not universal, though — the same
+  repeatedly** (stage 3a's slope saga: two successive narrow fine-tunes,
+  `m_slope_hardmine` then `n_slope_steep_hardmine`, each re-opened a
+  different corner) — if the same narrowing trick needs a second
+  reapplication, that's the signal to try the opposite: a broad pass over
+  the *entire* range at once, with less reopened exploration noise. This
+  is not universal, though — the same
   broad-consolidation fix that cleanly worked for slopes made stairs
   *worse* on gait symmetry and flat-ground drift (stage 3b) without fixing
   its actual problem. Never assume a fix that worked for one terrain type
