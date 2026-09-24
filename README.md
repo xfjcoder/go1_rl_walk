@@ -27,9 +27,15 @@ it walk right after cloning, no training needed:
 pip install -r requirements.txt
 python play.py --run-dir pretrained/p_stairs --target-speed 0.5 --stair-height 0.06 --record out.gif
 ```
-(`pretrained/o_slope_consolidate/` — slopes and terrain, no stairs yet — and
-`pretrained/k_hardmine/` from `main` — terrain only — are also committed, in
-case you want an earlier stage's checkpoint specifically.)
+(`pretrained/o_slope_consolidate/` — slopes and terrain, no stairs yet —
+`pretrained/k_hardmine/` — terrain only — and `pretrained/x_mesh_finetune/`
+— the higher-fidelity mesh model, Stage 4 below — are also committed, in
+case you want a different checkpoint specifically.)
+
+For PPO background, why the reward function looks the way it does, the
+full stage-by-stage story (including the failures that motivated each
+reward term and each fix), and a demo, see
+[PPO_AND_PROJECT_JOURNEY.md](PPO_AND_PROJECT_JOURNEY.md).
 
 ```
 go1_rl_walk/
