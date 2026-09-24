@@ -13,6 +13,7 @@ Usage:
     env = Go1FlatEnv(render_mode="human")
 """
 import os
+from collections import deque
 import numpy as np
 import mujoco
 import gymnasium as gym
@@ -186,6 +187,24 @@ class Go1FlatEnv(gym.Env):
         mass_scale_range: tuple | None = None,  # trunk mass (and inertia) scale sampled each reset
         push_velocity: float = 0.0,            # m/s: every 3-6 s add a random horizontal velocity kick of up
                                                # to +-this to the trunk (0 = off)
+        kp_range: tuple | None = None,          # (lo, hi): PD position gain sampled each reset, overriding
+                                               # the fixed `kp` below (motor-to-motor variance). None = fixed.
+        kd_range: tuple | None = None,          # same, for PD velocity gain
+        torque_scale_range: tuple | None = None,  # multiplicative factor on the final computed torque,
+                                               # sampled each reset (weaker/stronger actuators than nominal,
+                                               # on top of kp/kd -- "torque-domain", not just PD-gain,
+                                               # randomization). None = 1.0 (unchanged).
+        action_latency_range: tuple | None = None,  # (lo, hi) control steps: the torque this step uses the
+                                               # action from this many steps ago, sampled once per episode --
+                                               # models the delay between a real actuator being commanded and
+                                               # actually responding. None = 0 (no delay, unchanged).
+        observation_latency_range: tuple | None = None,  # same idea, for how many steps stale the RETURNED
+                                               # observation is (sensor/comms delay). None = 0 (unchanged).
+        observation_noise_scale: float = 0.0,   # multiplies a fixed set of per-channel noise std's (gravity/
+                                               # gyro/quat/joint pos&vel/heightmap; command, prev-action, and
+                                               # the phase clock are never noised -- they're not physically
+                                               # sensed) added to the observation each step. 0 = off (exact
+                                               # ground truth, unchanged).
         command_speed_range: tuple | None = None,  # (lo, hi): sample target_speed ~ U(lo, hi_now) every reset.
                                                # hi_now starts at hi and can be ramped by a curriculum callback
                                                # via the speed_max_current attribute. None = fixed target_speed.
@@ -350,6 +369,15 @@ class Go1FlatEnv(gym.Env):
         self.friction_range = tuple(friction_range)
         self.mass_scale_range = tuple(mass_scale_range) if mass_scale_range else None
         self.push_velocity = push_velocity
+        self.kp_range = tuple(kp_range) if kp_range else None
+        self.kd_range = tuple(kd_range) if kd_range else None
+        self.torque_scale_range = tuple(torque_scale_range) if torque_scale_range else None
+        self._episode_torque_scale = 1.0
+        self.action_latency_range = tuple(action_latency_range) if action_latency_range else None
+        self.observation_latency_range = tuple(observation_latency_range) if observation_latency_range else None
+        self.observation_noise_scale = observation_noise_scale
+        self._episode_action_latency = 0
+        self._episode_obs_latency = 0
         self.speed_max_current = self.command_speed_range[1] if self.command_speed_range else None
         self.gait_period_fast = gait_period_fast
         self.lateral_tracking_weight = lateral_tracking_weight
@@ -444,6 +472,21 @@ class Go1FlatEnv(gym.Env):
             obs_dim += 9  # 3x3 local heightmap, see _local_heightmap
         self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(obs_dim,), dtype=np.float32)
 
+        # Reference per-channel noise std (metres/rad/rad-per-s as appropriate) for
+        # observation_noise_scale=1.0 -- gravity(3), ang_vel(3), quat(4), joint_pos(12),
+        # joint_vel(12), prev_action(12, never noised -- it's what WE commanded),
+        # command(3, never noised -- not physically sensed), phase_clock(2, never noised --
+        # internally computed), [+ heightmap(9) if enabled].
+        self._obs_noise_std = np.concatenate([
+            np.full(3, 0.02), np.full(3, 0.05), np.full(4, 0.01), np.full(12, 0.01),
+            np.full(12, 0.05), np.zeros(12), np.zeros(3), np.zeros(2),
+        ] + ([np.full(9, 0.01)] if self.use_terrain_heightmap else [])).astype(np.float32)
+
+        action_latency_max = self.action_latency_range[1] if self.action_latency_range else 0
+        self._action_buffer = deque(maxlen=action_latency_max + 1)
+        obs_latency_max = self.observation_latency_range[1] if self.observation_latency_range else 0
+        self._obs_buffer = deque(maxlen=obs_latency_max + 1)
+
         self._prev_action = np.zeros(12, dtype=np.float32)
         self._step_count = 0
         self._foot_contact_ema = np.zeros(4, dtype=np.float32)  # per-foot running contact fraction
@@ -494,6 +537,25 @@ class Go1FlatEnv(gym.Env):
             self.model.body_mass[self._trunk_body] = self._nominal_trunk_mass * sc
             self.model.body_inertia[self._trunk_body] = self._nominal_trunk_inertia * sc
             mujoco.mj_setConst(self.model, self.data)
+
+        # Sim-to-real robustness randomization: torque domain (PD gains + a motor-strength
+        # multiplier) and action/observation latency, all sampled once per episode (stationary
+        # within an episode, like a real deployment's actuator/comms characteristics would be).
+        self._kp = float(self._rng.uniform(*self.kp_range)) if self.kp_range is not None else self._kp_value
+        self._kd = float(self._rng.uniform(*self.kd_range)) if self.kd_range is not None else self._kd_value
+        self._episode_torque_scale = float(self._rng.uniform(*self.torque_scale_range)) \
+            if self.torque_scale_range is not None else 1.0
+        self._action_buffer.clear()
+        if self.action_latency_range is not None:
+            self._episode_action_latency = int(self._rng.integers(self.action_latency_range[0],
+                                                                   self.action_latency_range[1] + 1))
+            for _ in range(self._action_buffer.maxlen):
+                self._action_buffer.append(np.zeros(12, dtype=np.float32))
+        self._obs_buffer.clear()
+        if self.observation_latency_range is not None:
+            self._episode_obs_latency = int(self._rng.integers(self.observation_latency_range[0],
+                                                                self.observation_latency_range[1] + 1))
+
         if self.terrain_enabled:
             if self.terrain_amplitude is not None:
                 amp = self.terrain_amplitude
@@ -576,7 +638,11 @@ class Go1FlatEnv(gym.Env):
         self._foot_air_time[:] = 0.0
         self._prev_touches[:] = True
 
-        obs = self._get_obs()
+        obs = self._add_obs_noise(self._get_obs())
+        if self.observation_latency_range is not None:
+            for _ in range(self._obs_buffer.maxlen):
+                self._obs_buffer.append(obs.copy())
+            obs = self._obs_buffer[-1 - self._episode_obs_latency]
         info = {}
         return obs, info
 
@@ -585,7 +651,12 @@ class Go1FlatEnv(gym.Env):
         if self._step_count == self._next_push_step:
             self.data.qvel[0:2] += self._rng.uniform(-self.push_velocity, self.push_velocity, 2)
             self._next_push_step += int(self._rng.integers(150, 300))
-        target_qpos = DEFAULT_JOINT_POS + self.action_scale * action
+        if self.action_latency_range is not None:
+            self._action_buffer.append(action.copy())
+            applied_action = self._action_buffer[-1 - self._episode_action_latency]
+        else:
+            applied_action = action
+        target_qpos = DEFAULT_JOINT_POS + self.action_scale * applied_action
 
         if self.use_gait_reference:
             # Force the thigh joints to follow a prescribed diagonal-trot oscillation.
@@ -618,11 +689,15 @@ class Go1FlatEnv(gym.Env):
             q = self.data.qpos[self._joint_qpos_adr]
             dq = self.data.qvel[self._joint_qvel_adr]
             torque = self._kp * (target_qpos - q) - self._kd * dq
+            torque = torque * self._episode_torque_scale
             torque = np.clip(torque, self._torque_range[:, 0], self._torque_range[:, 1])
             self.data.ctrl[self._actuator_ids] = torque
             mujoco.mj_step(self.model, self.data)
 
-        obs = self._get_obs()
+        obs = self._add_obs_noise(self._get_obs())
+        if self.observation_latency_range is not None:
+            self._obs_buffer.append(obs)
+            obs = self._obs_buffer[-1 - self._episode_obs_latency]
         reward, reward_info = self._compute_reward(action)
         terminated = self._check_termination()
         self._step_count += 1
@@ -806,6 +881,11 @@ class Go1FlatEnv(gym.Env):
         wy = y0 + F * s + L * c
         h = self._terrain_height(wx.ravel(), wy.ravel()) - self._terrain_height(x0, y0)
         return h.astype(np.float32)
+
+    def _add_obs_noise(self, obs):
+        if self.observation_noise_scale > 0:
+            obs = obs + self._rng.normal(0.0, self._obs_noise_std * self.observation_noise_scale).astype(np.float32)
+        return obs
 
     def _get_obs(self):
         quat = self.data.sensordata[self._imu_quat_adr:self._imu_quat_adr + 4]

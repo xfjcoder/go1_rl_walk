@@ -488,6 +488,30 @@ def main():
     g.add_argument("--push-velocity", type=float, default=0.0,
                     help="Random horizontal velocity kick (+-m/s) applied to the trunk every 3-6s.")
 
+    # ---- sim-to-real robustness randomization ----
+    g = parser.add_argument_group("sim-to-real robustness randomization")
+    g.add_argument("--kp-range", type=float, nargs=2, default=None, metavar=("LO", "HI"),
+                    help="PD position gain sampled each episode (motor-to-motor variance), overriding "
+                         "the fixed --kp. Unset = fixed --kp, unchanged.")
+    g.add_argument("--kd-range", type=float, nargs=2, default=None, metavar=("LO", "HI"),
+                    help="Same, for PD velocity gain, overriding the fixed --kd.")
+    g.add_argument("--torque-scale-range", type=float, nargs=2, default=None, metavar=("LO", "HI"),
+                    help="Multiplicative factor on the final computed torque, sampled each episode -- "
+                         "weaker/stronger actuators than nominal, on top of kp/kd (torque-domain, not "
+                         "just PD-gain, randomization). Unset = 1.0, unchanged.")
+    g.add_argument("--action-latency-range", type=int, nargs=2, default=None, metavar=("LO", "HI"),
+                    help="Control steps of delay between a commanded action and it actually being "
+                         "applied, sampled once per episode -- models real actuator response delay. "
+                         "Unset = 0, unchanged.")
+    g.add_argument("--observation-latency-range", type=int, nargs=2, default=None, metavar=("LO", "HI"),
+                    help="Control steps of delay before the observation reflects reality, sampled once "
+                         "per episode -- models sensor/comms delay. Unset = 0, unchanged.")
+    g.add_argument("--observation-noise-scale", type=float, default=0.0,
+                    help="Scales a fixed set of per-channel noise std's (gravity/gyro/quat/joint "
+                         "pos&vel/heightmap) added to the observation each step -- command, prev-action, "
+                         "and the phase clock are never noised, since they aren't physically sensed. "
+                         "0 = off (exact ground truth, unchanged).")
+
     args = parser.parse_args()
 
     global CKPT_DIR, LOG_DIR
@@ -550,6 +574,12 @@ def main():
         friction_range=list(args.friction_range),
         mass_scale_range=list(args.mass_scale_range) if args.mass_scale_range else None,
         push_velocity=args.push_velocity,
+        kp_range=list(args.kp_range) if args.kp_range else None,
+        kd_range=list(args.kd_range) if args.kd_range else None,
+        torque_scale_range=list(args.torque_scale_range) if args.torque_scale_range else None,
+        action_latency_range=list(args.action_latency_range) if args.action_latency_range else None,
+        observation_latency_range=list(args.observation_latency_range) if args.observation_latency_range else None,
+        observation_noise_scale=args.observation_noise_scale,
         lateral_tracking_weight=args.lateral_tracking_weight,
         lateral_tracking_sigma=args.lateral_tracking_sigma,
         max_foot_duty_cycle=args.max_foot_duty_cycle, min_foot_duty_cycle=args.min_foot_duty_cycle,
