@@ -519,6 +519,77 @@ is the only option, or narrow gaps that must be jumped rather than bumps
 that can be dodged. Not attempted here since the current (dodgeable)
 design already turned out to need no further work.
 
+## Sim-to-real robustness randomization
+
+`pretrained/p_stairs` has never seen anything but a perfect, instantaneous,
+noise-free simulation: exact torques from fixed PD gains, an action applied
+the instant it's computed, an observation that exactly reflects the current
+instant. A real robot has none of that -- motor-to-motor variance, a delay
+between commanding an actuator and it responding, sensor noise, and a delay
+before a reading reaches the controller. `envs/go1_env.py` adds four
+opt-in, additive mechanisms for this (all default off, verified
+bit-identical when unused):
+
+- `--kp-range`/`--kd-range`/`--torque-scale-range`: PD gains and a separate
+  multiplicative torque-strength factor, sampled once per episode.
+- `--action-latency-range`/`--observation-latency-range`: a small FIFO
+  buffer delays the effective action used for torque, and separately delays
+  what the observation reflects, by a randomly-sampled number of control
+  steps per episode. The policy's own `prev_action` observation and
+  action-rate reward still see the *raw* commanded action -- only the
+  physical effect and the sensed observation are delayed.
+- `--observation-noise-scale`: per-channel Gaussian noise on the physically
+  sensed quantities (gravity, gyro, orientation, joint pos/vel, heightmap).
+  Command, previous action, and the phase clock are never noised, since
+  they aren't physically sensed signals.
+
+**Zero-shot baseline** (`p_stairs`, never trained with any of this,
+evaluated *with* it at 0.8 m/s flat, 16 episodes): already robust to
+torque/PD variance (0% falls, vs. 6.25% with no randomization at all) and
+observation noise (6.25%, unaffected) -- but **latency is a real
+vulnerability** (37.5% falls with a 0-4 control-step / 0-80 ms delay).
+
+**Two fine-tuning attempts, both from `p_stairs`, neither adopted:**
+
+1. `runs/v_sim2real`: all four mechanisms at full configured strength from
+   step 0 -- unlike every other axis in this project (terrain, slope,
+   stairs, obstacles), which all ramped in gradually on first introduction.
+   Result: broadly regressed. Even basic flat-ground speed tracking broke
+   (0.8 m/s command only reached 0.544 m/s, vs. `p_stairs`'s own 0.780), and
+   robustness got *worse* on every axis, including zero change on the one
+   target metric (latency, still 37.5%).
+2. `runs/w_sim2real_curr`: fixed the obvious problem -- added
+   `sim2real_scale_current`, a shared curriculum multiplier ramping every
+   axis's deviation from nominal from 0 to full strength over the first 8M
+   of 14M steps, mirroring the `RampCallback` pattern already used
+   everywhere else (verified: scale=0 gives exactly nominal values
+   regardless of the configured range, scale=1 exactly reproduces the
+   original full-strength values). Result: still broadly regressed, nearly
+   identically to attempt 1 (0.8 m/s command still only reached 0.566 m/s),
+   and **latency's fall rate was exactly 37.5% again, unchanged by the
+   fix**.
+
+The fact that latency didn't move at all between two structurally different
+training setups is the real finding: the policy has no observation channel
+for *how much* delay the current episode has, so it can't specialize a
+strategy per episode -- it can only find one compromise averaged across the
+whole 0-4 step range, which ends up worse everywhere (including the
+zero-latency case, where an undedicated policy like `p_stairs` already
+tracks speed almost exactly) without being distinctly better at the high-
+latency end either. The standard real-world fix for this -- a "teacher"
+policy trained with privileged knowledge of the true per-episode latency,
+then distilled into a realistic "student" policy that doesn't have it -- is
+a substantially bigger technique than a reward/curriculum tweak, not
+attempted here. Torque/PD randomization and observation noise showed real,
+if partial, improvement from the curriculum fix (unlike latency), so they
+may be more tractable in isolation if revisited.
+
+**Decision: stop here, `pretrained/p_stairs` remains the accepted
+checkpoint.** Treated the same way as the ascending-stairs limit -- a
+documented, accepted boundary rather than an open problem to keep chasing.
+The four mechanisms stay in the codebase (all default off) as reasonable,
+generically useful, well-verified infrastructure.
+
 ## Next stages
 
 Terrain-aware observation and a non-trot gait mode were both tried already
@@ -540,10 +611,15 @@ ideas for extending past `runs/p_stairs`, roughly in order of effort:
 3. **Higher top speed** — the current trot always keeps ≥2 feet down; a
    faster gait needs a flight phase (0 feet down briefly), which the
    `phase_match` clock's stance/swing split would need to change to allow.
-4. **Sim-to-real** — swap in the higher-fidelity mesh model from MuJoCo
-   Menagerie (see the model note above), and add the usual sim-to-real
-   staples: actuator/observation latency, torque-domain randomization
-   (not just PD gains), and observation noise.
+4. **Sim-to-real, continued** — robustness randomization (latency,
+   torque-domain, observation noise) was tried already (see above); latency
+   specifically would likely need privileged-information training
+   (teacher/student distillation) to actually help rather than compromise
+   overall performance. The mesh-model swap (MuJoCo Menagerie's official
+   Unitree Go1, see the model note above) hasn't been attempted at all —
+   a bigger, riskier change likely to need its own re-validation pass,
+   probably invalidating the current checkpoints' fine details even if the
+   broad capability transfers.
 
 ## Troubleshooting
 
