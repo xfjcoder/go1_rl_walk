@@ -592,6 +592,34 @@ generically useful, well-verified infrastructure.
 
 ## Stage 4: higher-fidelity mesh model
 
+<p float="left">
+  <img src="media/mesh_model_flat.gif" width="400" alt="x_mesh_finetune walking on flat ground, mesh model">
+  <img src="media/mesh_model_slope_descent.gif" width="400" alt="x_mesh_finetune descending a 20 degree slope, mesh model">
+</p>
+
+*Left: flat ground, 0.5 m/s. Right: descending a 20° slope at 0.3 m/s — the
+drift on this exact scenario is what the fine-tune fixed (see the table
+below). Both are `pretrained/x_mesh_finetune` on `assets/go1_mesh.xml`.*
+
+To regenerate these (or record any other checkpoint/scenario — swap
+`--run-dir`, `--target-speed`, `--slope-deg`/`--stair-height`/
+`--terrain-amplitude`, `--seed`, `--camera` as needed):
+```bash
+python play.py --run-dir pretrained/x_mesh_finetune --episodes 1 --seed 5 \
+    --target-speed 0.5 --frame-stride 4 --record media/mesh_model_flat.gif --camera track
+
+python play.py --run-dir pretrained/x_mesh_finetune --episodes 1 --seed 3 \
+    --target-speed 0.3 --slope-deg -20 --frame-stride 4 \
+    --record media/mesh_model_slope_descent.gif --camera track
+```
+`--frame-stride 4` (vs. the default 2) roughly halves the GIF's file size
+by keeping every 4th rendered frame instead of every 2nd — the default is
+fine for closer visual inspection, but a courser stride keeps demo GIFs
+meant for the README/GitHub small. `--camera chase_rear` (follows from
+behind) is usually more informative than `track` (side-on) for spotting
+left/right leg asymmetry or watching a stair approach head-on; `topdown`
+is best for footfall/stride-pattern timing.
+
 `assets/go1_mesh.xml` swaps in the official MuJoCo Menagerie Unitree Go1
 model (meshes, per-link inertial tensors, per-link collision primitives,
 real joint ranges from the spec; BSD-3-Clause, `assets/meshes/LICENSE`),

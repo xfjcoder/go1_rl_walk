@@ -13,3 +13,7 @@ MUJOCO_LOG.TXT
 # ...except the one committed pretrained checkpoint (small, deliberately tracked)
 !pretrained/
 !pretrained/**
+
+# ...and a couple of demo GIFs for the README (small, deliberately tracked)
+!media/
+!media/**
