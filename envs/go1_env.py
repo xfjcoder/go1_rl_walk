@@ -13,6 +13,7 @@ Usage:
     env = Go1FlatEnv(render_mode="human")
 """
 import os
+import re
 from collections import deque
 import numpy as np
 import mujoco
@@ -757,6 +758,14 @@ class Go1FlatEnv(gym.Env):
         it never coincides with the terrain surface (heights are >= 0)."""
         with open(xml_path) as f:
             xml = f.read()
+        # from_xml_string() (used below) has no file context of its own, so a relative <compiler meshdir="..."/>
+        # (needed by any mesh-based model, e.g. assets/go1_mesh.xml) can't resolve -- rewrite it to an absolute
+        # path relative to xml_path's own directory. No-op for meshdir-less models (e.g. the primitive go1.xml).
+        xml = re.sub(
+            r'(<compiler\b[^>]*\bmeshdir=")([^"]+)(")',
+            lambda m: m.group(1) + os.path.abspath(os.path.join(os.path.dirname(xml_path), m.group(2))) + m.group(3),
+            xml,
+        )
         nrow, ncol = int(round(2 * HF_HALF_Y / HF_CELL)) + 1, int(round(2 * HF_HALF_X / HF_CELL)) + 1
         edits = [
             ("</asset>", f'<hfield name="terrain" nrow="{nrow}" ncol="{ncol}" '

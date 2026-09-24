@@ -96,6 +96,10 @@ def main():
     ap.add_argument("--target-speed", type=float, nargs="+", default=None,
                     help="command speed(s) to evaluate at. Default: the run's fixed speed, or 0.3 0.5 0.8 1.0 "
                          "for a run trained with a command-speed range.")
+    ap.add_argument("--robot-xml", default=None,
+                    help="path to an alternate MJCF file (e.g. assets/go1_mesh.xml) to evaluate the checkpoint "
+                         "against, in place of whatever assets/*.xml it was trained on. For sim-to-sim transfer "
+                         "checks -- the checkpoint's observation/action space must still match exactly.")
     args = ap.parse_args()
 
     ckpt_dir = os.path.join(args.run_dir, "checkpoints")
@@ -105,6 +109,8 @@ def main():
         else os.path.join(ckpt_dir, "vecnormalize_final.pkl")
     with open(os.path.join(args.run_dir, "env_kwargs.json")) as f:
         env_kwargs = json.load(f)
+    if args.robot_xml is not None:
+        env_kwargs["xml_path"] = os.path.abspath(args.robot_xml)
     trained_on_terrain = bool(env_kwargs.get("terrain_amplitude_range"))
     trained_on_slope = bool(env_kwargs.get("slope_range"))
     trained_on_stairs = bool(env_kwargs.get("stair_height_range"))
