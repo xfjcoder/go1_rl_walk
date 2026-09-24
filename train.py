@@ -511,6 +511,15 @@ def main():
                          "pos&vel/heightmap) added to the observation each step -- command, prev-action, "
                          "and the phase clock are never noised, since they aren't physically sensed. "
                          "0 = off (exact ground truth, unchanged).")
+    g.add_argument("--sim2real-curriculum-start", type=float, default=0.0,
+                    help="Fraction (0-1) of the configured kp/kd/torque-scale/latency/observation-noise "
+                         "ranges' deviation from nominal to use at the start of the run; ramps to 1.0 "
+                         "(full configured strength) over --sim2real-curriculum-steps. Only takes effect "
+                         "if at least one of those ranges/scales is set. Introducing all of these at full "
+                         "strength immediately (the default if this ramp isn't used) broadly destabilized "
+                         "even basic flat-ground tracking in testing -- ramp them in like every other "
+                         "randomization axis in this project.")
+    g.add_argument("--sim2real-curriculum-steps", type=int, default=8_000_000)
 
     args = parser.parse_args()
 
@@ -607,6 +616,10 @@ def main():
         env.set_attr("stair_height_max_current", args.stair_curriculum_start)
     if args.obstacle_height_max is not None:
         env.set_attr("obstacle_height_max_current", args.obstacle_curriculum_start)
+    sim2real_active = any([args.kp_range, args.kd_range, args.torque_scale_range, args.action_latency_range,
+                           args.observation_latency_range, args.observation_noise_scale > 0])
+    if sim2real_active:
+        env.set_attr("sim2real_scale_current", args.sim2real_curriculum_start)
     env = VecMonitor(env)
     vec_path = vecnormalize_path_for(args.resume) if args.resume else None
     if vec_path and os.path.exists(vec_path):
@@ -678,6 +691,9 @@ def main():
     if args.stair_height_max is not None:
         callbacks.append(RampCallback("stair_height_max_current", "stair_height_max", args.stair_curriculum_start,
                                       args.stair_height_max, args.stair_curriculum_steps))
+    if sim2real_active:
+        callbacks.append(RampCallback("sim2real_scale_current", "sim2real_scale", args.sim2real_curriculum_start,
+                                      1.0, args.sim2real_curriculum_steps))
     if args.obstacle_height_max is not None:
         callbacks.append(RampCallback("obstacle_height_max_current", "obstacle_height_max", args.obstacle_curriculum_start,
                                       args.obstacle_height_max, args.obstacle_curriculum_steps))

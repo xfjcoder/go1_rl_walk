@@ -378,6 +378,9 @@ class Go1FlatEnv(gym.Env):
         self.observation_noise_scale = observation_noise_scale
         self._episode_action_latency = 0
         self._episode_obs_latency = 0
+        self.sim2real_scale_current = 1.0   # 1.0 = full configured range immediately (matches direct,
+                                            # non-curriculum use); ramped 0->1 by a curriculum callback
+                                            # when introducing this for the first time -- see reset().
         self.speed_max_current = self.command_speed_range[1] if self.command_speed_range else None
         self.gait_period_fast = gait_period_fast
         self.lateral_tracking_weight = lateral_tracking_weight
@@ -541,20 +544,29 @@ class Go1FlatEnv(gym.Env):
         # Sim-to-real robustness randomization: torque domain (PD gains + a motor-strength
         # multiplier) and action/observation latency, all sampled once per episode (stationary
         # within an episode, like a real deployment's actuator/comms characteristics would be).
-        self._kp = float(self._rng.uniform(*self.kp_range)) if self.kp_range is not None else self._kp_value
-        self._kd = float(self._rng.uniform(*self.kd_range)) if self.kd_range is not None else self._kd_value
-        self._episode_torque_scale = float(self._rng.uniform(*self.torque_scale_range)) \
+        # Deviation from nominal is scaled by sim2real_scale_current (1.0 = full strength). Learned
+        # the hard way: introducing all of these at full strength from step 0, unlike every other
+        # axis in this project (terrain/slope/stairs/obstacles all ramped in gradually on their
+        # first introduction), broadly destabilized even basic flat-ground speed tracking.
+        s2r = self.sim2real_scale_current
+        self._kp = self._kp_value + (float(self._rng.uniform(*self.kp_range)) - self._kp_value) * s2r \
+            if self.kp_range is not None else self._kp_value
+        self._kd = self._kd_value + (float(self._rng.uniform(*self.kd_range)) - self._kd_value) * s2r \
+            if self.kd_range is not None else self._kd_value
+        self._episode_torque_scale = 1.0 + (float(self._rng.uniform(*self.torque_scale_range)) - 1.0) * s2r \
             if self.torque_scale_range is not None else 1.0
         self._action_buffer.clear()
         if self.action_latency_range is not None:
-            self._episode_action_latency = int(self._rng.integers(self.action_latency_range[0],
-                                                                   self.action_latency_range[1] + 1))
+            max_lat = self.action_latency_range[0] + round(
+                (self.action_latency_range[1] - self.action_latency_range[0]) * s2r)
+            self._episode_action_latency = int(self._rng.integers(self.action_latency_range[0], max_lat + 1))
             for _ in range(self._action_buffer.maxlen):
                 self._action_buffer.append(np.zeros(12, dtype=np.float32))
         self._obs_buffer.clear()
         if self.observation_latency_range is not None:
-            self._episode_obs_latency = int(self._rng.integers(self.observation_latency_range[0],
-                                                                self.observation_latency_range[1] + 1))
+            max_lat = self.observation_latency_range[0] + round(
+                (self.observation_latency_range[1] - self.observation_latency_range[0]) * s2r)
+            self._episode_obs_latency = int(self._rng.integers(self.observation_latency_range[0], max_lat + 1))
 
         if self.terrain_enabled:
             if self.terrain_amplitude is not None:
@@ -883,8 +895,9 @@ class Go1FlatEnv(gym.Env):
         return h.astype(np.float32)
 
     def _add_obs_noise(self, obs):
-        if self.observation_noise_scale > 0:
-            obs = obs + self._rng.normal(0.0, self._obs_noise_std * self.observation_noise_scale).astype(np.float32)
+        scale = self.observation_noise_scale * self.sim2real_scale_current
+        if scale > 0:
+            obs = obs + self._rng.normal(0.0, self._obs_noise_std * scale).astype(np.float32)
         return obs
 
     def _get_obs(self):
