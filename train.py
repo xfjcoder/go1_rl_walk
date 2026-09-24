@@ -239,6 +239,10 @@ def main():
                     help="On --resume, reset the policy's log action std to this value (re-opens "
                          "exploration when the task changes, e.g. -1.6 = std 0.2).")
     g.add_argument("--seed", type=int, default=0)
+    g.add_argument("--robot-xml", type=str, default=None,
+                    help="Path to an alternate MJCF file (e.g. assets/go1_mesh.xml) in place of the default "
+                         "assets/go1.xml. Saved into env_kwargs.json, so play.py/eval_policy.py/gait_stats.py "
+                         "pick it up automatically via --run-dir with no extra flag needed.")
 
     # ---- PPO / exploration ----
     g = parser.add_argument_group("PPO / exploration")
@@ -599,6 +603,9 @@ def main():
         static_stability_ref_height=args.static_stability_ref_height,
         target_air_time=args.target_air_time, kp=args.kp, kd=args.kd,
     )
+    if args.robot_xml is not None:
+        env_kwargs["xml_path"] = args.robot_xml  # kept as given (relative to cwd, i.e. the repo root by
+        # convention) rather than os.path.abspath'd, so env_kwargs.json stays portable across machines/clones
     if run_dir:
         import json
         with open(os.path.join(run_dir, "args.json"), "w") as f:

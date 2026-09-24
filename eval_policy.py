@@ -110,7 +110,8 @@ def main():
     with open(os.path.join(args.run_dir, "env_kwargs.json")) as f:
         env_kwargs = json.load(f)
     if args.robot_xml is not None:
-        env_kwargs["xml_path"] = os.path.abspath(args.robot_xml)
+        env_kwargs["xml_path"] = args.robot_xml  # relative to cwd (repo root), not abspath'd -- --robot-xml
+        # only overrides the CURRENT process's env, doesn't rewrite the run's own saved env_kwargs.json
     trained_on_terrain = bool(env_kwargs.get("terrain_amplitude_range"))
     trained_on_slope = bool(env_kwargs.get("slope_range"))
     trained_on_stairs = bool(env_kwargs.get("stair_height_range"))

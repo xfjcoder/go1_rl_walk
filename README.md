@@ -590,6 +590,84 @@ documented, accepted boundary rather than an open problem to keep chasing.
 The four mechanisms stay in the codebase (all default off) as reasonable,
 generically useful, well-verified infrastructure.
 
+## Stage 4: higher-fidelity mesh model
+
+`assets/go1_mesh.xml` swaps in the official MuJoCo Menagerie Unitree Go1
+model (meshes, per-link inertial tensors, per-link collision primitives,
+real joint ranges from the spec; BSD-3-Clause, `assets/meshes/LICENSE`),
+merged with this project's own control/sensor/terrain scheme so it's a
+drop-in replacement for `assets/go1.xml` — every existing checkpoint,
+`envs/go1_env.py`'s name-based lookups, and the terrain-injection code all
+work against it unmodified (see the file's own header for exactly what
+changed vs. what was deliberately kept the same, isolating the geometry/
+inertia/joint-range upgrade as one variable, not bundled with e.g. also
+adopting Menagerie's own solver settings).
+
+Leg segment lengths are identical between the two files, so the existing
+"stand" keyframe needed no changes — verified: FK gives the same standing
+foot height on both, and PD-holding the stand pose is stable for 10s of
+sim time.
+
+**Zero-shot check** (`pretrained/p_stairs`, no fine-tuning) across the
+whole previously-tested grid found no new capability regression anywhere
+(0% falls on flat/rough terrain 0-12cm x 0.3/0.8 m/s, slopes 0/±10/±20°,
+stairs 0/±6cm; the known ascending-12cm-stairs stall reproduced almost
+exactly — 0.084 vs 0.091 m/s — a useful cross-check that it's a genuine
+gait-strategy limit, not an artifact of the old primitive geometry).
+It did, however, show a consistent ~15-30% speed-tracking overshoot at
+every setting (the corrected mass distribution/inertia changes how the
+same PD torques convert to velocity) and larger lateral drift specifically
+on downhill slopes.
+
+**Fine-tuned**: `runs/x_mesh_finetune` (8M steps, resumed from `p_stairs`
+on the mesh model, `--resume-log-std -1.8`, every terrain/slope/stair/speed
+axis kept at its full existing range from the start — no curriculum
+re-ramp needed since the zero-shot check already showed the whole grid
+transfers). Committed at `pretrained/x_mesh_finetune/`.
+
+| setting | original | mesh zero-shot | mesh fine-tuned |
+|---|---|---|---|
+| flat 0.3 m/s | 0% falls, 0.316 m/s | 0%, 0.419 | 0%, 0.293 |
+| flat 0.8 m/s | 0%, 0.784 | 0%, 0.859 | 0%, 0.759 |
+| terrain 12cm, 0.8 m/s | 0%, 0.756 | 0%, 0.834 | 0%, 0.746 |
+| slope -10° | 0%, 0.304, drift 0.48m | 0%, 0.420, drift 1.00m | 0%, 0.284, drift 0.13m |
+| slope -20° | 0%, 0.324, drift 0.78m | 0%, 0.485, drift 1.45m | 0%, 0.284, drift 0.53m |
+| stairs +12cm (known stall) | 0%, 0.091 | 0%, 0.084 | 0%, 0.092 |
+| stairs -12cm (24 episodes) | 4% falls | 8% falls | 12% falls |
+
+The speed-tracking overshoot and slope drift are both fixed by the
+fine-tune — downhill drift at -10°/-20° ends up *better* than the original
+model's own numbers. The one soft spot: descending-12cm-stairs (already
+the single hardest corner in the whole project) drifted from 4% falls
+(original) to 8% (mesh zero-shot) to 12% (mesh fine-tuned) — a small,
+noise-adjacent trend (confirmed with 24-episode samples, not the noisier
+8-episode default) rather than a sharp regression, and the known ascending-
+stairs stall is untouched either way, exactly as expected since this
+fine-tune targeted broad recalibration, not that specific limit.
+
+**Decision: adopt `pretrained/x_mesh_finetune`** as the mesh-model
+checkpoint on this branch (`stage4-mesh-model`) — the fidelity upgrade
+transfers cleanly and the fine-tune corrects its only real zero-shot
+weaknesses, at the cost of a small, tracked dip on the already-hardest
+existing corner. `pretrained/p_stairs` (the primitive-geometry model) is
+untouched and remains `main`'s own checkpoint; this branch is a separate,
+parallel track, not a replacement, pending a decision on merging it in.
+
+```bash
+# Watch it walk / evaluate it, exactly like any other pretrained checkpoint --
+# env_kwargs.json already points at assets/go1_mesh.xml, no extra flag needed:
+python play.py --run-dir pretrained/x_mesh_finetune --target-speed 0.5 --stair-height 0.06 --record out.gif
+python eval_policy.py --run-dir pretrained/x_mesh_finetune --episodes 16
+
+# To sim-to-sim test any OTHER existing checkpoint against the mesh model without
+# retraining (what the zero-shot numbers above came from):
+python eval_policy.py --run-dir pretrained/p_stairs --robot-xml assets/go1_mesh.xml --episodes 16
+```
+
+Not attempted: Menagerie's own solver settings (elliptic friction cone,
+`impratio=100`, softer foot contact) — a separate follow-up variable,
+deliberately not bundled with this change.
+
 ## Next stages
 
 Terrain-aware observation and a non-trot gait mode were both tried already
@@ -615,11 +693,10 @@ ideas for extending past `runs/p_stairs`, roughly in order of effort:
    torque-domain, observation noise) was tried already (see above); latency
    specifically would likely need privileged-information training
    (teacher/student distillation) to actually help rather than compromise
-   overall performance. The mesh-model swap (MuJoCo Menagerie's official
-   Unitree Go1, see the model note above) hasn't been attempted at all —
-   a bigger, riskier change likely to need its own re-validation pass,
-   probably invalidating the current checkpoints' fine details even if the
-   broad capability transfers.
+   overall performance. The mesh-model swap (see "Stage 4" above) is done
+   and adopted on `stage4-mesh-model`; Menagerie's own solver settings
+   (elliptic friction cone, softer foot contact) are a separate, still-
+   untried follow-up variable.
 
 ## Troubleshooting
 

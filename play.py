@@ -57,6 +57,9 @@ def main():
     parser.add_argument("--camera", type=str, default="track", choices=["track", "chase_rear", "topdown"],
                          help="track: side view. chase_rear: follows from behind, best for spotting "
                               "left/right leg asymmetry. topdown: best for footfall timing patterns.")
+    parser.add_argument("--robot-xml", type=str, default=None,
+                         help="path to an alternate MJCF file (e.g. assets/go1_mesh.xml) to play the checkpoint "
+                              "against, in place of whatever assets/*.xml it was trained on.")
     args = parser.parse_args()
 
     render_mode = "rgb_array" if args.record else "human"
@@ -87,6 +90,8 @@ def main():
     env_kwargs["obstacle_height_range"] = None
     env_kwargs["obstacle_height"] = args.obstacle_height
     env_kwargs.setdefault("target_speed", 1.0)
+    if args.robot_xml is not None:
+        env_kwargs["xml_path"] = args.robot_xml  # relative to cwd (repo root), not abspath'd
 
     def make_env():
         return Go1FlatEnv(render_mode=render_mode, domain_randomize=False, camera=args.camera, **env_kwargs)
