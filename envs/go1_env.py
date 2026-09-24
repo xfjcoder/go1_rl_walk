@@ -210,8 +210,15 @@ class Go1FlatEnv(gym.Env):
                                                # hi_now starts at hi and can be ramped by a curriculum callback
                                                # via the speed_max_current attribute. None = fixed target_speed.
         gait_period_fast: float | None = None,  # if set, the trot clock period shrinks linearly from gait_period
-                                               # (at 0.3 m/s) to this value (at 1.0 m/s), clipped outside, so faster
-                                               # commands get a faster step rate. None = fixed gait_period.
+                                               # (at 0.3 m/s) to this value (at gait_period_fast_speed), clipped
+                                               # outside, so faster commands get a faster step rate. None = fixed
+                                               # gait_period.
+        gait_period_fast_speed: float = 1.0,   # the speed (m/s) at which the interpolation above reaches
+                                               # gait_period_fast; speeds at/above it just use gait_period_fast
+                                               # directly. 1.0 (default) matches every run before this flag
+                                               # existed exactly. Raise it if the speed range extends past 1.0
+                                               # m/s (stage 5) so the clock keeps speeding up across the new
+                                               # range instead of saturating at the old one.
         lateral_tracking_weight: float = 0.0,  # reward exp(-(v_side/sigma)^2) for zero sideways velocity (body frame
                                                # if body_frame_velocity). Fixes crabbing: h_clock drifted 4.6 cm/s
                                                # sideways while heading stayed straight.
@@ -255,6 +262,22 @@ class Go1FlatEnv(gym.Env):
                                                # gallop-like coordination despite trot being enforced
                                                # -- this robot's dynamics may simply make a bound more
                                                # natural than a trot.
+        gait_duty: float = 0.5,               # fraction of the stride cycle each leg-pair spends
+                                               # in prescribed STANCE (the rest is prescribed SWING).
+                                               # 0.5 (default) is the original always->=2-feet-down
+                                               # trot/bound with zero flight window, bit-for-bit
+                                               # unchanged from before this flag existed. duty < 0.5
+                                               # opens a genuine FLIGHT phase (both pairs prescribed
+                                               # swing simultaneously, all 4 feet intentionally
+                                               # airborne) for a fraction (1 - 2*duty) of the cycle --
+                                               # stage 5, needed for speeds beyond what an always-
+                                               # supported gait can reach. Reshapes r_gait's target
+                                               # unconditionally (r_gait has no on/off flag of its
+                                               # own); also reshapes r_phase_match's target, which
+                                               # only contributes to the total reward when
+                                               # phase_match_weight > 0. gait_period usually needs
+                                               # lowering too, for the faster cadence a flight gait
+                                               # needs.
         phase_match_weight: float = 0.0,      # reward for matching a PRESCRIBED diagonal-trot
                                                # timing against a fixed external clock. Defaulted to
                                                # 0.0 -- across many runs, hand-picked clock parameters
@@ -384,6 +407,7 @@ class Go1FlatEnv(gym.Env):
                                             # when introducing this for the first time -- see reset().
         self.speed_max_current = self.command_speed_range[1] if self.command_speed_range else None
         self.gait_period_fast = gait_period_fast
+        self.gait_period_fast_speed = gait_period_fast_speed
         self.lateral_tracking_weight = lateral_tracking_weight
         self.lateral_tracking_sigma = lateral_tracking_sigma
         self._episode_gait_period = gait_period
@@ -403,6 +427,7 @@ class Go1FlatEnv(gym.Env):
         self.target_air_time = target_air_time
         self.use_gait_reference = use_gait_reference
         self.gait_style = gait_style
+        self.gait_duty = gait_duty
         self.use_calf_reference = use_calf_reference
         self.gait_swing_amplitude = gait_swing_amplitude
         self.thigh_residual_scale = thigh_residual_scale
@@ -875,7 +900,13 @@ class Go1FlatEnv(gym.Env):
         if self.gait_period_fast is None:
             period = self.gait_period
         else:
-            f = float(np.clip((speed - 0.3) / 0.7, 0.0, 1.0))
+            # Interpolates linearly from gait_period at 0.3 m/s to gait_period_fast at
+            # gait_period_fast_speed (default 1.0 m/s, matching every run before this flag
+            # existed exactly -- 0.3 + 0.7 = 1.0). Speeds at/above gait_period_fast_speed just
+            # use gait_period_fast directly (the interpolation saturates, same as before).
+            # Parameterized (stage 5) so a speed range extended past 1.0 m/s can keep the clock
+            # speeding up smoothly across the WHOLE new range instead of saturating early.
+            f = float(np.clip((speed - 0.3) / (self.gait_period_fast_speed - 0.3), 0.0, 1.0))
             period = (1 - f) * self.gait_period + f * self.gait_period_fast
         return period + self.gait_period_stair_stretch * stair_h
 
@@ -1001,6 +1032,19 @@ class Go1FlatEnv(gym.Env):
         touches = self._foot_contacts()
         n_contacts = touches.sum()
 
+        # Gait-phase reference: per-leg desired stance/swing from a periodic clock (trot:
+        # diagonal pairs FR+RL / FL+RR alternate; bound: front pair / rear pair alternate),
+        # generalized with a duty cycle so a full stride can include a genuine FLIGHT phase
+        # (all 4 feet simultaneously airborne) when gait_duty < 0.5 -- needed for speeds beyond
+        # what an always->=2-feet-down trot/bound can reach (stage 5). gait_duty=0.5 (the
+        # default) reproduces the original always-2-feet-down pattern exactly, with zero flight
+        # window -- verified bit-for-bit identical reward at the default before this was used
+        # for anything.
+        phase = self._gait_phase()
+        leg_phases = (phase + GAIT_PHASE_OFFSETS[self.gait_style]) % 1.0
+        desired_stance = leg_phases < self.gait_duty   # FR, FL, RR, RL
+        n_desired = int(desired_stance.sum())
+
         # 6b. Feet air-time reward (Rudin et al. 2022 "Learning to Walk in Minutes" style):
         # on the step a foot touches DOWN, reward it for how long it had been airborne,
         # relative to target_air_time. Unlike phase_match/gait_period, this never specifies
@@ -1017,29 +1061,39 @@ class Go1FlatEnv(gym.Env):
         self._foot_air_time = np.where(touches, 0.0, self._foot_air_time + dt_control)
         self._prev_touches = touches.copy()
 
-        # A canonical trot has exactly 2 feet down. Previously this rewarded ANY
-        # count from 1-3 equally, which let a persistent 3-down/1-stepping pattern
-        # (rear legs always planted, only front legs doing anything) score exactly
-        # as well as a real 2-2 trot -- removing any pressure to actually use all
-        # four legs. Now only a genuine 2-2 split gets the bonus; 1 or 3 is neutral,
-        # 0 or 4 (stumble/frozen) is still penalized.
-        if n_contacts == 2:
-            r_gait = 0.08
-        elif n_contacts == 3:
-            r_gait = 0.0   # slightly sloppy (an extra foot down) but not dangerous
-        elif n_contacts == 1:
-            # Single-point-of-support: dramatically less stable than either a proper
-            # 2-2 trot or a sloppy 3-down stance (no roll stability at all -- the
-            # robot can rock and fall either way). Previously treated identically to
-            # n_contacts==3 (both scored 0.0, neutral), which gave no specific
-            # incentive to avoid this far more dangerous case. This was observed
-            # directly: the robot took a couple of good steps, then ended up
-            # supported on only the front-right foot while all three other legs
-            # were simultaneously airborne (diagonal-pair synchrony broken down),
-            # and fell from exactly that configuration.
-            r_gait = -0.15
-        else:  # 0 or 4
-            r_gait = -0.05
+        # A canonical trot has exactly 2 feet down whenever the clock calls for stance
+        # (n_desired == 2); during an intentional FLIGHT window (n_desired == 0, only possible
+        # when gait_duty < 0.5) exactly 0 feet down is the target instead. Previously this
+        # rewarded ANY count from 1-3 equally during a stance window, which let a persistent
+        # 3-down/1-stepping pattern (rear legs always planted, only front legs doing anything)
+        # score exactly as well as a real 2-2 trot -- removing any pressure to actually use all
+        # four legs. Now only a genuine 2-2 split gets the bonus during a stance window; 1 or 3
+        # is neutral, 0 or 4 (stumble/frozen) is still penalized.
+        if n_desired == 2:
+            if n_contacts == 2:
+                r_gait = 0.08
+            elif n_contacts == 3:
+                r_gait = 0.0   # slightly sloppy (an extra foot down) but not dangerous
+            elif n_contacts == 1:
+                # Single-point-of-support: dramatically less stable than either a proper
+                # 2-2 trot or a sloppy 3-down stance (no roll stability at all -- the
+                # robot can rock and fall either way). Previously treated identically to
+                # n_contacts==3 (both scored 0.0, neutral), which gave no specific
+                # incentive to avoid this far more dangerous case. This was observed
+                # directly: the robot took a couple of good steps, then ended up
+                # supported on only the front-right foot while all three other legs
+                # were simultaneously airborne (diagonal-pair synchrony broken down),
+                # and fell from exactly that configuration.
+                r_gait = -0.15
+            else:  # 0 or 4 feet down when 2 were expected
+                r_gait = -0.05
+        else:  # n_desired == 0: an intentional flight window (gait_duty < 0.5 only)
+            if n_contacts == 0:
+                r_gait = 0.08   # a genuine, controlled aerial phase -- the whole point of this gait
+            elif n_contacts <= 2:
+                r_gait = 0.0    # transitioning in/out of the flight window; tolerate a partial touch
+            else:  # 3 or 4 feet still down deep into what should be a flight window
+                r_gait = -0.05
 
         # 7a. Per-foot duty-cycle penalty: track each foot's running fraction of
         # time spent in contact, and penalize any foot whose average exceeds
@@ -1054,18 +1108,11 @@ class Go1FlatEnv(gym.Env):
         duty_excess_low = np.maximum(self.min_foot_duty_cycle - self._foot_contact_ema, 0.0)
         r_foot_duty = -self.foot_duty_weight * float(np.sum(duty_excess_high) + np.sum(duty_excess_low))
 
-        # 7a2. Gait-phase tracking: reward matching a PRESCRIBED footfall timing (trot: diagonal
-        # pairs FR+RL / FL+RR; bound: front pair / rear pair), rather than any loose "some
+        # 7a2. Gait-phase tracking: reward matching the PRESCRIBED footfall timing computed
+        # above (desired_stance, including any flight window), rather than any loose "some
         # acceptable split" check. This gives the policy an explicit, unambiguous reference to
         # track -- much easier for per-step Gaussian exploration to find than "discover a good
         # rhythm from scratch."
-        phase = self._gait_phase()
-        if self.gait_style == "bound":
-            front_stance = phase < 0.5
-            desired_stance = np.array([front_stance, front_stance, not front_stance, not front_stance])  # FR,FL,RR,RL
-        else:  # "trot"
-            fr_rl_stance = phase < 0.5
-            desired_stance = np.array([fr_rl_stance, not fr_rl_stance, not fr_rl_stance, fr_rl_stance])  # FR,FL,RR,RL
         r_phase_match = self._episode_phase_match_weight * float(np.mean(touches == desired_stance))
 
         # Static-stability bonus: reward having MORE than 2 feet down, scaled by how tall the

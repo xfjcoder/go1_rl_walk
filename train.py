@@ -314,13 +314,35 @@ def main():
                     help="Seconds per full stride cycle for the prescribed gait-phase clock. "
                          "Only relevant if --phase-match-weight > 0.")
     g.add_argument("--gait-period-fast", type=float, default=None,
-                    help="Trot-clock period (s) at 1.0 m/s; the period interpolates linearly from "
-                         "--gait-period (at 0.3 m/s) to this, so faster commands get a faster step "
-                         "rate. Default: fixed period regardless of speed.")
+                    help="Trot-clock period (s) at --gait-period-fast-speed; the period interpolates "
+                         "linearly from --gait-period (at 0.3 m/s) to this, so faster commands get a "
+                         "faster step rate. Default: fixed period regardless of speed.")
+    g.add_argument("--gait-period-fast-speed", type=float, default=1.0,
+                    help="Speed (m/s) at which the interpolation above reaches --gait-period-fast; "
+                         "speeds at/above it use --gait-period-fast directly. 1.0 (default) matches "
+                         "every run before this flag existed. Raise it if --speed-range-max extends "
+                         "past 1.0 m/s, so the clock keeps speeding up across the new range.")
     g.add_argument("--gait-style", type=str, default="trot", choices=["trot", "bound"],
                     help="'trot': diagonal pairs together (FR+RL, FL+RR), the default and the only "
                          "style used in any working run so far. 'bound' (front pair / rear pair "
                          "alternating) is wired through phase_match and trot_symmetry but untested.")
+    g.add_argument("--gait-duty", type=float, default=0.5,
+                    help="Fraction of the stride cycle each leg-pair spends in prescribed stance. "
+                         "0.5 (default) is the original always->=2-feet-down gait, zero flight "
+                         "window, bit-for-bit unchanged from before this flag existed. Below 0.5 "
+                         "opens a genuine FLIGHT phase (all 4 feet prescribed airborne together) "
+                         "for a (1 - 2*duty) fraction of the cycle -- for reaching speeds beyond "
+                         "what an always-supported trot/bound can. Reshapes r_gait's target "
+                         "unconditionally; --gait-period-fast usually needs lowering too, for the "
+                         "faster cadence a flight gait needs.")
+    g.add_argument("--gait-duty-final", type=float, default=None,
+                    help="If set, ramp gait_duty from --gait-duty down to this value over "
+                         "--gait-duty-curriculum-steps, opening the flight window gradually "
+                         "rather than all at once -- same reasoning as every other curriculum "
+                         "here (a brand-new axis introduced at full strength from step 0 "
+                         "regressed broadly the one time it was tried, see README's sim-to-real "
+                         "section). None (default): gait_duty stays fixed at --gait-duty.")
+    g.add_argument("--gait-duty-curriculum-steps", type=int, default=8_000_000)
     g.add_argument("--phase-match-weight", type=float, default=0.0,
                     help="Reward for matching the prescribed diagonal-trot timing above. This is "
                          "what actually fixed the front/rear step-rate mismatch (see README) -- "
@@ -573,7 +595,7 @@ def main():
         air_time_cap=args.air_time_cap,
         command_speed_range=([args.speed_range_min, args.speed_range_max]
                              if args.speed_range_min is not None else None),
-        gait_period_fast=args.gait_period_fast,
+        gait_period_fast=args.gait_period_fast, gait_period_fast_speed=args.gait_period_fast_speed,
         terrain_amplitude_range=([args.terrain_amp_min, args.terrain_amp_max] if args.terrain_amp_max is not None else None),
         slope_range=([args.slope_min_deg, args.slope_max_deg] if args.slope_max_deg is not None else None),
         ramp_length=args.ramp_length,
@@ -597,6 +619,7 @@ def main():
         lateral_tracking_sigma=args.lateral_tracking_sigma,
         max_foot_duty_cycle=args.max_foot_duty_cycle, min_foot_duty_cycle=args.min_foot_duty_cycle,
         foot_duty_weight=args.foot_duty_weight, gait_period=args.gait_period, gait_style=args.gait_style,
+        gait_duty=args.gait_duty,
         phase_match_weight=initial_phase_match_weight, air_time_weight=args.air_time_weight,
         phase_match_stair_relax=args.phase_match_stair_relax,
         static_stability_weight=args.static_stability_weight,
@@ -704,6 +727,9 @@ def main():
     if args.obstacle_height_max is not None:
         callbacks.append(RampCallback("obstacle_height_max_current", "obstacle_height_max", args.obstacle_curriculum_start,
                                       args.obstacle_height_max, args.obstacle_curriculum_steps))
+    if args.gait_duty_final is not None:
+        callbacks.append(RampCallback("gait_duty", "gait_duty", args.gait_duty,
+                                      args.gait_duty_final, args.gait_duty_curriculum_steps))
     if args.phase_match_warmup_steps > 0:
         callbacks.append(RewardWarmupCallback(
             attr_name="phase_match_weight",
