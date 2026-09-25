@@ -278,6 +278,20 @@ class Go1FlatEnv(gym.Env):
                                                # phase_match_weight > 0. gait_period usually needs
                                                # lowering too, for the faster cadence a flight gait
                                                # needs.
+        gait_duty_fast: float | None = None,  # if set, the EFFECTIVE duty used in the reward
+                                               # interpolates per-episode from gait_duty (at 0.3 m/s)
+                                               # to this value (at gait_period_fast_speed), exactly
+                                               # mirroring gait_period_fast's own interpolation --
+                                               # slow commands keep the safe, proven gait_duty=0.5
+                                               # trot, only fast commands narrow toward a flight
+                                               # phase. None (default): duty is gait_duty always,
+                                               # regardless of speed (the original stage-5 behavior --
+                                               # found to force an unwanted partial flight attempt
+                                               # even at low, already-solid speeds, since gait_duty
+                                               # alone has no notion of the episode's own commanded
+                                               # speed; --gait-duty-final's training-time curriculum
+                                               # has the same blind spot for the same reason. Prefer
+                                               # this flag over that curriculum for a real fix).
         phase_match_weight: float = 0.0,      # reward for matching a PRESCRIBED diagonal-trot
                                                # timing against a fixed external clock. Defaulted to
                                                # 0.0 -- across many runs, hand-picked clock parameters
@@ -428,6 +442,7 @@ class Go1FlatEnv(gym.Env):
         self.use_gait_reference = use_gait_reference
         self.gait_style = gait_style
         self.gait_duty = gait_duty
+        self.gait_duty_fast = gait_duty_fast
         self.use_calf_reference = use_calf_reference
         self.gait_swing_amplitude = gait_swing_amplitude
         self.thigh_residual_scale = thigh_residual_scale
@@ -910,6 +925,15 @@ class Go1FlatEnv(gym.Env):
             period = (1 - f) * self.gait_period + f * self.gait_period_fast
         return period + self.gait_period_stair_stretch * stair_h
 
+    def _duty_for_speed(self, speed: float) -> float:
+        """Same interpolation as _period_for_speed, applied to gait_duty instead: slow commands
+        keep gait_duty (the safe default, 0.5 = no flight window), fast commands narrow toward
+        gait_duty_fast. None (default) means duty is gait_duty at every speed, unconditionally."""
+        if self.gait_duty_fast is None:
+            return self.gait_duty
+        f = float(np.clip((speed - 0.3) / (self.gait_period_fast_speed - 0.3), 0.0, 1.0))
+        return (1 - f) * self.gait_duty + f * self.gait_duty_fast
+
     def _gait_phase(self) -> float:
         """Where we are in the prescribed stride cycle, in [0, 1)."""
         episode_time = self._step_count / self.control_hz
@@ -1042,7 +1066,7 @@ class Go1FlatEnv(gym.Env):
         # for anything.
         phase = self._gait_phase()
         leg_phases = (phase + GAIT_PHASE_OFFSETS[self.gait_style]) % 1.0
-        desired_stance = leg_phases < self.gait_duty   # FR, FL, RR, RL
+        desired_stance = leg_phases < self._duty_for_speed(self.target_speed)   # FR, FL, RR, RL
         n_desired = int(desired_stance.sum())
 
         # 6b. Feet air-time reward (Rudin et al. 2022 "Learning to Walk in Minutes" style):

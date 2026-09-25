@@ -341,8 +341,21 @@ def main():
                          "rather than all at once -- same reasoning as every other curriculum "
                          "here (a brand-new axis introduced at full strength from step 0 "
                          "regressed broadly the one time it was tried, see README's sim-to-real "
-                         "section). None (default): gait_duty stays fixed at --gait-duty.")
+                         "section). None (default): gait_duty stays fixed at --gait-duty. CAUTION: "
+                         "this ramps duty over TRAINING TIME regardless of the episode's own "
+                         "commanded speed, so by the end of the ramp every episode gets the same "
+                         "narrowed duty even at speeds that were already solid at duty=0.5 -- this "
+                         "is what caused a drift regression at low/unchanged speeds the one time "
+                         "it was tried (see README). Prefer --gait-duty-fast instead, which makes "
+                         "duty depend on the episode's own speed and needs no separate curriculum.")
     g.add_argument("--gait-duty-curriculum-steps", type=int, default=8_000_000)
+    g.add_argument("--gait-duty-fast", type=float, default=None,
+                    help="If set, the EFFECTIVE duty used in the reward interpolates per-episode "
+                         "from --gait-duty (at 0.3 m/s) to this value (at --gait-period-fast-speed), "
+                         "exactly mirroring --gait-period-fast's own interpolation -- slow commands "
+                         "keep the safe, proven duty=0.5 trot, only fast commands narrow toward a "
+                         "flight phase. The recommended way to open a flight window (see the "
+                         "caution on --gait-duty-final above for why).")
     g.add_argument("--phase-match-weight", type=float, default=0.0,
                     help="Reward for matching the prescribed diagonal-trot timing above. This is "
                          "what actually fixed the front/rear step-rate mismatch (see README) -- "
@@ -619,7 +632,7 @@ def main():
         lateral_tracking_sigma=args.lateral_tracking_sigma,
         max_foot_duty_cycle=args.max_foot_duty_cycle, min_foot_duty_cycle=args.min_foot_duty_cycle,
         foot_duty_weight=args.foot_duty_weight, gait_period=args.gait_period, gait_style=args.gait_style,
-        gait_duty=args.gait_duty,
+        gait_duty=args.gait_duty, gait_duty_fast=args.gait_duty_fast,
         phase_match_weight=initial_phase_match_weight, air_time_weight=args.air_time_weight,
         phase_match_stair_relax=args.phase_match_stair_relax,
         static_stability_weight=args.static_stability_weight,
