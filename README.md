@@ -824,8 +824,31 @@ python play.py --run-dir pretrained/go2_speed_curriculum --target-speed 0.8 --re
 python eval_policy.py --run-dir pretrained/go2_speed_curriculum --episodes 16
 ```
 
-Not yet attempted for Go2: rough terrain, slopes, stairs, or any of the
-later Go1 stages — this is Go2's equivalent of Go1's own Stage 1 only.
+**Stage 2 — rough terrain** (`runs/go2_terrain`, 14M steps, resumed from
+`go2_speed_curriculum`, the exact original `j_terrain` recipe verbatim —
+heightfield bumps ramped 0→12cm, friction/mass/push randomization, speed
+range kept at its already-learned full 0.2–1.0 m/s from the start since
+only terrain is new here):
+
+<p float="left">
+  <img src="media/go2_terrain_12cm_0.8ms.gif" width="380" alt="Go2 on 12cm rough terrain at 0.8 m/s">
+</p>
+
+*`go2_terrain` on 12cm rough terrain, 0.8 m/s.*
+
+0% falls at 0/4/8cm amplitude across both 0.3 and 0.8 m/s, with a small
+6% fall rate only at the single hardest setting (12cm) — closely
+mirroring Go1's own `j_terrain` result (which had the same kind of small
+hardest-corner vulnerability, later fixed by a short hard-mining pass,
+`k_hardmine`). Committed at `pretrained/go2_terrain/`.
+
+```bash
+python play.py --run-dir pretrained/go2_terrain --target-speed 0.8 --terrain-amplitude 0.12 --record out.gif
+python eval_policy.py --run-dir pretrained/go2_terrain --episodes 16 --terrain-amplitude 0 0.04 0.08 0.12
+```
+
+Not yet attempted for Go2: the `k_hardmine`-style fix for the 12cm
+corner, slopes, stairs, or any of the later Go1 stages.
 
 ## Next stages
 
