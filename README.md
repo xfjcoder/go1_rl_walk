@@ -847,8 +847,34 @@ python play.py --run-dir pretrained/go2_terrain --target-speed 0.8 --terrain-amp
 python eval_policy.py --run-dir pretrained/go2_terrain --episodes 16 --terrain-amplitude 0 0.04 0.08 0.12
 ```
 
-Not yet attempted for Go2: the `k_hardmine`-style fix for the 12cm
-corner, slopes, stairs, or any of the later Go1 stages.
+**Stage 2b — hard-mine the 12cm corner** (`runs/go2_hardmine`, 8M steps,
+resumed from `go2_terrain`): adapted from Go1's own `k_hardmine` recipe,
+but biased differently — Go1's hardest corner was specifically fast+hard
+combined (12cm at 0.8 m/s only), so `k_hardmine` narrowed both terrain
+*and* speed range. Go2's `j_terrain` result showed the 6% vulnerability at
+12cm regardless of speed (both 0.3 and 0.8 m/s), so this fine-tune instead
+biases sampling toward the hard *terrain* range (6-12cm) only, keeping the
+full existing 0.2-1.0 m/s speed range — narrowing speed too would have
+under-trained the slow+hard case Go2 actually struggles with.
+
+<p float="left">
+  <img src="media/go2_hardmine_12cm_0.8ms.gif" width="380" alt="Go2 on 12cm rough terrain at 0.8 m/s, after hard-mining">
+</p>
+
+*`go2_hardmine` on 12cm rough terrain, 0.8 m/s.*
+
+Result: 12cm/0.8m/s fixed to 0% falls (was 6%); 12cm/0.3m/s dropped to 3%
+with a larger 32-episode sample (was 6% on 16 episodes) — noise-level, not
+a real remaining vulnerability. No regression anywhere else in the grid
+(0/4/8cm stayed 0% falls at both speeds). Committed at
+`pretrained/go2_hardmine/`, the new Go2 checkpoint.
+
+```bash
+python play.py --run-dir pretrained/go2_hardmine --target-speed 0.8 --terrain-amplitude 0.12 --record out.gif
+python eval_policy.py --run-dir pretrained/go2_hardmine --episodes 16 --terrain-amplitude 0 0.04 0.08 0.12
+```
+
+Not yet attempted for Go2: slopes, stairs, or any of the later Go1 stages.
 
 ## Next stages
 
