@@ -32,6 +32,11 @@ python play.py --run-dir pretrained/p_stairs --target-speed 0.5 --stair-height 0
 — the higher-fidelity mesh model, Stage 4 below — are also committed, in
 case you want a different checkpoint specifically.)
 
+Stage 6 below trains a *different robot* (Unitree Go2) through the
+equivalent of stage 1 only — see
+[Stage 6: a different robot — Unitree Go2](#stage-6-a-different-robot--unitree-go2).
+`pretrained/go2_speed_curriculum/` is its own committed checkpoint.
+
 For PPO background, why the reward function looks the way it does, the
 full stage-by-stage story (including the failures that motivated each
 reward term and each fix), and a demo, see
@@ -762,6 +767,65 @@ what fixed the slopes stage) instead of incremental fine-tuning, or
 strengthening the flight-phase reward incentive (the flight bonus and
 normal-stance bonus are currently numerically equal, +0.08 each, giving no
 extra pull to actually commit to synchronized flight over gaming cadence).
+
+## Stage 6: a different robot — Unitree Go2
+
+<p float="left">
+  <img src="media/go2_h_clock_flat.gif" width="380" alt="Go2 walking at 0.3 m/s, first training pass">
+  <img src="media/go2_speed_curriculum_0.8ms.gif" width="380" alt="Go2 walking at 0.8 m/s, after the speed curriculum">
+</p>
+
+*Left: `go2_h_clock`, 0.3 m/s. Right: `go2_speed_curriculum`, 0.8 m/s.*
+
+Everything so far has been the Go1. `assets/go2_mesh.xml` adds the official
+MuJoCo Menagerie Unitree Go2 — a genuinely different robot (not just
+better geometry of the same one, unlike Stage 4's mesh swap), merged with
+this project's own control/sensor/terrain scheme the same way. Real
+differences from Go1, taken from Go2's own spec: heavier trunk (6.921 kg
+vs. 5.204 kg), wider hip abduction range, a stronger knee motor (±45.43
+vs. ±35.55 N·m), and — the one genuinely new modeling wrinkle — **asymmetric
+front/back thigh joint ranges** (front −1.5708..3.4907, back
+−0.5236..4.5379; Go1 uses the same range for all four legs), handled with
+two thigh classes instead of Go1's one. Thigh/calf link lengths are
+identical to Go1 (0.213 m each), so the existing standing keyframe carried
+over unmodified — verified via FK and a PD-hold stability test (Go1's own
+kp=80/kd=2 gains hold a stable stand on the heavier Go2 with no retuning).
+
+A quick zero-shot check (a Go1-trained policy, `pretrained/x_mesh_finetune`,
+no retraining) on the new model managed 0% falls at 0.3 m/s — mostly a
+sign the two robots' proportions are close enough for the env plumbing to
+produce sane physics, not a substitute for real training.
+
+**Real Go2-specific training**, mirroring the exact two-step recipe that
+started the original Go1 pipeline (Stage 1a/1b), trained from scratch (no
+warm-start from a Go1 checkpoint — different enough robot that it would be
+a confound, not a head start):
+
+1. `runs/go2_h_clock` (6M steps, fixed 0.3 m/s, phase-match trot clock —
+   the original `h_clock` recipe verbatim): 0% falls, speed exactly on
+   target (0.300 m/s), and a cleaner initial gait than Go1's own first
+   attempt needed — step-rate spread 1.04 (1.39–1.45 steps/s across all
+   four legs) straight out of the first training pass.
+2. `runs/go2_speed_curriculum` (12M steps, resumed from `go2_h_clock`,
+   speed range ramped to 0.2–1.0 m/s — the original `i_speed_curriculum`
+   recipe verbatim): **0% falls at every commanded speed** 0.3/0.5/0.8/1.0
+   m/s, tracking 0.299/0.487/0.747/0.917 respectively (8% short at the
+   top, comparable to Go1's own 10%-short pattern), with *perfect* gait
+   symmetry at top speed — step-rate spread exactly 1.00 (all four legs at
+   2.56 steps/s).
+
+**Result: the whole recipe — reward shaping, PPO setup, curriculum
+methodology — transferred to a different quadruped with no code changes
+and no reward/PD retuning needed**, only swapping the model file and
+training from scratch. Committed at `pretrained/go2_speed_curriculum/`.
+
+```bash
+python play.py --run-dir pretrained/go2_speed_curriculum --target-speed 0.8 --record out.gif
+python eval_policy.py --run-dir pretrained/go2_speed_curriculum --episodes 16
+```
+
+Not yet attempted for Go2: rough terrain, slopes, stairs, or any of the
+later Go1 stages — this is Go2's equivalent of Go1's own Stage 1 only.
 
 ## Next stages
 
