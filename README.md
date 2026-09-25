@@ -702,6 +702,67 @@ Not attempted: Menagerie's own solver settings (elliptic friction cone,
 `impratio=100`, softer foot contact) — a separate follow-up variable,
 deliberately not bundled with this change.
 
+## Stage 5: higher top speed / flight-phase gait (known limitation)
+
+The trot/bound gait clock always keeps ≥2 feet down (a strict phase<0.5
+pair split, no gap) — a real ceiling on achievable speed, since a genuine
+gallop/flying-trot needs a suspension phase (all 4 feet briefly airborne)
+to extend stride length beyond what an always-supported gait allows.
+
+Generalized the existing per-leg phase-offset machinery with a `gait_duty`
+parameter (each leg is in prescribed stance when its own phase < duty,
+instead of a hardcoded 0.5 split): `gait_duty=0.5` (default) reproduces
+the original always-supported pattern exactly — verified via 40,000
+randomized trials against the old hardcoded logic, zero mismatches.
+`gait_duty < 0.5` opens a genuine flight window for a `(1 - 2*duty)`
+fraction of the cycle, and `r_gait` is phase-aware (0 contacts scores the
+flight-window bonus instead of the old unconditional penalty).
+
+**First attempt** (`runs/y_flight_phase`, 14M steps, duty ramped 0.5→0.4
+over *training time*): the core numeric goal worked — 0% falls across the
+whole extended range up to 1.4 m/s. But `gait_stats.py` showed only 2% of
+steps actually had 0 feet down (vs. the ~20% prescribed) — the policy
+mostly gamed a faster, *asymmetric* trot instead of committing to real
+flight (one leg at 3.84 steps/s vs. ~2.5 for the other three), producing a
+drift/yaw regression that wasn't even confined to the new speed range —
+the unchanged 0.3 m/s case also got worse. Root cause: `gait_duty` ramped
+over training time with no notion of the episode's own commanded speed, so
+every episode — even slow, already-solid ones — got the same narrowed
+duty by the end of the ramp.
+
+**Fix attempted**: `gait_duty_fast` makes duty interpolate per-episode by
+*commanded speed* (mirroring `gait_period_fast`'s own interpolation) —
+`runs/z_flight_duty_fixed`, resumed fresh from `x_mesh_finetune`. Result:
+gait symmetry at high speed genuinely improved (step-rate spread 1.57→1.16
+at 1.2 m/s) — that part of the diagnosis was correct. But overall drift/
+yaw stayed elevated across the board, *including at 0.3 m/s where duty is
+now provably locked at exactly 0.5* — `gait_stats.py` revealed a *new*
+asymmetry there instead (one leg at 2.84 steps/s vs. ~1.45–1.50 for the
+rest). Real flight-phase time barely moved either (still ~1% at 1.2 m/s).
+No capability regression either time (0% falls maintained everywhere).
+
+**Corrected understanding**: the low-speed degradation wasn't the
+training-time-duty bug after all (now proven absent) — it's a broader
+fine-tuning interference effect: extending the network's required
+behavioral range perturbs the already-good low-speed policy through
+shared weights, despite `target_speed` being in the observation. Same
+shape as the ascending-stairs stall's "deep local optimum from fine-tuning
+an already-converged, trot-locked policy" — a structurally different
+demand placed on an existing policy via incremental fine-tuning, not
+cleanly explained by any single bug.
+
+**Decision: stop here, accept the limit.** Same treatment as the
+ascending-stairs and sim-to-real-latency limits. `pretrained/x_mesh_finetune`
+remains the accepted checkpoint; neither flight-phase attempt was promoted
+to `pretrained/` (both stay as `runs/` experiments only). The `gait_duty`/
+`gait_duty_fast`/`gait_period_fast_speed` mechanisms stay in the codebase
+(all default off/unchanged) as reasonable, well-verified infrastructure.
+Untried follow-ups if revisited: a *broad* consolidation pass (mirroring
+what fixed the slopes stage) instead of incremental fine-tuning, or
+strengthening the flight-phase reward incentive (the flight bonus and
+normal-stance bonus are currently numerically equal, +0.08 each, giving no
+extra pull to actually commit to synchronized flight over gaming cadence).
+
 ## Next stages
 
 Terrain-aware observation and a non-trot gait mode were both tried already
@@ -720,9 +781,11 @@ ideas for extending past `runs/p_stairs`, roughly in order of effort:
    already solved (see above) and needed no work; a genuinely forcing
    version would span the full lane width, or use narrow gaps that must be
    jumped, so stepping over/between them is the only option.
-3. **Higher top speed** — the current trot always keeps ≥2 feet down; a
-   faster gait needs a flight phase (0 feet down briefly), which the
-   `phase_match` clock's stance/swing split would need to change to allow.
+3. **Higher top speed, continued** — a flight-phase gait mechanism was
+   built and tried (see "Stage 5" above); it reaches 1.4 m/s with 0%
+   falls, but a real drift/gait-quality regression wasn't resolved and is
+   accepted as a known limit. Untried follow-ups: a broad consolidation
+   pass, or strengthening the flight-phase reward incentive.
 4. **Sim-to-real, continued** — robustness randomization (latency,
    torque-domain, observation noise) was tried already (see above); latency
    specifically would likely need privileged-information training
