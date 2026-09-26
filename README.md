@@ -901,9 +901,56 @@ python play.py --run-dir pretrained/go2_slopes --target-speed 0.8 --slope-deg -2
 python eval_policy.py --run-dir pretrained/go2_slopes --episodes 16 --slope-deg 0 10 -10 20 -20
 ```
 
-Not yet attempted for Go2: stairs, or any of the later Go1 stages. The two
-soft spots above could be addressed with a hard-mining or broad-
+The two soft spots above could be addressed with a hard-mining or broad-
 consolidation follow-up (mirroring Go1's own slopes saga), not yet tried.
+
+## Stage 4: stairs (Go2)
+
+`runs/go2_stairs` (14M steps, resumed from `go2_slopes`, the exact
+original `p_stairs` recipe verbatim — terrain/slope kept at their full
+existing ranges immediately, stairs curriculum-ramped 0→12cm over 8M
+steps, since stairs is the only new axis) revealed a real, severe,
+direction-specific problem: ascending 12cm stalled (speed 0.101 m/s — the
+same pattern as Go1's own accepted ascending-stairs limit), but
+**descending 12cm hit 94% falls** — far worse than anything Go1 ever saw
+on the same corner (12-38% at its worst). General drift/yaw also degraded
+across the whole grid, even where falls stayed at 0%.
+
+Diagnosed the fix couldn't be a direct copy of `k_hardmine`'s recipe:
+`stair_height_min`/`max` only bias the sampled height *magnitude*, and
+ascending vs. descending was a hardcoded, uncontrollable 50/50 coin flip
+— there was no way to hard-mine a direction-specific failure at all.
+Added `stair_ascending_prob` (default 0.5 = the original unbiased
+behavior, verified via a 50k-sample distribution check) so a fine-tune
+can oversample the failing direction specifically.
+
+<p float="left">
+  <img src="media/go2_stairs_hardmine_descending12.gif" width="380" alt="Go2 descending 12cm stairs after the hard-mining fix">
+</p>
+
+*`go2_stairs_hardmine` descending 12cm stairs, 0.3 m/s.*
+
+`runs/go2_stairs_hardmine` (8M steps, resumed from `go2_stairs`,
+`--stair-ascending-prob 0.15` + `--stair-height-min 0.06`, biasing toward
+mostly-descending mostly-hard stairs while keeping some ascending
+exposure): descending-12cm fell from 94% to 28% (confirmed with a
+32-episode sample after a 16-episode sample showed a possibly-optimistic
+12%) — a huge fix, now landing in the same range as Go1's own
+never-fully-solved descending-stairs numbers (12-38%), not a clean zero
+but a well-precedented stopping point. No new capability regression
+elsewhere; the general drift/yaw quality trade-off from the stairs
+introduction itself remains (not addressed by this targeted fix — a
+broad-consolidation pass, not attempted, would be the way to address
+that specifically). Committed at `pretrained/go2_stairs_hardmine/`.
+
+```bash
+python play.py --run-dir pretrained/go2_stairs_hardmine --target-speed 0.3 --stair-height -0.12 --record out.gif
+python eval_policy.py --run-dir pretrained/go2_stairs_hardmine --episodes 32 --stair-height 0 0.06 -0.06 0.12 -0.12
+```
+
+Not yet attempted for Go2: a broad-consolidation pass to address the
+general drift/yaw regression, or any of the later Go1 stages (discrete
+obstacles, sim-to-real, the mesh-model equivalent, flight-phase gait).
 
 ## Next stages
 
