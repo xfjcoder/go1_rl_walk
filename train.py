@@ -485,6 +485,11 @@ def main():
                     help="Tread depth (m) of each stair. Kept a multiple of the 5cm heightfield cell "
                          "size for a crisp riser edge.")
     g.add_argument("--num-stairs", type=int, default=8, help="Number of steps before leveling into a plateau.")
+    g.add_argument("--stair-ascending-prob", type=float, default=0.5,
+                    help="Probability a stair episode samples ascending (vs descending). 0.5 (default) is "
+                         "the original unbiased coin flip. Lower it to oversample descending specifically "
+                         "for a hard-mining fine-tune -- independent of --stair-height-min/max, which bias "
+                         "the sampled height MAGNITUDE but not direction.")
     g.add_argument("--obstacle-height-min", type=float, default=0.0,
                     help="Lower end of the sampled obstacle height range (m). Raise for hard-mining, "
                          "same idea as --terrain-amp-min.")
@@ -614,6 +619,7 @@ def main():
         ramp_length=args.ramp_length,
         stair_height_range=([args.stair_height_min, args.stair_height_max] if args.stair_height_max is not None else None),
         stair_depth=args.stair_depth, num_stairs=args.num_stairs,
+        stair_ascending_prob=args.stair_ascending_prob,
         gait_period_stair_stretch=args.gait_period_stair_stretch,
         obstacle_height_range=([args.obstacle_height_min, args.obstacle_height_max] if args.obstacle_height_max is not None else None),
         obstacle_radius=args.obstacle_radius, num_obstacles=args.num_obstacles,

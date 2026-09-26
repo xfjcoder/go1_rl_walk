@@ -133,6 +133,13 @@ class Go1FlatEnv(gym.Env):
                                                # grid cell, not a true vertical face, so a riser is a steep ramp
                                                # over one HF_CELL (5 cm), not a perfect right angle.
         num_stairs: int = 8,                   # number of steps before leveling into a plateau
+        stair_ascending_prob: float = 0.5,     # probability a stair_height_range episode samples ascending
+                                               # (vs descending). 0.5 (default) is the original unbiased
+                                               # 50/50 coin flip, unchanged. Lower it to oversample descending
+                                               # specifically for a hard-mining fine-tune targeting a
+                                               # descending-specific failure (as opposed to
+                                               # stair_height_min/max, which bias the SAMPLED HEIGHT
+                                               # magnitude but not direction -- the two are independent axes).
         obstacle_height_range: tuple | None = None,  # (lo, hi) metres: enable discrete obstacles --
                                                # num_obstacles isolated round bumps of random height and
                                                # position scattered on otherwise-flat ground (not continuous
@@ -388,6 +395,7 @@ class Go1FlatEnv(gym.Env):
         self.slope_deg_max_current = self.slope_range[1] if self.slope_range else None
         self.ramp_length = ramp_length
         self.stair_height_range = tuple(stair_height_range) if stair_height_range else None
+        self.stair_ascending_prob = stair_ascending_prob
         self.stair_height = stair_height
         self.stair_height_max_current = self.stair_height_range[1] if self.stair_height_range else None
         self.stair_depth = stair_depth
@@ -630,7 +638,7 @@ class Go1FlatEnv(gym.Env):
             elif self.stair_height_range is not None:
                 stair_h = float(self._rng.uniform(self.stair_height_range[0],
                                                   max(self.stair_height_max_current, self.stair_height_range[0])))
-                ascending = bool(self._rng.integers(0, 2))
+                ascending = bool(self._rng.uniform() < self.stair_ascending_prob)
             else:
                 stair_h, ascending = 0.0, True
             if self.obstacle_height is not None:
