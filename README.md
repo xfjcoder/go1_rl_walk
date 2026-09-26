@@ -971,9 +971,43 @@ staying broken). Here: descending-12cm fell rate got *worse* (44% vs.
 worked for one terrain type transfers to another" lesson holds across
 robots, not just within Go1's own history.
 
-Not yet attempted for Go2: any of the later Go1 stages (sim-to-real, the
-mesh-model equivalent, flight-phase gait). The general drift/yaw
-regression from stairs remains an open, unaddressed soft spot.
+## Sim-to-real robustness (Go2)
+
+Zero-shot check (`pretrained/go2_stairs_hardmine`, no retraining), same
+four mechanisms and methodology as Go1's own sim-to-real section, each
+isolated separately at 0.8 m/s flat, 16 episodes:
+
+| randomization | fall rate |
+|---|---|
+| none (baseline) | 0% |
+| torque/PD variance (±12.5-25%) | 0% |
+| observation noise | 0% |
+| **latency (0-4 control steps / 0-80ms)** | **62.5%** |
+
+Same qualitative pattern as Go1: robust to torque/PD variance and
+observation noise, vulnerable specifically to latency — but notably
+*more* vulnerable than Go1 was at the identical latency range (62.5% vs.
+Go1's own 37.5% on `p_stairs`).
+
+Go1 already tried fixing this twice — full-strength from step 0 (broadly
+regressed everything), then with a curriculum fix (regressed nearly
+identically, with latency's fall rate completely unchanged both times).
+The conclusion there was structural, not robot-specific: the policy has
+no observation channel for its own episode's actual latency, so it can't
+specialize and instead finds one compromise that's worse everywhere
+without being distinctly better at high latency. Since that root cause
+applies to this project's observation/reward design generally, not
+anything particular to Go1's dynamics, **decided not to repeat both
+already-known-to-fail fine-tuning attempts for Go2** — accepted as the
+same documented limit, cross-validated across a second robot rather than
+re-litigated. `pretrained/go2_stairs_hardmine` remains the accepted
+checkpoint.
+
+Not yet attempted for Go2: the mesh-model equivalent, flight-phase gait,
+or teacher/student latency distillation (the substantially bigger
+technique that could actually fix the latency vulnerability, not
+attempted for either robot). The general drift/yaw regression from stairs
+also remains an open, unaddressed soft spot.
 
 ## Next stages
 
