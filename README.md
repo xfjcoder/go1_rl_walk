@@ -874,7 +874,36 @@ python play.py --run-dir pretrained/go2_hardmine --target-speed 0.8 --terrain-am
 python eval_policy.py --run-dir pretrained/go2_hardmine --episodes 16 --terrain-amplitude 0 0.04 0.08 0.12
 ```
 
-Not yet attempted for Go2: slopes, stairs, or any of the later Go1 stages.
+**Stage 3 — slopes** (`runs/go2_slopes`, 14M steps, resumed from
+`go2_hardmine`): unlike Go1's own slopes stage — which took 4 chained
+fine-tunes (`l_slopes` → `m_slope_hardmine` → `n_slope_steep_hardmine` →
+`o_slope_consolidate`) to get a clean result, since the first pass
+regressed flat-ground drift and gait symmetry — Go2 got most of the way
+there in **one pass**, gradually curriculum-ramping the slope range 0→20°
+over 8M steps (the original, verified `l_slopes` recipe shape, not
+README's untested full-strength shortcut).
+
+<p float="left">
+  <img src="media/go2_slopes_downhill20.gif" width="380" alt="Go2 descending a 20 degree slope at 0.8 m/s">
+</p>
+
+*`go2_slopes` descending a 20° slope, 0.8 m/s.*
+
+0% falls at flat, ±10° (both speeds), and +20°/0.8 m/s; only 12% falls at
+−20°/0.3 m/s. Two known soft spots, not chased further yet: steep uphill
+(+20°) shows real speed degradation (0.148/0.208 m/s vs. 0.3/0.8 m/s
+commanded — a slowdown, not a fall), and terrain-amplitude regression
+checks show a possible small (6%, 1/16, not yet resampled to confirm)
+uptick at 12cm/0.3 m/s. Committed at `pretrained/go2_slopes/`.
+
+```bash
+python play.py --run-dir pretrained/go2_slopes --target-speed 0.8 --slope-deg -20 --record out.gif
+python eval_policy.py --run-dir pretrained/go2_slopes --episodes 16 --slope-deg 0 10 -10 20 -20
+```
+
+Not yet attempted for Go2: stairs, or any of the later Go1 stages. The two
+soft spots above could be addressed with a hard-mining or broad-
+consolidation follow-up (mirroring Go1's own slopes saga), not yet tried.
 
 ## Next stages
 
