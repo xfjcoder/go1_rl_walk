@@ -1003,11 +1003,39 @@ same documented limit, cross-validated across a second robot rather than
 re-litigated. `pretrained/go2_stairs_hardmine` remains the accepted
 checkpoint.
 
-Not yet attempted for Go2: the mesh-model equivalent, flight-phase gait,
-or teacher/student latency distillation (the substantially bigger
-technique that could actually fix the latency vulnerability, not
-attempted for either robot). The general drift/yaw regression from stairs
-also remains an open, unaddressed soft spot.
+## Go2's own solver settings (known limitation)
+
+`go2_mesh.xml` deliberately deferred Go2's own solver/contact settings
+(elliptic friction cone, `impratio=100`, softened foot contact via
+`solimp`/`condim=6`) as a separate variable when it was built — the
+closest thing to Go1's own mesh-model fidelity upgrade for Go2, since
+there was no primitive-geometry phase to graduate from here.
+`assets/go2_mesh_softcontact.xml` isolates exactly those two axes,
+identical to `go2_mesh.xml` otherwise — verified stable (FK + a 10s
+PD-hold test with the same kp=80/kd=2 gains).
+
+Zero-shot check (`pretrained/go2_stairs_hardmine`, no retraining): no
+clear win. Flat ground, rough terrain, and the ascending-stairs stall are
+essentially unchanged, but the already-fragile descending-12cm-stairs
+corner gets *worse* (47% falls vs. 28% under this project's own solver
+settings) — plausible, since the softer, differently-directed foot
+contact changes exactly the edge-grip dynamics relevant to a foot
+catching a stair riser while descending, and the policy was never trained
+under it.
+
+**Decision: stop here, keep `assets/go2_mesh.xml` (this project's own
+solver settings) as the accepted model.** Given the broad-consolidation
+rollback already showed Go2's stairs handling is fragile to further
+perturbation, a dedicated fine-tune to adapt to the new contact model
+carries real risk for an uncertain payoff — not attempted.
+`go2_mesh_softcontact.xml` stays in the codebase as reasonable, verified
+infrastructure if revisited.
+
+Not yet attempted for Go2: flight-phase gait, or teacher/student latency
+distillation (the substantially bigger technique that could actually fix
+the latency vulnerability, not attempted for either robot). The general
+drift/yaw regression from stairs also remains an open, unaddressed soft
+spot.
 
 ## Next stages
 
