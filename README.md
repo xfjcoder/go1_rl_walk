@@ -948,9 +948,15 @@ python play.py --run-dir pretrained/go2_stairs_hardmine --target-speed 0.3 --sta
 python eval_policy.py --run-dir pretrained/go2_stairs_hardmine --episodes 32 --stair-height 0 0.06 -0.06 0.12 -0.12
 ```
 
+**Discrete obstacles**: a zero-shot check (`pretrained/go2_stairs_hardmine`,
+no retraining) found the same result as Go1's own equivalent check — 0%
+falls to 18cm (taller than the robot's own thigh segment), only a
+noise-level 6% blip at 12cm/0.8 m/s. Already solved, no dedicated training
+needed, exactly like Go1.
+
 Not yet attempted for Go2: a broad-consolidation pass to address the
-general drift/yaw regression, or any of the later Go1 stages (discrete
-obstacles, sim-to-real, the mesh-model equivalent, flight-phase gait).
+general drift/yaw regression, or any of the later Go1 stages (sim-to-real,
+the mesh-model equivalent, flight-phase gait).
 
 ## Next stages
 
