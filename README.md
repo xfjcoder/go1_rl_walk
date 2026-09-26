@@ -954,9 +954,26 @@ falls to 18cm (taller than the robot's own thigh segment), only a
 noise-level 6% blip at 12cm/0.8 m/s. Already solved, no dedicated training
 needed, exactly like Go1.
 
-Not yet attempted for Go2: a broad-consolidation pass to address the
-general drift/yaw regression, or any of the later Go1 stages (sim-to-real,
-the mesh-model equivalent, flight-phase gait).
+**Broad-consolidation attempt** (`runs/go2_consolidate`, 12M steps,
+resumed from `go2_stairs_hardmine`, full ranges together + less reopened
+exploration noise — mirroring what fixed Go1's own slopes stage) was
+tried to address the general drift/yaw regression. Result: it *reproduced
+Go1's own `q_stairs_consolidate` failure* almost exactly — Go1's project
+history already found that the "broad consolidation beats narrow
+hard-mining" fix, which worked cleanly for slopes, did **not** transfer to
+stairs (worse gait symmetry, worse flat-ground drift, the hardest corner
+staying broken). Here: descending-12cm fell rate got *worse* (44% vs.
+`go2_stairs_hardmine`'s 28%), a new 6% fall rate appeared at 12cm-terrain/
+0.8 m/s (wasn't there before), and general drift wasn't clearly improved
+(0.74-0.88 m vs. 0.35-1.09 m — no clear win). **Rolled back**:
+`pretrained/go2_stairs_hardmine` remains the accepted Go2 checkpoint;
+`go2_consolidate` was not promoted. Confirms the "don't assume a fix that
+worked for one terrain type transfers to another" lesson holds across
+robots, not just within Go1's own history.
+
+Not yet attempted for Go2: any of the later Go1 stages (sim-to-real, the
+mesh-model equivalent, flight-phase gait). The general drift/yaw
+regression from stairs remains an open, unaddressed soft spot.
 
 ## Next stages
 
