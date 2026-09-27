@@ -105,6 +105,20 @@ def main():
                               f"-- this script only handles growth in the observation (input) dimension")
     new_model.policy.load_state_dict(new_sd)
 
+    # PPO("MlpPolicy", ...) above constructs a BRAND NEW model, whose num_timesteps starts at 0 --
+    # unlike a normal --resume from an unmodified checkpoint, which carries the old cumulative count
+    # forward. Left alone, this silently breaks the learning-rate schedule every fine-tune in this
+    # project relies on: SB3's progress_remaining is computed against num_timesteps, so a late-stage
+    # checkpoint (typically tens of millions of steps in) normally starts a resume already deep into
+    # its decay (a small, gentle effective LR) -- but with num_timesteps reset to 0, the SAME
+    # --learning-rate instead decays from full strength across the entire new run, a much larger and
+    # longer-lived update budget than every other fine-tune in this project has had. Preserve it, so a
+    # warm-started checkpoint's own subsequent --resume behaves identically to a normal one.
+    new_model.num_timesteps = old_model.num_timesteps
+    print(f"Preserved num_timesteps={old_model.num_timesteps} from the original checkpoint (a fresh "
+          f"PPO(...) construction above would otherwise reset it to 0, breaking the learning-rate "
+          f"schedule's usual decay-relative-to-cumulative-steps behavior on a subsequent --resume).")
+
     old_vecnorm = VecNormalize.load(args.vecnormalize, DummyVecEnv([lambda: Go1FlatEnv(render_mode=None, **old_only_kwargs)]))
     new_vecnorm = VecNormalize(new_env, norm_obs=True, norm_reward=old_vecnorm.norm_reward,
                                 clip_obs=old_vecnorm.clip_obs, clip_reward=old_vecnorm.clip_reward,
