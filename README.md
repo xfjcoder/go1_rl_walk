@@ -1031,11 +1031,52 @@ carries real risk for an uncertain payoff — not attempted.
 `go2_mesh_softcontact.xml` stays in the codebase as reasonable, verified
 infrastructure if revisited.
 
-Not yet attempted for Go2: flight-phase gait, or teacher/student latency
-distillation (the substantially bigger technique that could actually fix
-the latency vulnerability, not attempted for either robot). The general
-drift/yaw regression from stairs also remains an open, unaddressed soft
-spot.
+## Flight-phase gait (Go2, known limitation)
+
+Applying Stage 5's flight-phase mechanics (`gait_duty`/`gait_duty_fast`)
+to Go2, resuming from `pretrained/go2_stairs_hardmine`, extending speed
+to 1.4 m/s — applying Go1's own already-learned fix from the start this
+time (speed-scoped duty via `gait_duty_fast`, not the training-time-only
+curriculum that regressed Go1's low speeds):
+
+1. `runs/go2_flight_phase` (14M steps): 0% falls to the full extended
+   range, but `gait_stats.py` showed only ~4% real 0-contact ("flight")
+   time at 1.2 m/s (vs. the ~20% prescribed by `gait_duty_fast=0.4`) — the
+   same shared-network interference Go1 hit, this time also compounding
+   with Go2's known stairs fragility: descending-12cm-stairs fell rate
+   went from 28% to 50%, and a new low-speed gait asymmetry appeared
+   (step-rate spread 2.15, one leg at 3.11 steps/s vs ~1.45-1.61 for the
+   rest) despite duty being provably locked at 0.5 there.
+2. `flight_bonus_scale` (new: multiplies only the flight-window success
+   bonus, leaving the normal stance bonus untouched — untried for either
+   robot) → `runs/go2_flight_incentive` (14M steps, `flight_bonus_scale=3.0`,
+   resumed fresh from `go2_stairs_hardmine` to avoid inheriting attempt
+   1's regressions): flight-phase time barely moved (5%), low-speed
+   asymmetry got *worse* (spread 3.31, one leg at 4.78 steps/s), and drift
+   worsened across flat ground and terrain (up to 2.06 m at 1.2 m/s).
+   Mixed on stairs specifically — descending-12cm-alone improved (28%→6%)
+   but the harder terrain-combined corners got worse (31%, 69%).
+
+Two structurally different attempts — one fixing the duty-scoping bug
+cleanly, one adding a 3x stronger flight-specific incentive that was
+never tried for Go1 either — both failed to induce genuine synchronized
+flight, with the policy consistently preferring to game cadence via leg
+asymmetry over restructuring its gait, regardless of how strongly flight
+was rewarded. Same shape as the ascending-stairs limit: a deep local
+optimum from fine-tuning an already-converged, trot-locked policy, not
+resolved by another reward-shaping lever.
+
+**Decision: stop here, accept the limit.** `pretrained/go2_stairs_hardmine`
+remains the accepted checkpoint; neither flight-phase attempt is promoted
+to `pretrained/` (both stay as `runs/` experiments). The `gait_duty`/
+`gait_duty_fast`/`gait_period_fast_speed`/`flight_bonus_scale` mechanisms
+stay in the codebase (all default off/unchanged) as reasonable, verified
+infrastructure.
+
+Not yet attempted for Go2: teacher/student latency distillation (the
+substantially bigger technique that could actually fix the latency
+vulnerability, not attempted for either robot). The general drift/yaw
+regression from stairs also remains an open, unaddressed soft spot.
 
 ## Next stages
 
