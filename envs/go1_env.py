@@ -208,6 +208,16 @@ class Go1FlatEnv(gym.Env):
                                                # actually responding. None = 0 (no delay, unchanged).
         observation_latency_range: tuple | None = None,  # same idea, for how many steps stale the RETURNED
                                                # observation is (sensor/comms delay). None = 0 (unchanged).
+        privileged_latency_obs: bool = False,  # append the CURRENT episode's actual action/observation
+                                               # latency (normalized to each range's own max) as 2 extra
+                                               # observation dims. False (default): obs_dim unchanged.
+                                               # For training a "teacher" policy with ground-truth latency
+                                               # info it wouldn't have on real hardware -- tests directly
+                                               # whether giving the policy the missing signal (diagnosed
+                                               # as the root cause of the latency vulnerability throughout
+                                               # this project) actually helps, before attempting to distill
+                                               # that behavior into a realistic "student" that infers it
+                                               # instead of being told it.
         observation_noise_scale: float = 0.0,   # multiplies a fixed set of per-channel noise std's (gravity/
                                                # gyro/quat/joint pos&vel/heightmap; command, prev-action, and
                                                # the phase clock are never noised -- they're not physically
@@ -432,6 +442,7 @@ class Go1FlatEnv(gym.Env):
         self._episode_torque_scale = 1.0
         self.action_latency_range = tuple(action_latency_range) if action_latency_range else None
         self.observation_latency_range = tuple(observation_latency_range) if observation_latency_range else None
+        self.privileged_latency_obs = privileged_latency_obs
         self.observation_noise_scale = observation_noise_scale
         self._episode_action_latency = 0
         self._episode_obs_latency = 0
@@ -534,6 +545,8 @@ class Go1FlatEnv(gym.Env):
         obs_dim = 3 + 3 + 4 + 12 + 12 + 12 + 3 + 2  # see _get_obs for layout (+2 for gait-phase clock)
         if self.use_terrain_heightmap:
             obs_dim += 9  # 3x3 local heightmap, see _local_heightmap
+        if self.privileged_latency_obs:
+            obs_dim += 2  # ground-truth action/observation latency this episode, see _get_obs
         self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(obs_dim,), dtype=np.float32)
 
         # Reference per-channel noise std (metres/rad/rad-per-s as appropriate) for
@@ -998,12 +1011,25 @@ class Go1FlatEnv(gym.Env):
         phase_clock = np.array([np.sin(2 * np.pi * phase), np.cos(2 * np.pi * phase)], dtype=np.float32)
 
         # Layout (dim 51, or 60 with use_terrain_heightmap): gravity(3) + ang_vel(3) + base_quat(4)
-        #   + joint_pos(12) + joint_vel(12) + prev_action(12) + command(3) + phase_clock(2) [+ heightmap(9)]
+        #   + joint_pos(12) + joint_vel(12) + prev_action(12) + command(3) + phase_clock(2)
+        #   [+ heightmap(9)] [+ privileged_latency(2)]
         parts = [gravity_vec, ang_vel, quat, joint_pos, joint_vel, self._prev_action, command, phase_clock]
         if self.use_terrain_heightmap:
             parts.append(self._local_heightmap())
+        if self.privileged_latency_obs:
+            parts.append(self._privileged_latency_obs())
         obs = np.concatenate(parts).astype(np.float32)
         return obs
+
+    def _privileged_latency_obs(self) -> np.ndarray:
+        """Ground-truth action/observation latency for THIS episode, each normalized to its own
+        configured range's max (0 = no delay, 1 = the worst-case delay this training run ever
+        samples). 0 for either axis if that axis's *_latency_range isn't set at all."""
+        a_max = self.action_latency_range[1] if self.action_latency_range else 0
+        o_max = self.observation_latency_range[1] if self.observation_latency_range else 0
+        a_norm = self._episode_action_latency / a_max if a_max > 0 else 0.0
+        o_norm = self._episode_obs_latency / o_max if o_max > 0 else 0.0
+        return np.array([a_norm, o_norm], dtype=np.float32)
 
 
     # ------------------------------------------------------------------ #

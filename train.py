@@ -562,6 +562,12 @@ def main():
                          "pos&vel/heightmap) added to the observation each step -- command, prev-action, "
                          "and the phase clock are never noised, since they aren't physically sensed. "
                          "0 = off (exact ground truth, unchanged).")
+    g.add_argument("--privileged-latency-obs", action=argparse.BooleanOptionalAction, default=False,
+                    help="Append the CURRENT episode's actual action/observation latency (normalized) "
+                         "as 2 extra observation dims -- for training a latency-aware 'teacher' policy "
+                         "as ground truth to later distill into a realistic 'student' that infers it "
+                         "instead. Changes obs_dim, so breaks --resume with a checkpoint that doesn't "
+                         "already have it; use expand_obs_checkpoint.py to warm-start across the gap.")
     g.add_argument("--sim2real-curriculum-start", type=float, default=0.0,
                     help="Fraction (0-1) of the configured kp/kd/torque-scale/latency/observation-noise "
                          "ranges' deviation from nominal to use at the start of the run; ramps to 1.0 "
@@ -640,6 +646,7 @@ def main():
         torque_scale_range=list(args.torque_scale_range) if args.torque_scale_range else None,
         action_latency_range=list(args.action_latency_range) if args.action_latency_range else None,
         observation_latency_range=list(args.observation_latency_range) if args.observation_latency_range else None,
+        privileged_latency_obs=args.privileged_latency_obs,
         observation_noise_scale=args.observation_noise_scale,
         lateral_tracking_weight=args.lateral_tracking_weight,
         lateral_tracking_sigma=args.lateral_tracking_sigma,
