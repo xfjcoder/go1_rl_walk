@@ -299,6 +299,17 @@ class Go1FlatEnv(gym.Env):
                                                # speed; --gait-duty-final's training-time curriculum
                                                # has the same blind spot for the same reason. Prefer
                                                # this flag over that curriculum for a real fix).
+        flight_bonus_scale: float = 1.0,      # multiplies r_gait's flight-window success bonus
+                                               # (n_contacts==0 during an n_desired==0 window) only --
+                                               # the normal stance-window bonus is untouched. 1.0
+                                               # (default) leaves both bonuses numerically equal
+                                               # (+0.08 each), which gave the policy no extra pull to
+                                               # actually commit to a genuine synchronized flight over
+                                               # gaming cadence within the ordinary 2-2 trot (measured:
+                                               # only ~2-4% real 0-contact time vs the ~20% prescribed
+                                               # by gait_duty_fast). Raise it to make committing to
+                                               # real flight worth strictly more than the easier
+                                               # alternative.
         phase_match_weight: float = 0.0,      # reward for matching a PRESCRIBED diagonal-trot
                                                # timing against a fixed external clock. Defaulted to
                                                # 0.0 -- across many runs, hand-picked clock parameters
@@ -451,6 +462,7 @@ class Go1FlatEnv(gym.Env):
         self.gait_style = gait_style
         self.gait_duty = gait_duty
         self.gait_duty_fast = gait_duty_fast
+        self.flight_bonus_scale = flight_bonus_scale
         self.use_calf_reference = use_calf_reference
         self.gait_swing_amplitude = gait_swing_amplitude
         self.thigh_residual_scale = thigh_residual_scale
@@ -1121,7 +1133,8 @@ class Go1FlatEnv(gym.Env):
                 r_gait = -0.05
         else:  # n_desired == 0: an intentional flight window (gait_duty < 0.5 only)
             if n_contacts == 0:
-                r_gait = 0.08   # a genuine, controlled aerial phase -- the whole point of this gait
+                r_gait = 0.08 * self.flight_bonus_scale   # a genuine, controlled aerial phase --
+                                                           # the whole point of this gait
             elif n_contacts <= 2:
                 r_gait = 0.0    # transitioning in/out of the flight window; tolerate a partial touch
             else:  # 3 or 4 feet still down deep into what should be a flight window

@@ -356,6 +356,13 @@ def main():
                          "keep the safe, proven duty=0.5 trot, only fast commands narrow toward a "
                          "flight phase. The recommended way to open a flight window (see the "
                          "caution on --gait-duty-final above for why).")
+    g.add_argument("--flight-bonus-scale", type=float, default=1.0,
+                    help="Multiplies r_gait's flight-window success bonus only (the normal stance "
+                         "bonus is untouched). 1.0 (default) leaves both bonuses numerically equal, "
+                         "which gave no extra pull to commit to real flight over gaming cadence "
+                         "(measured: only a few percent real 0-contact time vs roughly a fifth of "
+                         "the cycle prescribed). Raise it to make committing to real flight worth "
+                         "strictly more.")
     g.add_argument("--phase-match-weight", type=float, default=0.0,
                     help="Reward for matching the prescribed diagonal-trot timing above. This is "
                          "what actually fixed the front/rear step-rate mismatch (see README) -- "
@@ -503,7 +510,7 @@ def main():
     g.add_argument("--obstacle-curriculum-steps", type=int, default=10_000_000)
     g.add_argument("--obstacle-radius", type=float, default=0.10,
                     help="Base radius (m) of each obstacle's footprint (actual radius/height randomized "
-                         "+-30% per obstacle).")
+                         "+-30 percent per obstacle).")
     g.add_argument("--num-obstacles", type=int, default=6, help="Obstacles scattered per episode.")
     g.add_argument("--use-terrain-heightmap", action=argparse.BooleanOptionalAction, default=False,
                     help="Add a 3x3 local heightmap (9 dims) to the observation -- see "
@@ -639,6 +646,7 @@ def main():
         max_foot_duty_cycle=args.max_foot_duty_cycle, min_foot_duty_cycle=args.min_foot_duty_cycle,
         foot_duty_weight=args.foot_duty_weight, gait_period=args.gait_period, gait_style=args.gait_style,
         gait_duty=args.gait_duty, gait_duty_fast=args.gait_duty_fast,
+        flight_bonus_scale=args.flight_bonus_scale,
         phase_match_weight=initial_phase_match_weight, air_time_weight=args.air_time_weight,
         phase_match_stair_relax=args.phase_match_stair_relax,
         static_stability_weight=args.static_stability_weight,
