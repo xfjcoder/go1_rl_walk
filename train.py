@@ -438,6 +438,13 @@ def main():
     g.add_argument("--lateral-tracking-sigma", type=float, default=0.1)
     g.add_argument("--yaw-rate-weight", type=float, default=0.0,
                     help="Penalty weight on yaw rate squared (discourages turning/veering).")
+    g.add_argument("--velocity-smoothness-weight", type=float, default=0.0,
+                    help="Penalty weight on frame-to-frame forward-velocity jerk (squared), "
+                         "independent of the existing action-rate penalty -- constrains the "
+                         "PHYSICAL velocity profile directly rather than just the policy's raw "
+                         "output. Added to address a 'surge-brake' oscillation pattern observed "
+                         "under sim-to-real latency (velocity swinging from near-target down to "
+                         "near-zero or briefly negative every stride). 0.0 (default) = off.")
     g.add_argument("--heading-weight", type=float, default=0.5,
                     help="Penalizes yaw deviation from straight-ahead. Without this, a slow "
                          "constant yaw drift costs almost nothing per step and compounds into "
@@ -623,6 +630,7 @@ def main():
         heading_weight=args.heading_weight,
         lateral_position_weight=args.lateral_position_weight,
         body_frame_velocity=args.body_frame_velocity, yaw_rate_weight=args.yaw_rate_weight,
+        velocity_smoothness_weight=args.velocity_smoothness_weight,
         air_time_cap=args.air_time_cap,
         command_speed_range=([args.speed_range_min, args.speed_range_max]
                              if args.speed_range_min is not None else None),

@@ -246,6 +246,10 @@ class Go1FlatEnv(gym.Env):
                                                # (run e_long_d: RR hovered, front feet shuffled 1-2 cm high).
         yaw_rate_weight: float = 0.0,          # penalty weight on yaw rate^2 (turning); ang_vel term already
                                                # covers roll/pitch/yaw rates weakly (0.05)
+        velocity_smoothness_weight: float = 0.0,  # penalty weight on frame-to-frame forward-velocity
+                                               # JERK (squared), independent of action-rate. 0.0
+                                               # (default) = off, unchanged. See r_velocity_smoothness
+                                               # in _compute_reward for why this exists.
         max_foot_duty_cycle: float = 0.75,    # a foot averaging more ground-contact time than
                                                # this gets penalized, regardless of other gait
                                                # terms -- directly prevents a foot from just
@@ -406,6 +410,8 @@ class Go1FlatEnv(gym.Env):
         self.heading_weight = heading_weight
         self.body_frame_velocity = body_frame_velocity
         self.yaw_rate_weight = yaw_rate_weight
+        self.velocity_smoothness_weight = velocity_smoothness_weight
+        self._prev_lin_vel_x = 0.0
         self.air_time_cap = air_time_cap
         self.command_speed_range = tuple(command_speed_range) if command_speed_range else None
         self.terrain_amplitude_range = tuple(terrain_amplitude_range) if terrain_amplitude_range else None
@@ -719,6 +725,7 @@ class Go1FlatEnv(gym.Env):
                 self.data.qpos[2] += lift
                 mujoco.mj_forward(self.model, self.data)
         self._prev_action[:] = 0.0
+        self._prev_lin_vel_x = 0.0  # true at reset -- the stand keyframe has zero velocity
         self._step_count = 0
         self._foot_contact_ema[:] = 0.0
         self._foot_air_time[:] = 0.0
@@ -1053,6 +1060,20 @@ class Go1FlatEnv(gym.Env):
         normalized_error = vel_error / max(self.target_speed, 0.1)
         r_velocity = np.exp(-2.0 * normalized_error ** 2)
 
+        # 1b. Penalize frame-to-frame forward-velocity JERK directly (not just action-rate,
+        # which constrains the policy's raw OUTPUT but doesn't directly constrain the resulting
+        # PHYSICAL velocity profile). Added after observing a real "surge-brake" pattern under
+        # sim-to-real latency randomization: forward velocity oscillating from near-target down
+        # to near-zero or briefly negative every stride (~0.4-0.5s period), which the concave
+        # r_velocity term alone doesn't clearly discourage -- a smooth constant-partial-speed
+        # gait scores MORE reward under r_velocity than an oscillating one of the same average
+        # speed (exp(.) is concave), so in principle the policy already had an incentive to
+        # smooth this out; this term makes that incentive explicit and direct instead of
+        # relying on it being an indirect side-effect of tracking. 0.0 (default) = off,
+        # unchanged behavior.
+        r_velocity_smoothness = -self.velocity_smoothness_weight * (lin_vel[0] - self._prev_lin_vel_x) ** 2
+        self._prev_lin_vel_x = lin_vel[0]
+
         # 2. Penalize lateral / vertical VELOCITY drift
         r_lateral = -0.5 * (lin_vel[1] ** 2 + lin_vel[2] ** 2)
         r_yaw_rate = -self.yaw_rate_weight * ang_vel[2] ** 2
@@ -1254,6 +1275,7 @@ class Go1FlatEnv(gym.Env):
 
         weights_applied = dict(
             velocity=r_velocity * 1.5,
+            velocity_smoothness=r_velocity_smoothness,
             lateral=r_lateral,
             yaw_rate=r_yaw_rate,
             lateral_tracking=r_lat_track,
