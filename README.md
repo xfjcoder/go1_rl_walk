@@ -1123,9 +1123,18 @@ ground too, not just a cosmetic fix. Re-distilling from this improved
 teacher (`runs/go2_latency_student_smooth`) transferred the improvement
 cleanly to the fully realistic student: 0% falls at both latency
 settings, full-latency speed 0.545 m/s (matching the teacher), velocity
-std 0.138 (matching the teacher's own smoothed profile). No new
-capability regression beyond the stairs-12cm issue both versions already
-had.
+std 0.138 (matching the teacher's own smoothed profile).
+
+One new regression, confirmed with a 48-episode resample (not noise):
+stairs+6cm/0.8m/s on flat ground went from 0% (pre-smoothness) to 29%
+falls (teacher) / 38% falls (student) -- and it's worse still combined
+with slope (10-48% across +-10/+-20deg). Stairs-12cm remained severely
+regressed too, as it already was pre-smoothness. Both are accepted,
+unaddressed costs of the smoothness fix rather than chased further --
+the fix's actual goal (latency robustness + gait quality) was achieved
+cleanly, and this checkpoint is a latency specialization already
+understood to trade away general stairs capability, per the decision
+above.
 
 **Decision: adopt `pretrained/go2_latency_teacher_smooth` and
 `pretrained/go2_latency_student_smooth`** as the current best latency-robust
