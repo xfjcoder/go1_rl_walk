@@ -250,6 +250,21 @@ class Go1FlatEnv(gym.Env):
                                                # JERK (squared), independent of action-rate. 0.0
                                                # (default) = off, unchanged. See r_velocity_smoothness
                                                # in _compute_reward for why this exists.
+        velocity_smoothness_stair_relax: float = 0.0,  # metres: linearly relax velocity_smoothness_weight
+                                               # to 0 as the current episode's stair height goes from 0
+                                               # to this value, mirroring phase_match_stair_relax above.
+                                               # Added after tracing why go2_latency_teacher_smooth
+                                               # regressed at stairs+6cm/0.8m/s (0%->29-38% falls): the
+                                               # pre-smoothness policy recovers its balance near a stair
+                                               # edge by rocking forward velocity through a wide range
+                                               # (observed -0.5..+0.4 m/s) every ~0.2s until it catches
+                                               # its footing; the smoothness penalty suppresses exactly
+                                               # this rocking, so the robot instead goes still for longer
+                                               # then commits to one larger, uncorrected lurch that can
+                                               # tip it over. 0 = off (velocity_smoothness_weight always
+                                               # full strength, old behavior). Only affects stair
+                                               # episodes; 0 on flat/bump/slope/obstacle-only episodes
+                                               # regardless of this setting.
         max_foot_duty_cycle: float = 0.75,    # a foot averaging more ground-contact time than
                                                # this gets penalized, regardless of other gait
                                                # terms -- directly prevents a foot from just
@@ -411,6 +426,8 @@ class Go1FlatEnv(gym.Env):
         self.body_frame_velocity = body_frame_velocity
         self.yaw_rate_weight = yaw_rate_weight
         self.velocity_smoothness_weight = velocity_smoothness_weight
+        self.velocity_smoothness_stair_relax = velocity_smoothness_stair_relax
+        self._episode_velocity_smoothness_weight = velocity_smoothness_weight
         self._prev_lin_vel_x = 0.0
         self.air_time_cap = air_time_cap
         self.command_speed_range = tuple(command_speed_range) if command_speed_range else None
@@ -686,6 +703,11 @@ class Go1FlatEnv(gym.Env):
                 self._episode_phase_match_weight = self.phase_match_weight * relax_frac
             else:
                 self._episode_phase_match_weight = self.phase_match_weight
+            if self.velocity_smoothness_stair_relax > 1e-6:
+                vs_relax_frac = float(np.clip(1.0 - stair_h / self.velocity_smoothness_stair_relax, 0.0, 1.0))
+                self._episode_velocity_smoothness_weight = self.velocity_smoothness_weight * vs_relax_frac
+            else:
+                self._episode_velocity_smoothness_weight = self.velocity_smoothness_weight
             self._episode_target_clearance = max(self.target_clearance, stair_h + 0.03)
         self._episode_gait_period = self._period_for_speed(self.target_speed, stair_h)
         self._next_push_step = int(self._rng.integers(150, 300)) if self.push_velocity > 0 else 10**9
@@ -1071,7 +1093,7 @@ class Go1FlatEnv(gym.Env):
         # smooth this out; this term makes that incentive explicit and direct instead of
         # relying on it being an indirect side-effect of tracking. 0.0 (default) = off,
         # unchanged behavior.
-        r_velocity_smoothness = -self.velocity_smoothness_weight * (lin_vel[0] - self._prev_lin_vel_x) ** 2
+        r_velocity_smoothness = -self._episode_velocity_smoothness_weight * (lin_vel[0] - self._prev_lin_vel_x) ** 2
         self._prev_lin_vel_x = lin_vel[0]
 
         # 2. Penalize lateral / vertical VELOCITY drift

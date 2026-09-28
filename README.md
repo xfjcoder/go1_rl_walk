@@ -1129,12 +1129,46 @@ One new regression, confirmed with a 48-episode resample (not noise):
 stairs+6cm/0.8m/s on flat ground went from 0% (pre-smoothness) to 29%
 falls (teacher) / 38% falls (student) -- and it's worse still combined
 with slope (10-48% across +-10/+-20deg). Stairs-12cm remained severely
-regressed too, as it already was pre-smoothness. Both are accepted,
-unaddressed costs of the smoothness fix rather than chased further --
-the fix's actual goal (latency robustness + gait quality) was achieved
-cleanly, and this checkpoint is a latency specialization already
-understood to trade away general stairs capability, per the decision
-above.
+regressed too, as it already was pre-smoothness.
+
+**Tried to fix the stairs+6cm/0.8m/s regression specifically, failed.**
+Traced the actual failure mode by tracing per-step episode dynamics at
+the exact seeds that fall: the pre-smoothness policy recovers its
+balance near a stair edge by rocking forward velocity through a wide
+range (observed -0.5..+0.4 m/s) every ~0.2s until it catches its
+footing; the smoothness penalty suppresses exactly this rocking, so the
+policy goes still for longer instead and then commits to one larger,
+uncorrected lurch that tips it over backward down the steps it had just
+climbed. Added `velocity_smoothness_stair_relax` (mirrors
+`phase_match_stair_relax`'s existing pattern): linearly relaxes
+`velocity_smoothness_weight` to 0 as stair height grows, verified
+numerically correct (full weight at stair_h=0, zero by stair_h=0.04).
+Fine-tuned 8M steps from `go2_latency_teacher` (the pre-smoothness
+checkpoint, not the regressed smoothed one) with this relax active ->
+`runs/go2_latency_teacher_smooth_stairfix`. Result: **no improvement** --
+40% falls on a 48-episode resample at the target corner (statistically
+the same as, if anything slightly worse than, the original 29-38%), while
+flat-ground latency robustness stayed intact (0% falls, unaffected).
+Merely removing the penalty on stair episodes didn't restore the
+rocking-recovery behavior -- likely the same "deep local optimum from
+fine-tuning an already-converged policy" pattern documented repeatedly
+elsewhere in this project (Go1's own ascending-stairs saga: four
+different reward-shaping fixes all failed to change an already-converged
+trot-locked policy's behavior on a hard stairs corner). One attempt here
+isn't as conclusive as that four-in-a-row pattern, so this specific
+corner could still be revisited with a stronger, more direct
+intervention (an active incentive rather than a removed penalty, or
+hard-mining the corner directly) -- not attempted further for now.
+`velocity_smoothness_stair_relax` stays in the codebase (default off,
+verified backward-compatible) as reasonable, reusable infrastructure
+regardless of not solving this specific case; `go2_latency_teacher_smooth_stairfix`
+was not promoted to `pretrained/` (stays a gitignored `runs/` experiment).
+
+**DECISION (discussed with user): accept both regressions as unaddressed
+costs of the smoothness fix rather than chase further.** The fix's actual
+goal (latency robustness + gait quality) was achieved cleanly, and this
+checkpoint is a latency specialization already understood to trade away
+general stairs capability, per the decision above.
 
 **Decision: adopt `pretrained/go2_latency_teacher_smooth` and
 `pretrained/go2_latency_student_smooth`** as the current best latency-robust

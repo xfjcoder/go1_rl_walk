@@ -445,6 +445,14 @@ def main():
                          "output. Added to address a 'surge-brake' oscillation pattern observed "
                          "under sim-to-real latency (velocity swinging from near-target down to "
                          "near-zero or briefly negative every stride). 0.0 (default) = off.")
+    g.add_argument("--velocity-smoothness-stair-relax", type=float, default=0.0,
+                    help="Metres: linearly relax --velocity-smoothness-weight to 0 as the current "
+                         "episode's stair height goes from 0 to this value, mirroring "
+                         "--phase-match-stair-relax. Added after tracing a real regression: the "
+                         "velocity-smoothness penalty suppresses the wide, rapid forward-velocity "
+                         "corrections a stairs policy uses to recover balance near a step edge, so "
+                         "it goes still for longer instead and then commits to one uncorrected lurch "
+                         "that can tip it over. 0.0 (default) = off, unaffected by stair height.")
     g.add_argument("--heading-weight", type=float, default=0.5,
                     help="Penalizes yaw deviation from straight-ahead. Without this, a slow "
                          "constant yaw drift costs almost nothing per step and compounds into "
@@ -631,6 +639,7 @@ def main():
         lateral_position_weight=args.lateral_position_weight,
         body_frame_velocity=args.body_frame_velocity, yaw_rate_weight=args.yaw_rate_weight,
         velocity_smoothness_weight=args.velocity_smoothness_weight,
+        velocity_smoothness_stair_relax=args.velocity_smoothness_stair_relax,
         air_time_cap=args.air_time_cap,
         command_speed_range=([args.speed_range_min, args.speed_range_max]
                              if args.speed_range_min is not None else None),
