@@ -1079,11 +1079,61 @@ latency-robust checkpoint**, alongside (not replacing) `go2_stairs_hardmine`
 as the general-purpose one — the student trades away significant stairs
 capability for latency robustness, a genuine specialization rather than a
 strict improvement, so which to use depends on what a deployment actually
-needs.
+needs. **Superseded by the velocity-smoothness fix below — use
+`pretrained/go2_latency_student_smooth` instead**, which is strictly
+better (same fall rate, faster, smoother) with no trade-off against this
+version specifically.
+
+### Fixing a "surge-brake" gait under latency
+
+Visually reviewing the teacher/student GIFs revealed a real, repeating
+gait pattern under latency: forward velocity surging up toward the
+commanded speed, then braking to near-zero (occasionally briefly
+negative) about once per stride, rather than tracking smoothly. Measuring
+the raw per-timestep velocity confirmed this is real simulation behavior,
+not a GIF rendering artifact — and it's present in the *teacher* too, at
+the identical seed, ruling out distillation as the cause: this is
+inherent to how the RL fine-tune resolved latency robustness, not
+something introduced by behavior cloning.
+
+The existing action-rate penalty constrains the policy's raw *output*
+smoothness, but not the resulting *physical* velocity profile directly.
+Added `velocity_smoothness_weight`: a new reward term penalizing
+frame-to-frame forward-velocity jerk (squared) directly — calibrated
+against the observed jerk magnitude (weight=30). Mathematically, the
+existing tracking reward (a concave `exp(-error²)`) already scores a
+smooth constant-partial-speed gait *higher* than an oscillating one of
+the same average speed, so this just makes that incentive explicit
+instead of relying on it as an indirect side effect.
+
+<p float="left">
+  <img src="media/go2_latency_teacher_smooth_0.8ms.gif" width="380" alt="Go2 latency teacher with smoothed gait">
+  <img src="media/go2_latency_student_smooth_0.8ms.gif" width="380" alt="Go2 latency student with smoothed gait">
+</p>
+
+*Left: smoothed teacher. Right: smoothed student. Both at 0.8 m/s under the full trained latency range.*
+
+`runs/go2_latency_teacher_smooth` (8M steps, resumed from
+`go2_latency_teacher`): at the same seed used to diagnose the problem,
+velocity std dropped from 0.241 to 0.132 (roughly halved) and the minimum
+velocity went from -0.121 (briefly moving backward) to -0.006 (essentially
+never). **The 0% fall rate under latency held, and full-latency speed
+actually improved** (0.546 vs. 0.468 m/s) — a smoother gait covers more
+ground too, not just a cosmetic fix. Re-distilling from this improved
+teacher (`runs/go2_latency_student_smooth`) transferred the improvement
+cleanly to the fully realistic student: 0% falls at both latency
+settings, full-latency speed 0.545 m/s (matching the teacher), velocity
+std 0.138 (matching the teacher's own smoothed profile). No new
+capability regression beyond the stairs-12cm issue both versions already
+had.
+
+**Decision: adopt `pretrained/go2_latency_teacher_smooth` and
+`pretrained/go2_latency_student_smooth`** as the current best latency-robust
+checkpoints, superseding the unsmoothed versions above.
 
 ```bash
-python play.py --run-dir pretrained/go2_latency_student --target-speed 0.8 --record out.gif
-python eval_policy.py --run-dir pretrained/go2_latency_student --episodes 16
+python play.py --run-dir pretrained/go2_latency_student_smooth --target-speed 0.8 --record out.gif
+python eval_policy.py --run-dir pretrained/go2_latency_student_smooth --episodes 16
 ```
 
 ## Go2's own solver settings (known limitation)
