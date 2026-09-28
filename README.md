@@ -1001,7 +1001,90 @@ anything particular to Go1's dynamics, **decided not to repeat both
 already-known-to-fail fine-tuning attempts for Go2** — accepted as the
 same documented limit, cross-validated across a second robot rather than
 re-litigated. `pretrained/go2_stairs_hardmine` remains the accepted
-checkpoint.
+checkpoint *for general use* — see below, where this specific limitation
+was later revisited and actually resolved with a bigger technique.
+
+## Teacher/student latency distillation (Go2) — resolved
+
+The latency limit above was accepted as structural: no observation
+channel for the episode's own latency, so the policy can't specialize.
+Teacher/student distillation tests that theory directly instead of
+accepting it — give a "teacher" the missing signal as privileged
+information during training, then distill its behavior into a realistic
+"student" that has to work without it, matching real deployment (you
+can't directly measure your own actuator/sensor latency on real
+hardware).
+
+**Stage 1 — teacher.** `privileged_latency_obs` appends the CURRENT
+episode's actual action/observation latency (normalized) as 2 extra
+observation dims (53-dim total). Warm-started from
+`pretrained/go2_stairs_hardmine` via `expand_obs_checkpoint.py` (zero-init
+the 2 new input columns), then fine-tuned with the real latency ranges
+active (curriculum-gated via `sim2real_scale_current`, the mechanism
+already fixed during Go1's own sim-to-real investigation).
+
+Found and fixed a real bug in `expand_obs_checkpoint.py` along the way:
+it constructs a *fresh* PPO model, silently resetting `num_timesteps` to
+0 — unlike a normal `--resume`, which carries the old cumulative count
+forward. This broke the learning-rate schedule every fine-tune in this
+project relies on (a late-stage checkpoint normally resumes already deep
+into its decay; with `num_timesteps` reset, the same `--learning-rate`
+instead decays from full strength across the entire new run). The first
+attempt, built on this bug, showed real promise on the isolated latency
+axis (18.75% vs. 62.5% falls) but also a catastrophic regression on
+stairs/terrain (12–100% falls on settings that were previously 0%). Fixed
+by preserving `num_timesteps` through the warm-start (verified via a
+save/load round trip); the retry recovered flat/terrain almost completely
+(0–6% falls, matching baseline) **and** improved isolated latency
+robustness all the way to **0% falls** (vs. the blind policy's 62.5%) —
+a complete elimination of the vulnerability, not just a partial fix. The
+remaining cost: the hardest stairs corner (12cm) stayed severely
+regressed (75–100% falls), the same compounding-with-known-fragility
+pattern seen in the flight-phase investigation.
+
+<p float="left">
+  <img src="media/go2_latency_teacher_0.8ms.gif" width="380" alt="Go2 latency teacher walking with privileged latency observation">
+  <img src="media/go2_latency_student_0.8ms.gif" width="380" alt="Go2 latency student walking with no privileged observation">
+</p>
+
+*Left: teacher (privileged latency observation). Right: student (fully
+realistic observation). Both shown walking at 0.8 m/s under the full
+trained latency range (0-4 control steps of delay).*
+
+**Stage 2 — student.** `distill_student.py` (new tool): truncates the
+teacher's 2 privileged input columns to build the student's starting
+point (verified exact at zero privileged network input — see the tool's
+own docstring for a subtlety around VecNormalize's mean-centering that an
+earlier version of this check got wrong), then collects
+(student-observation, teacher-action) pairs from real teacher rollouts
+(~320,000 transitions, varied latency/terrain/speed matching training)
+and trains the student's policy network via supervised MSE regression —
+standard behavior cloning, not RL.
+
+**Result: the student — with NO privileged observation at all, just the
+ordinary 51-dim observation — achieves 0% falls at both zero latency and
+the full 0-4 step latency range**, matching the teacher almost exactly
+(same capability profile, same stairs-corner regression, inherited
+faithfully through the distillation). This is a genuinely surprising
+result given this project's own env has no observation-history buffering
+at all (a single memoryless timestep) — standard RMA-style approaches use
+a short history specifically because delay is a property of a sequence,
+not a snapshot, and a real risk going in was that a single-step student
+might recover little of the teacher's specialization. It didn't need to
+infer the exact latency value to find a strategy that's robust across the
+whole trained range without sacrificing zero-latency performance.
+
+**Decision: adopt `pretrained/go2_latency_student` as a specialized,
+latency-robust checkpoint**, alongside (not replacing) `go2_stairs_hardmine`
+as the general-purpose one — the student trades away significant stairs
+capability for latency robustness, a genuine specialization rather than a
+strict improvement, so which to use depends on what a deployment actually
+needs.
+
+```bash
+python play.py --run-dir pretrained/go2_latency_student --target-speed 0.8 --record out.gif
+python eval_policy.py --run-dir pretrained/go2_latency_student --episodes 16
+```
 
 ## Go2's own solver settings (known limitation)
 
