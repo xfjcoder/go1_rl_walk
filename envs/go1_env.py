@@ -49,6 +49,7 @@ ACTUATOR_NAMES = [
 ]
 FOOT_TOUCH_SENSORS = ["FR_touch", "FL_touch", "RR_touch", "RL_touch"]
 FOOT_SITES = ["FR_foot_site", "FL_foot_site", "RR_foot_site", "RL_foot_site"]  # same order
+LIDAR_SENSORS = [f"lidar_t{t}_y{y}" for t in range(3) for y in range(3)]  # 3 tilt x 3 yaw, see use_lidar
 THIGH_IDX = np.array([1, 4, 7, 10])  # FR, FL, RR, RL thigh indices in the 12-dim joint/action arrays
 CALF_IDX = np.array([2, 5, 8, 11])   # FR, FL, RR, RL calf indices
 GAIT_PHASE_OFFSETS = {
@@ -186,6 +187,25 @@ class Go1FlatEnv(gym.Env):
                                                # see expand_obs_checkpoint.py to warm-start one instead
                                                # of retraining from scratch. Default False = unchanged
                                                # 51-dim observation, bit-identical to every prior run.
+        use_lidar: bool = False,               # add a 9-ray forward-facing rangefinder fan (3 tilt
+                                               # angles x 3 yaw angles, see assets/go2_mesh_lidar.xml's
+                                               # lidar_t*_y* sites/sensors) to the observation: REAL
+                                               # ray-cast distance to whatever's actually in each ray's
+                                               # path, normalized to [0,1] (0 = touching the mount, 1 =
+                                               # at/beyond lidar_max_range or no hit at all). Unlike
+                                               # use_terrain_heightmap (a privileged analytic lookup),
+                                               # this only sees what an onboard sensor genuinely could --
+                                               # it detects a stair riser, a bump, or an obstacle because
+                                               # the ray physically intersects it, and is blocked the same
+                                               # way a real lidar would be. Requires the loaded robot XML
+                                               # to actually define the lidar_t*_y* sensors (only
+                                               # assets/go2_mesh_lidar.xml does, for now) -- raises clearly if
+                                               # not. Changes obs_dim +9, so it breaks --resume with any
+                                               # pre-existing checkpoint -- see expand_obs_checkpoint.py.
+                                               # Default False = unchanged observation, bit-identical.
+        lidar_max_range: float = 1.5,          # metres: lidar readings are clipped and normalized
+                                               # against this (see use_lidar above). Only matters when
+                                               # use_lidar=True.
         gait_period_stair_stretch: float = 0.0,  # extra seconds of gait period per metre of the current
                                                # episode's stair riser height, on top of the speed-based
                                                # period. Gives a tall step's swing phase more real time to
@@ -339,6 +359,29 @@ class Go1FlatEnv(gym.Env):
                                                # by gait_duty_fast). Raise it to make committing to
                                                # real flight worth strictly more than the easier
                                                # alternative.
+        gait_clock_wait_for_contact: bool = False,  # make the gait clock event-driven: pause its
+                                               # advance (don't move on to the next demanded
+                                               # transition) if any leg is overdue for its
+                                               # prescribed stance contact (desired_stance says it
+                                               # should be down, it isn't, for more than
+                                               # gait_clock_grace_steps in a row). Default False =
+                                               # the original pure metronome (phase advances by a
+                                               # fixed amount every step regardless of what actually
+                                               # happened physically) -- bit-for-bit unchanged.
+                                               # Added after tracing a stairs failure: the policy
+                                               # engages a step with its front legs but the clock
+                                               # keeps demanding the NEXT transition before the
+                                               # current lift actually completes, so it never gets
+                                               # the real extra time a big single-leg lift needs.
+                                               # This gives it that time, and a distinguishable
+                                               # observation signal (the phase_clock stops advancing)
+                                               # for "still mid-attempt" that the original memoryless,
+                                               # purely time-driven clock could never represent.
+        gait_clock_grace_steps: int = 3,      # control steps (at 50 Hz, ~60ms) a leg may be overdue
+                                               # for stance before gait_clock_wait_for_contact
+                                               # considers it a real stall worth pausing for, rather
+                                               # than ordinary swing-to-stance landing lag. Only
+                                               # matters when gait_clock_wait_for_contact=True.
         phase_match_weight: float = 0.0,      # reward for matching a PRESCRIBED diagonal-trot
                                                # timing against a fixed external clock. Defaulted to
                                                # 0.0 -- across many runs, hand-picked clock parameters
@@ -452,6 +495,8 @@ class Go1FlatEnv(gym.Env):
         self.num_obstacles = num_obstacles
         self.obstacle_lane_half_width = obstacle_lane_half_width
         self.use_terrain_heightmap = use_terrain_heightmap
+        self.use_lidar = use_lidar
+        self.lidar_max_range = lidar_max_range
         self.terrain_enabled = (self.terrain_amplitude_range is not None or terrain_amplitude is not None
                                 or self.slope_range is not None or slope_deg is not None
                                 or self.stair_height_range is not None or stair_height is not None
@@ -497,6 +542,10 @@ class Go1FlatEnv(gym.Env):
         self.gait_duty = gait_duty
         self.gait_duty_fast = gait_duty_fast
         self.flight_bonus_scale = flight_bonus_scale
+        self.gait_clock_wait_for_contact = gait_clock_wait_for_contact
+        self.gait_clock_grace_steps = gait_clock_grace_steps
+        self._phase = 0.0
+        self._stance_wait = np.zeros(4)
         self.use_calf_reference = use_calf_reference
         self.gait_swing_amplitude = gait_swing_amplitude
         self.thigh_residual_scale = thigh_residual_scale
@@ -550,6 +599,14 @@ class Go1FlatEnv(gym.Env):
         self._imu_vel_adr = self.model.sensor_adr[
             mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_SENSOR, "trunk_linvel")
         ]
+        if self.use_lidar:
+            lidar_ids = [mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_SENSOR, n) for n in LIDAR_SENSORS]
+            missing = [n for n, i in zip(LIDAR_SENSORS, lidar_ids) if i < 0]
+            if missing:
+                raise ValueError(f"use_lidar=True but this robot XML is missing lidar sensors: {missing} "
+                                  f"(only assets/go2_mesh_lidar.xml defines the lidar_t*_y* sites/sensors "
+                                  f"so far -- pass --robot-xml assets/go2_mesh_lidar.xml)")
+            self._lidar_sensor_adr = np.array([self.model.sensor_adr[i] for i in lidar_ids])
 
         joint_range = self.model.jnt_range[
             [mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_JOINT, n) for n in JOINT_NAMES]
@@ -568,6 +625,8 @@ class Go1FlatEnv(gym.Env):
         obs_dim = 3 + 3 + 4 + 12 + 12 + 12 + 3 + 2  # see _get_obs for layout (+2 for gait-phase clock)
         if self.use_terrain_heightmap:
             obs_dim += 9  # 3x3 local heightmap, see _local_heightmap
+        if self.use_lidar:
+            obs_dim += 9  # 3x3 rangefinder fan, see _lidar_obs
         if self.privileged_latency_obs:
             obs_dim += 2  # ground-truth action/observation latency this episode, see _get_obs
         self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(obs_dim,), dtype=np.float32)
@@ -576,11 +635,15 @@ class Go1FlatEnv(gym.Env):
         # observation_noise_scale=1.0 -- gravity(3), ang_vel(3), quat(4), joint_pos(12),
         # joint_vel(12), prev_action(12, never noised -- it's what WE commanded),
         # command(3, never noised -- not physically sensed), phase_clock(2, never noised --
-        # internally computed), [+ heightmap(9) if enabled].
+        # internally computed), [+ heightmap(9) if enabled], [+ lidar(9) if enabled],
+        # [+ privileged_latency(2), never noised -- ground truth, not physically sensed, if enabled].
+        # NOTE: order must match _get_obs's concatenation exactly.
         self._obs_noise_std = np.concatenate([
             np.full(3, 0.02), np.full(3, 0.05), np.full(4, 0.01), np.full(12, 0.01),
             np.full(12, 0.05), np.zeros(12), np.zeros(3), np.zeros(2),
-        ] + ([np.full(9, 0.01)] if self.use_terrain_heightmap else [])).astype(np.float32)
+        ] + ([np.full(9, 0.01)] if self.use_terrain_heightmap else [])
+          + ([np.full(9, 0.03)] if self.use_lidar else [])
+          + ([np.zeros(2)] if self.privileged_latency_obs else [])).astype(np.float32)
 
         action_latency_max = self.action_latency_range[1] if self.action_latency_range else 0
         self._action_buffer = deque(maxlen=action_latency_max + 1)
@@ -749,6 +812,8 @@ class Go1FlatEnv(gym.Env):
         self._prev_action[:] = 0.0
         self._prev_lin_vel_x = 0.0  # true at reset -- the stand keyframe has zero velocity
         self._step_count = 0
+        self._phase = 0.0
+        self._stance_wait[:] = 0.0
         self._foot_contact_ema[:] = 0.0
         self._foot_air_time[:] = 0.0
         self._prev_touches[:] = True
@@ -815,6 +880,7 @@ class Go1FlatEnv(gym.Env):
             obs = self._obs_buffer[-1 - self._episode_obs_latency]
         reward, reward_info = self._compute_reward(action)
         terminated = self._check_termination()
+        self._advance_gait_phase()
         self._step_count += 1
         truncated = self._step_count >= self.max_episode_steps
         self._prev_action = action.copy()
@@ -997,9 +1063,33 @@ class Go1FlatEnv(gym.Env):
         return (1 - f) * self.gait_duty + f * self.gait_duty_fast
 
     def _gait_phase(self) -> float:
-        """Where we are in the prescribed stride cycle, in [0, 1)."""
-        episode_time = self._step_count / self.control_hz
-        return (episode_time % self._episode_gait_period) / self._episode_gait_period
+        """Where we are in the prescribed stride cycle, in [0, 1). A stateful accumulator
+        (see _advance_gait_phase) rather than a pure function of elapsed time, so it CAN be
+        paused (gait_clock_wait_for_contact) -- but by default advances at exactly the same
+        fixed rate every step, making it numerically equivalent to the original
+        time-based formula (episode_time % period) / period."""
+        return self._phase
+
+    def _advance_gait_phase(self):
+        """Advance the gait clock by one control step, called once per step() after physics
+        and reward are computed (so touches reflect what actually just happened). Default
+        (gait_clock_wait_for_contact=False): always advances by a fixed fraction of the
+        period -- a pure metronome, bit-for-bit equivalent to the original design. When
+        True: PAUSES the advance (holds the current phase, and therefore the current
+        desired_stance target, another step) if any leg has been overdue for its prescribed
+        stance contact for more than gait_clock_grace_steps in a row -- giving the policy
+        real extra time to complete a lift instead of the clock moving on to demand the
+        next transition regardless of whether the current one succeeded."""
+        dt_frac = (1.0 / self.control_hz) / self._episode_gait_period
+        if self.gait_clock_wait_for_contact:
+            touches = self._foot_contacts()
+            leg_phases = (self._phase + GAIT_PHASE_OFFSETS[self.gait_style]) % 1.0
+            desired_stance = leg_phases < self._duty_for_speed(self.target_speed)
+            overdue = desired_stance & ~touches
+            self._stance_wait = np.where(overdue, self._stance_wait + 1, 0.0)
+            if np.any(self._stance_wait > self.gait_clock_grace_steps):
+                return  # paused: hold the current phase (and its desired_stance) another step
+        self._phase = (self._phase + dt_frac) % 1.0
 
     # ------------------------------------------------------------------ #
     # Observation
@@ -1039,16 +1129,30 @@ class Go1FlatEnv(gym.Env):
         phase = self._gait_phase()
         phase_clock = np.array([np.sin(2 * np.pi * phase), np.cos(2 * np.pi * phase)], dtype=np.float32)
 
-        # Layout (dim 51, or 60 with use_terrain_heightmap): gravity(3) + ang_vel(3) + base_quat(4)
-        #   + joint_pos(12) + joint_vel(12) + prev_action(12) + command(3) + phase_clock(2)
-        #   [+ heightmap(9)] [+ privileged_latency(2)]
+        # Layout (dim 51, or +9 with use_terrain_heightmap, +9 with use_lidar, +2 with
+        # privileged_latency_obs): gravity(3) + ang_vel(3) + base_quat(4) + joint_pos(12)
+        # + joint_vel(12) + prev_action(12) + command(3) + phase_clock(2)
+        #   [+ heightmap(9)] [+ lidar(9)] [+ privileged_latency(2)]
         parts = [gravity_vec, ang_vel, quat, joint_pos, joint_vel, self._prev_action, command, phase_clock]
         if self.use_terrain_heightmap:
             parts.append(self._local_heightmap())
+        if self.use_lidar:
+            parts.append(self._lidar_obs())
         if self.privileged_latency_obs:
             parts.append(self._privileged_latency_obs())
         obs = np.concatenate(parts).astype(np.float32)
         return obs
+
+    def _lidar_obs(self) -> np.ndarray:
+        """9 forward-facing rangefinder readings (3 tilt angles x 3 yaw angles, see
+        assets/go2_mesh_lidar.xml's lidar_t*_y* sites/sensors), each normalized to [0, 1]: 0 = touching
+        the mount, 1 = at or beyond lidar_max_range (including MuJoCo's own -1 = no hit at all
+        within its ray-cast horizon). Real ray-cast sensing against whatever's actually there --
+        unlike _local_heightmap, which is a privileged analytic lookup, this only sees what an
+        onboard rangefinder genuinely could (blocked/foreshortened by real geometry in its path)."""
+        raw = self.data.sensordata[self._lidar_sensor_adr]
+        normalized = np.where(raw < 0, 1.0, np.clip(raw, 0.0, self.lidar_max_range) / self.lidar_max_range)
+        return normalized.astype(np.float32)
 
     def _privileged_latency_obs(self) -> np.ndarray:
         """Ground-truth action/observation latency for THIS episode, each normalized to its own

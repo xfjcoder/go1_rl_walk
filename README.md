@@ -1254,6 +1254,174 @@ substantially bigger technique that could actually fix the latency
 vulnerability, not attempted for either robot). The general drift/yaw
 regression from stairs also remains an open, unaddressed soft spot.
 
+## Stage 7: rangefinder lidar + an event-driven gait clock (Go2)
+
+A genuinely new project direction, not a continuation of any accepted
+limit above: give the robot real onboard perception (a physically
+simulated sensor, not a privileged analytic shortcut) instead of pure
+proprioception, and separately, make the gait clock closed-loop instead
+of a fixed-time metronome. Both ideas came from asking how a real dog
+actually climbs stairs (see below) rather than from a specific bug
+report.
+
+### Lidar: real ray-cast sensing — tried, net regression, not adopted
+
+`assets/go2_mesh_lidar.xml` (a SEPARATE file from `go2_mesh.xml` — adding
+9 rangefinder sensors to the shared file would cost every existing Go2
+checkpoint 9 extra ray-casts per step regardless of whether it uses
+them, since MuJoCo computes every declared sensor every `mj_step`,
+whether or not the observation reads it; same one-change-at-a-time
+isolation as `go2_mesh_softcontact.xml`) adds a 9-ray forward-facing fan
+(3 tilt angles x 3 yaw angles, mounted near the front of the trunk).
+`use_lidar` (new `go1_env.py` option) turns this into a 9-dim
+observation block, each ray normalized to `[0,1]` by `lidar_max_range`.
+Verified the MuJoCo rangefinder convention (ray along the site's local
++Z axis) with a standalone test model before using it, and verified
+readings exactly match `height/sin(tilt)` trig on flat ground and
+respond to real stair geometry (not a fixed per-episode value) by
+tracing readings as a test robot approached a staircase.
+
+Warm-started from `pretrained/go2_stairs_hardmine` via
+`expand_obs_checkpoint.py` (51->60 dims), self-verified exact (action
+diff 0.000000). Zero-shot regression check (before any fine-tuning):
+clean, matching the baseline closely across most of the grid — confirms
+the sensor addition itself introduces no side effects.
+
+Fine-tuned 8M steps (`runs/go2_lidar`) with the new sense active over
+the existing full terrain/slope/stairs ranges. Result: a **net
+regression**, confirmed by a 50-combo grid against the baseline run
+side-by-side (same seeds): mean fall rate 29.0% vs baseline's 13.2%
+(more than double), mean lateral drift 1.08m vs 0.56m (roughly double) —
+and the drift increase showed up even on completely flat ground with no
+stairs at all, not just at hard corners. One genuine, narrow win: flat
+descending-12cm-stairs at 0.8 m/s went from 38%->0% falls. Extended the
+fine-tune to 16M steps to check whether the new dims simply hadn't
+settled yet: fall rate improved marginally (29.0%->26.0%) but drift got
+WORSE, not better (1.08m->1.31m) — ruling out "just needs more time" and
+pointing to a genuine different, worse local optimum rather than slow
+convergence.
+
+Traced an ascending-12cm failure directly (frame-by-frame, not just the
+fall-rate number) to understand whether this was a perception problem:
+the lidar rays clearly track the stairs throughout the approach (so it's
+not blind to them), and the front legs visibly engage the step edge (a
+real climbing attempt) — but the hind legs progressively splay out
+further behind the body over several seconds while the front body
+pitches increasingly nose-down, a failed weight-transfer/push-off, not a
+height-misjudgment. Same qualitative failure shape as the long-standing
+ascending-stairs limit from earlier stages.
+
+**DECISION: not adopted.** `pretrained/go2_stairs_hardmine` (superseded
+below) remained the checkpoint through this experiment; `runs/go2_lidar`
+and `runs/go2_lidar_extended` stay gitignored experiments, not promoted.
+`use_lidar`/`lidar_max_range`/`go2_mesh_lidar.xml` stay in the codebase
+(default off) as reasonable, verified infrastructure regardless.
+
+### Event-driven gait clock — tried, net win, ADOPTED
+
+How does a real dog actually climb a tall step? Not with a symmetric,
+fixed-rhythm trot — it shifts its weight onto a stable base *before*
+lifting a leg, uses its front legs to reach/grip and its rear legs to
+push (two different jobs, not one repeated pattern), and critically,
+places each foot with closed-loop, one-step-at-a-time feedback rather
+than committing to a rhythm and hoping each step lands on schedule. This
+project's gait clock (`_gait_phase`, driving both the `phase_clock`
+observation and the `r_gait`/`r_phase_match` reward targets) had always
+been the latter: a pure function of elapsed time, advancing on a fixed
+schedule regardless of whether a foot had actually landed yet. The
+ascending-stairs failure traced above shows exactly this: the clock kept
+demanding the next transition before the current lift actually
+succeeded, giving the policy no way to represent "I'm still mid-attempt,
+wait."
+
+Of the two ideas, only this one was actually untried — an "asymmetric
+gait" reward already exists in a different form
+(`phase_match_stair_relax` + `static_stability_weight`) and already
+failed for Go1's own ascending-stairs limit; `go2_stairs_hardmine`
+itself already trains with `phase_match_weight=0` (no diagonal-trot
+constraint enforced at all), so "allow asymmetry" was already the status
+quo and still wasn't enough on its own.
+
+`gait_clock_wait_for_contact` (new): the phase is now a stateful
+accumulator (`self._phase`) instead of a pure function of
+`self._step_count` — advances by the same fixed fraction every step by
+default (verified numerically equivalent to the old formula to ~1e-14,
+and confirmed bit-for-bit identical fall-rate/speed numbers on
+`pretrained/go2_stairs_hardmine` after the refactor). When enabled, the
+advance PAUSES — holding the current phase and its `desired_stance`
+target another step — if any leg has been overdue for its prescribed
+stance contact for more than `gait_clock_grace_steps` in a row.
+Unit-tested the pause/resume logic in isolation (mocked contact states):
+pauses exactly when a leg is stuck, resumes exactly when it lands,
+advances normally otherwise.
+
+**First attempt, `gait_clock_grace_steps=3` (~60ms): a real bug.**
+Measuring the baseline's own natural landing-time variance (even in an
+already-converged, non-stalling gait) showed a leg routinely goes up to
+5-6 consecutive steps "overdue" during completely ordinary walking (99th
+percentile 5, max 6) — so grace=3 was firing on normal jitter, not
+genuine stalls (measured: 5.7% of ALL flat-ground steps paused).
+Fine-tuned 8M steps from `pretrained/go2_stairs_hardmine` anyway to see
+the effect: mean fall rate improved over baseline (11.2% vs 13.2%,
+including the flat descending-12cm corner fully fixed, 38%->0% at both
+speeds) but mean drift got worse (0.75m vs 0.56m), similar in shape (if
+smaller in magnitude) to the lidar regression.
+
+**Recalibrated to `gait_clock_grace_steps=12`** (comfortably above the
+observed natural max of 6), re-verified it tolerates the full normal
+jitter range with zero spurious pauses, and re-ran the fine-tune fresh
+from the same baseline. Result: fall rate improved FURTHER (9.7% vs
+13.2% baseline, 6 combos improved >=20pp vs only 2 regressed) — strictly
+better than the miscalibrated grace=3 attempt on the metric that
+mattered — but drift barely moved (0.72m vs 0.75m), showing the
+spurious-pausing theory only partly explained the drift cost.
+
+**Traced the drift directly** rather than guessing further: at a
+flat-ground seed with only 1 pause in the entire 1000-step episode, |y|
+still drifted smoothly and monotonically to 0.93m — ruling out "caused
+by actual pause events" (can't explain a steady drift from one isolated
+pause). Ran a **control experiment** to isolate whether this was just a
+generic cost of re-exploring an already-converged policy
+(`--resume-log-std -1.8`) rather than anything specific to the new
+mechanism: the exact same 8M-step fine-tune recipe, same checkpoint,
+same log-std reset, but with the new flag OFF. Result: the control's
+drift (0.58m) was statistically identical to the untouched baseline's
+own (0.56m) — re-exploration alone does NOT cause this regression. The
+drift cost is real and specific to the gait-clock mechanism (and,
+separately, to lidar) — most likely the same shared-network-interference
+pattern documented repeatedly elsewhere in this project (behavior
+learned to cope with genuine stair-related pauses partially bleeding
+into ordinary flat-ground behavior, since it's one shared network), not
+solved further here.
+
+<p align="center">
+  <img src="media/go2_gaitclock_stairs_desc12cm_FIXED.gif" width="500" alt="Go2 with the event-driven gait clock, descending stairs cleanly">
+</p>
+
+*The event-driven-gait-clock checkpoint cleanly descending 12cm stairs — frame-by-frame inspection confirms a real, controlled descent (steady gait throughout, no hunching or stalling), not a lucky fall-rate number.*
+
+**DECISION: adopted.** `pretrained/go2_gaitclock` (promoted from
+`runs/go2_gaitclock_g12`) **supersedes `pretrained/go2_stairs_hardmine`
+as the default Go2 checkpoint** — net fall-rate win across the grid,
+including a genuine fix of the long-standing descending-12cm corner that
+persisted through every earlier Go2 stairs fine-tune, at the cost of
+somewhat worse (but not catastrophic) straight-line lateral tracking
+precision (0.72m vs 0.56m mean drift). The un-recalibrated
+`grace_steps=3` attempt (`runs/go2_gaitclock`) and the control experiment
+(`runs/go2_control_reexplore`) stay gitignored experiments documenting
+the investigation, not promoted. `gait_clock_wait_for_contact`/
+`gait_clock_grace_steps` stay in the codebase, default off, so every
+earlier checkpoint's behavior is unaffected.
+
+**Not addressed**: the drift cost itself — a real, mechanism-specific
+regression, isolated via the control experiment but not fixed (tuning
+`lateral_tracking_weight` or a dedicated stabilization pass were
+proposed but not attempted). Ascending stairs specifically remain mixed
+(several corners improved, a few regressed) rather than cleanly solved —
+this is a win on the metric that matters most (overall fall rate) and on
+one particular stubborn corner (descending-12cm), not a complete
+resolution of the project's long-standing stairs difficulty.
+
 ## Next stages
 
 Terrain-aware observation and a non-trot gait mode were both tried already

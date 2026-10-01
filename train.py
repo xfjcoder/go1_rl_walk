@@ -363,6 +363,17 @@ def main():
                          "(measured: only a few percent real 0-contact time vs roughly a fifth of "
                          "the cycle prescribed). Raise it to make committing to real flight worth "
                          "strictly more.")
+    g.add_argument("--gait-clock-wait-for-contact", action=argparse.BooleanOptionalAction, default=False,
+                    help="Make the gait clock event-driven: pause its advance (hold the current "
+                         "demanded stance target another step) if any leg is overdue for its "
+                         "prescribed stance contact for more than --gait-clock-grace-steps in a "
+                         "row, instead of always ticking forward on a fixed timer regardless of "
+                         "what actually happened physically. Default False = the original pure "
+                         "metronome, numerically verified bit-for-bit unchanged.")
+    g.add_argument("--gait-clock-grace-steps", type=int, default=3,
+                    help="Control steps (~60ms at 50Hz) a leg may be overdue for stance before "
+                         "--gait-clock-wait-for-contact treats it as a real stall worth pausing "
+                         "for, rather than ordinary swing-to-stance landing lag.")
     g.add_argument("--phase-match-weight", type=float, default=0.0,
                     help="Reward for matching the prescribed diagonal-trot timing above. This is "
                          "what actually fixed the front/rear step-rate mismatch (see README) -- "
@@ -533,6 +544,17 @@ def main():
                          "--resume with any pre-existing (blind) checkpoint; use "
                          "expand_obs_checkpoint.py to warm-start one instead of retraining from "
                          "scratch. Default False = every prior run's exact behavior, unchanged.")
+    g.add_argument("--use-lidar", action=argparse.BooleanOptionalAction, default=False,
+                    help="Add a 9-ray forward-facing rangefinder fan (3 tilt x 3 yaw angles) to the "
+                         "observation -- real ray-cast sensing (sees whatever a ray actually hits), "
+                         "unlike --use-terrain-heightmap's privileged analytic lookup. Requires the "
+                         "loaded --robot-xml to define the lidar_t*_y* sensors (only "
+                         "assets/go2_mesh_lidar.xml does, for now). Changes obs_dim +9, breaking --resume "
+                         "with any pre-existing checkpoint; use expand_obs_checkpoint.py to warm-start. "
+                         "Default False = every prior run's exact behavior, unchanged.")
+    g.add_argument("--lidar-max-range", type=float, default=1.5,
+                    help="Metres: lidar readings are clipped and normalized against this. Only "
+                         "matters with --use-lidar.")
     g.add_argument("--obstacle-lane-half-width", type=float, default=0.4,
                     help="Metres either side of y=0 that obstacles are placed within. Narrower than the "
                          "full course width so obstacles actually land in the robot's walking path -- "
@@ -655,6 +677,7 @@ def main():
         obstacle_radius=args.obstacle_radius, num_obstacles=args.num_obstacles,
         obstacle_lane_half_width=args.obstacle_lane_half_width,
         use_terrain_heightmap=args.use_terrain_heightmap,
+        use_lidar=args.use_lidar, lidar_max_range=args.lidar_max_range,
         friction_range=list(args.friction_range),
         mass_scale_range=list(args.mass_scale_range) if args.mass_scale_range else None,
         push_velocity=args.push_velocity,
@@ -671,6 +694,8 @@ def main():
         foot_duty_weight=args.foot_duty_weight, gait_period=args.gait_period, gait_style=args.gait_style,
         gait_duty=args.gait_duty, gait_duty_fast=args.gait_duty_fast,
         flight_bonus_scale=args.flight_bonus_scale,
+        gait_clock_wait_for_contact=args.gait_clock_wait_for_contact,
+        gait_clock_grace_steps=args.gait_clock_grace_steps,
         phase_match_weight=initial_phase_match_weight, air_time_weight=args.air_time_weight,
         phase_match_stair_relax=args.phase_match_stair_relax,
         static_stability_weight=args.static_stability_weight,
