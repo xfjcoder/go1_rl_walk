@@ -1422,6 +1422,85 @@ this is a win on the metric that matters most (overall fall rate) and on
 one particular stubborn corner (descending-12cm), not a complete
 resolution of the project's long-standing stairs difficulty.
 
+### Lidar trained from scratch — tried, net negative at the hardest corner, not adopted
+
+The warm-started lidar fine-tune above regressed broadly. The leading
+hypothesis was "shared-network interference" — grafting 9 new input
+dimensions onto an already-converged, lidar-blind policy disrupts
+behavior it had nothing to do with. The direct test: redo the ENTIRE
+Go2 pipeline from scratch (h_clock -> speed curriculum -> terrain ->
+terrain hard-mining -> slopes -> stairs -> stairs hard-mining, ~76M
+steps total) with `use_lidar`/`go2_mesh_lidar.xml` active from the very
+first training step, so there's no old habit to interfere with at all.
+
+**A real bug found and fixed along the way, via visual inspection, not
+the fall-rate metric.** The first `go2_lidar_h_clock` attempt (stage 1,
+seed=0) reported 0% falls — but a GIF showed the rear-left leg looking
+"limp." `gait_stats.py` confirmed it decisively: RL had **0 steps/s, 0%
+duty cycle, permanently airborne for the entire episode** — the robot
+had learned to balance on 3 legs well enough to never fall, hiding a
+completely broken gait behind a reassuring fall-rate number (the exact
+"fall rate alone misses stuck/broken gaits" lesson from the Go1 stairs
+saga, recurring here in a new form). Root cause: `--seed` defaults to 0
+(not random), and a fresh network sized for 60 inputs instead of 51
+starts from different initial weights than the original blind h_clock
+ever had — "same seed" doesn't mean "same outcome" once the architecture
+itself differs. Retrying with `--seed 1` and verifying all 4 legs
+stepped symmetrically via `gait_stats.py` *before* building anything on
+top of it fixed it cleanly (spread 1.04, matching the original blind
+h_clock's own quality). Adopted a new discipline from this point on:
+generate a GIF and run `gait_stats.py` after every stage, before
+launching the next one.
+
+**Every stage through slopes matched or exceeded the equivalent
+non-lidar baseline**, with lidar active throughout: flat walking,
+terrain (0% falls at every amplitude, including a 12cm corner that
+needed a dedicated hard-mining pass in the non-lidar lineage), terrain
+hard-mining, and slopes (clean at every angle except the same known
+steep-uphill soft spot the non-lidar version has). Stairs (pre-hard-
+mining) reproduced the exact expected historical shape: clean to ±6cm,
+descending-12cm catastrophic (94%/62% falls) — matching the non-lidar
+`go2_stairs`'s own pre-hard-mining numbers almost exactly.
+
+**The final hard-mining pass is where it fell short.** Comparing the
+same flat/no-slope stairs corner head-to-head against
+`pretrained/go2_stairs_hardmine` (16 episodes each):
+
+| | baseline (non-lidar) | lidar-from-scratch |
+|---|---|---|
+| mean fall rate (10 combos) | 11.4% | **25.6%** |
+| mean lateral drift | 0.53 m | **0.76 m** |
+| ascending-12cm (0.3/0.8 m/s) | 19% / 19% | **69% / 62%** |
+| descending-12cm (0.3/0.8 m/s) | 38% / 38% | 100% / **25%** (mixed) |
+
+**Why training from scratch didn't fully solve this, even though it
+should only ever ADD information**: PPO is a local, stochastic
+optimizer, not a global search — a network with more inputs isn't
+guaranteed to find a better policy, only a different one, and "different"
+can land worse specifically on the narrowest-margin task (a 12cm riser
+leaves very little room for error in the weight-shift timing) even while
+matching or beating the baseline everywhere there's more slack to work
+with. This is the same "shared-network interference" shape as the warm-
+started regression and the gait-clock drift regression earlier in this
+stage, just milder (drift 1.4x baseline here vs 2x for the warm-started
+version) — training from scratch helped, but didn't eliminate the
+effect. A genuine, unresolved alternative explanation: PPO training is
+stochastic, and this exact pipeline's own stage 1 landed in a badly
+broken local optimum on one random seed and cleanly fixed on another —
+it's possible the stairs hard-mining stage specifically drew an unlucky
+seed, independent of lidar being involved at all. Retrying that one
+stage with a different seed would be the direct way to tell these apart;
+not attempted.
+
+**DECISION (discussed with user): accept as a genuine negative/mixed
+result, not adopted.** `pretrained/go2_gaitclock` remains the adopted
+Go2 checkpoint. None of `runs/go2_lidar_h_clock_v2` through
+`runs/go2_lidar_stairs_hardmine_v2` were promoted to `pretrained/` — all
+stay as gitignored `runs/` experiments. No code changes were needed for
+this experiment (`use_lidar`/`go2_mesh_lidar.xml` already existed); the
+value was the empirical result and the reusable "verify with GIF +
+gait_stats before trusting a 0%-fall-rate stage" discipline.
+
 ## Next stages
 
 Terrain-aware observation and a non-trot gait mode were both tried already
