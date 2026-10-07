@@ -24,15 +24,68 @@ import os
 import re
 
 import numpy as np
+import torch
+import torch.nn as nn
 
 from stable_baselines3 import PPO
 from stable_baselines3.common.vec_env import SubprocVecEnv, VecNormalize, VecMonitor
 from stable_baselines3.common.callbacks import CheckpointCallback, BaseCallback, CallbackList
 from stable_baselines3.common.utils import set_random_seed, get_schedule_fn
+from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
 
 from envs.go1_env import Go1FlatEnv
 
 CKPT_DIR = "checkpoints"
+
+
+class CameraMlpExtractor(BaseFeaturesExtractor):
+    """For --use-camera: the env's observation is still a single flat Box (same convention as
+    every other optional sensor in this project -- heightmap, lidar), not a Dict space, so the
+    default MlpPolicy would otherwise feed the raw flattened depth pixels straight into the
+    net_arch MLP as if they were ordinary proprioceptive floats. This extractor instead slices
+    the flat vector into [proprio_dim : camera_resolution**2], reshapes the image portion back
+    into (1, res, res), runs it through a small CNN, and concatenates the CNN's output features
+    with the UNTOUCHED proprioceptive portion -- which net_arch's own MLP layers then process
+    exactly as they always have. Mirrors SB3's own CombinedExtractor pattern (CNN branch for
+    image keys, passthrough for the rest) without needing a Dict observation space.
+
+    Only used when --use-camera is set (see train.py's policy_kwargs wiring below); the default
+    MlpPolicy/FlattenExtractor (plain passthrough) is used otherwise, completely unchanged."""
+
+    def __init__(self, observation_space, proprio_dim: int, camera_resolution: int, cnn_features_dim: int = 128):
+        total_dim = int(np.prod(observation_space.shape))
+        expected_dim = proprio_dim + camera_resolution ** 2
+        if total_dim != expected_dim:
+            raise ValueError(f"CameraMlpExtractor: observation dim {total_dim} != proprio_dim "
+                              f"{proprio_dim} + camera_resolution**2 {camera_resolution ** 2} "
+                              f"(={expected_dim}) -- proprio_dim must match obs_dim MINUS the "
+                              f"camera block exactly (see Go1FlatEnv's own obs_dim formula); "
+                              f"combining --use-camera with --privileged-latency-obs isn't "
+                              f"supported by this extractor yet (the latency block comes after "
+                              f"the camera block in _get_obs's concatenation order).")
+        super().__init__(observation_space, features_dim=proprio_dim + cnn_features_dim)
+        self.proprio_dim = proprio_dim
+        self.camera_resolution = camera_resolution
+        # 32x32 -> 16x16 -> 8x8 -> 4x4 (stride-2 convs, not maxpool -- fewer ops for the same
+        # downsampling, standard for small-image RL feature extractors). Sized for 32x32 input;
+        # a different --camera-resolution still works (conv arithmetic handles any input size),
+        # just with a different flattened dim feeding the linear layer below (computed, not hardcoded).
+        self.cnn = nn.Sequential(
+            nn.Conv2d(1, 16, kernel_size=3, stride=2, padding=1), nn.ReLU(),
+            nn.Conv2d(16, 32, kernel_size=3, stride=2, padding=1), nn.ReLU(),
+            nn.Conv2d(32, 32, kernel_size=3, stride=2, padding=1), nn.ReLU(),
+            nn.Flatten(),
+        )
+        with torch.no_grad():
+            dummy = torch.zeros(1, 1, camera_resolution, camera_resolution)
+            n_flatten = self.cnn(dummy).shape[1]
+        self.linear = nn.Sequential(nn.Linear(n_flatten, cnn_features_dim), nn.ReLU())
+
+    def forward(self, observations: torch.Tensor) -> torch.Tensor:
+        proprio = observations[:, :self.proprio_dim]
+        image = observations[:, self.proprio_dim:].reshape(-1, 1, self.camera_resolution, self.camera_resolution)
+        cnn_features = self.linear(self.cnn(image))
+        return torch.cat([proprio, cnn_features], dim=1)
 LOG_DIR = "logs"
 
 
@@ -574,6 +627,27 @@ def main():
     g.add_argument("--lidar-max-range", type=float, default=1.5,
                     help="Metres: lidar readings are clipped and normalized against this. Only "
                          "matters with --use-lidar.")
+    g.add_argument("--use-camera", action=argparse.BooleanOptionalAction, default=False,
+                    help="Add a forward-and-down-facing onboard DEPTH camera (see "
+                         "assets/go2_mesh_camera.xml's depth_cam) to the observation -- real "
+                         "rendering (responds to terrain/stairs/obstacles like a genuine onboard "
+                         "camera would), not an approximation. Requires the loaded --robot-xml to "
+                         "define the depth_cam camera (only assets/go2_mesh_camera.xml does, for "
+                         "now). Changes obs_dim +camera_resolution**2, breaking --resume with any "
+                         "pre-existing checkpoint. Also switches the policy's feature extractor to "
+                         "CameraMlpExtractor (a small CNN branch for the image, passthrough for the "
+                         "rest -- see its docstring) instead of the default plain-passthrough "
+                         "FlattenExtractor. Default False = every prior run's exact behavior, "
+                         "unchanged. Benchmarked: render cost is real (~1.5-1.7x slower aggregate "
+                         "training throughput at 16 parallel envs, GPU-rendering-bottlenecked, not "
+                         "pixel-count-bottlenecked) but tractable, not prohibitive.")
+    g.add_argument("--camera-resolution", type=int, default=32,
+                    help="Depth image is camera-resolution x camera-resolution. Only matters with "
+                         "--use-camera. Benchmarked: render cost is dominated by per-call overhead, "
+                         "not pixel count (32x32 and 64x64 cost almost the same).")
+    g.add_argument("--camera-max-range", type=float, default=3.0,
+                    help="Metres: depth readings are clipped and normalized against this. Only "
+                         "matters with --use-camera.")
     g.add_argument("--obstacle-lane-half-width", type=float, default=0.4,
                     help="Metres either side of y=0 that obstacles are placed within. Narrower than the "
                          "full course width so obstacles actually land in the robot's walking path -- "
@@ -701,6 +775,8 @@ def main():
         obstacle_lane_half_width=args.obstacle_lane_half_width,
         use_terrain_heightmap=args.use_terrain_heightmap,
         use_lidar=args.use_lidar, lidar_max_range=args.lidar_max_range,
+        use_camera=args.use_camera, camera_resolution=args.camera_resolution,
+        camera_max_range=args.camera_max_range,
         friction_range=list(args.friction_range),
         mass_scale_range=list(args.mass_scale_range) if args.mass_scale_range else None,
         push_velocity=args.push_velocity,
@@ -765,6 +841,20 @@ def main():
 
     policy_kwargs = dict(net_arch=dict(pi=[256, 256, 128], vf=[256, 256, 128]),
                          log_std_init=args.log_std_init)
+    if args.use_camera:
+        if args.privileged_latency_obs:
+            raise SystemExit("--use-camera + --privileged-latency-obs together isn't supported by "
+                              "CameraMlpExtractor yet (see its docstring) -- drop one of the two.")
+        # Mirrors Go1FlatEnv's own obs_dim formula exactly, MINUS the camera block (everything
+        # the extractor passes through untouched) -- see CameraMlpExtractor's docstring.
+        proprio_dim = 3 + 3 + 4 + 12 + 12 + 12 + 3 + 2
+        if args.use_terrain_heightmap:
+            proprio_dim += 9
+        if args.use_lidar:
+            proprio_dim += 9
+        policy_kwargs["features_extractor_class"] = CameraMlpExtractor
+        policy_kwargs["features_extractor_kwargs"] = dict(
+            proprio_dim=proprio_dim, camera_resolution=args.camera_resolution)
 
     if args.resume:
         model = PPO.load(args.resume, env=env, tensorboard_log=tb_log_dir)

@@ -218,6 +218,31 @@ class Go1FlatEnv(gym.Env):
         lidar_max_range: float = 1.5,          # metres: lidar readings are clipped and normalized
                                                # against this (see use_lidar above). Only matters when
                                                # use_lidar=True.
+        use_camera: bool = False,              # add a forward-and-down-facing onboard DEPTH camera
+                                               # (see assets/go2_mesh_camera.xml's depth_cam) to the
+                                               # observation: camera_resolution x camera_resolution
+                                               # depth values, flattened, clipped and normalized to
+                                               # [0,1] against camera_max_range (0 = touching the lens,
+                                               # 1 = at/beyond camera_max_range -- MuJoCo's own no-hit
+                                               # sentinel is a large FINITE value, verified empirically,
+                                               # so plain clipping handles it with no special case,
+                                               # unlike lidar's negative-sentinel convention). Real
+                                               # rendering, not an approximation -- responds to terrain/
+                                               # stairs/obstacles the same way an onboard camera
+                                               # genuinely would. Requires the loaded robot XML to
+                                               # actually define the depth_cam camera (only
+                                               # assets/go2_mesh_camera.xml does, for now) -- raises
+                                               # clearly if not. Changes obs_dim +camera_resolution**2,
+                                               # so it breaks --resume with any pre-existing checkpoint.
+                                               # Default False = unchanged observation, bit-identical.
+        camera_resolution: int = 32,           # depth image is camera_resolution x camera_resolution.
+                                               # Only matters when use_camera=True. Benchmarked: render
+                                               # cost is dominated by per-call overhead, not pixel count
+                                               # (32x32 and 64x64 cost almost the same), so there's no
+                                               # speed reason to go smaller than this.
+        camera_max_range: float = 3.0,         # metres: depth readings are clipped and normalized
+                                               # against this (see use_camera above). Only matters when
+                                               # use_camera=True.
         gait_period_stair_stretch: float = 0.0,  # extra seconds of gait period per metre of the current
                                                # episode's stair riser height, on top of the speed-based
                                                # period. Gives a tall step's swing phase more real time to
@@ -523,6 +548,9 @@ class Go1FlatEnv(gym.Env):
         self.use_terrain_heightmap = use_terrain_heightmap
         self.use_lidar = use_lidar
         self.lidar_max_range = lidar_max_range
+        self.use_camera = use_camera
+        self.camera_resolution = camera_resolution
+        self.camera_max_range = camera_max_range
         self.terrain_enabled = (self.terrain_amplitude_range is not None or terrain_amplitude is not None
                                 or self.slope_range is not None or slope_deg is not None
                                 or self.stair_height_range is not None or stair_height is not None
@@ -636,6 +664,17 @@ class Go1FlatEnv(gym.Env):
                                   f"(only assets/go2_mesh_lidar.xml defines the lidar_t*_y* sites/sensors "
                                   f"so far -- pass --robot-xml assets/go2_mesh_lidar.xml)")
             self._lidar_sensor_adr = np.array([self.model.sensor_adr[i] for i in lidar_ids])
+        if self.use_camera:
+            cam_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_CAMERA, "depth_cam")
+            if cam_id < 0:
+                raise ValueError("use_camera=True but this robot XML is missing the depth_cam camera "
+                                  "(only assets/go2_mesh_camera.xml defines it so far -- pass "
+                                  "--robot-xml assets/go2_mesh_camera.xml)")
+            # Created once, not per-step -- a fresh mujoco.Renderer every call (like render() does for
+            # GIF recording) would add far more than the per-call overhead already measured; reusing one
+            # instance across the whole episode (and process lifetime) is the standard efficient pattern.
+            self._camera_renderer = mujoco.Renderer(self.model, height=camera_resolution, width=camera_resolution)
+            self._camera_renderer.enable_depth_rendering()
 
         joint_range = self.model.jnt_range[
             [mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_JOINT, n) for n in JOINT_NAMES]
@@ -656,6 +695,8 @@ class Go1FlatEnv(gym.Env):
             obs_dim += 9  # 3x3 local heightmap, see _local_heightmap
         if self.use_lidar:
             obs_dim += 9  # 3x3 rangefinder fan, see _lidar_obs
+        if self.use_camera:
+            obs_dim += camera_resolution ** 2  # flattened depth image, see _camera_obs
         if self.privileged_latency_obs:
             obs_dim += 2  # ground-truth action/observation latency this episode, see _get_obs
         self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(obs_dim,), dtype=np.float32)
@@ -665,13 +706,15 @@ class Go1FlatEnv(gym.Env):
         # joint_vel(12), prev_action(12, never noised -- it's what WE commanded),
         # command(3, never noised -- not physically sensed), phase_clock(2, never noised --
         # internally computed), [+ heightmap(9) if enabled], [+ lidar(9) if enabled],
-        # [+ privileged_latency(2), never noised -- ground truth, not physically sensed, if enabled].
-        # NOTE: order must match _get_obs's concatenation exactly.
+        # [+ camera(camera_resolution**2) if enabled], [+ privileged_latency(2), never noised --
+        # ground truth, not physically sensed, if enabled]. NOTE: order must match _get_obs's
+        # concatenation exactly.
         self._obs_noise_std = np.concatenate([
             np.full(3, 0.02), np.full(3, 0.05), np.full(4, 0.01), np.full(12, 0.01),
             np.full(12, 0.05), np.zeros(12), np.zeros(3), np.zeros(2),
         ] + ([np.full(9, 0.01)] if self.use_terrain_heightmap else [])
           + ([np.full(9, 0.03)] if self.use_lidar else [])
+          + ([np.full(camera_resolution ** 2, 0.03)] if self.use_camera else [])
           + ([np.zeros(2)] if self.privileged_latency_obs else [])).astype(np.float32)
 
         action_latency_max = self.action_latency_range[1] if self.action_latency_range else 0
@@ -1168,15 +1211,18 @@ class Go1FlatEnv(gym.Env):
         phase = self._gait_phase()
         phase_clock = np.array([np.sin(2 * np.pi * phase), np.cos(2 * np.pi * phase)], dtype=np.float32)
 
-        # Layout (dim 51, or +9 with use_terrain_heightmap, +9 with use_lidar, +2 with
-        # privileged_latency_obs): gravity(3) + ang_vel(3) + base_quat(4) + joint_pos(12)
-        # + joint_vel(12) + prev_action(12) + command(3) + phase_clock(2)
-        #   [+ heightmap(9)] [+ lidar(9)] [+ privileged_latency(2)]
+        # Layout (dim 51, or +9 with use_terrain_heightmap, +9 with use_lidar,
+        # +camera_resolution**2 with use_camera, +2 with privileged_latency_obs):
+        # gravity(3) + ang_vel(3) + base_quat(4) + joint_pos(12) + joint_vel(12)
+        # + prev_action(12) + command(3) + phase_clock(2)
+        #   [+ heightmap(9)] [+ lidar(9)] [+ camera(camera_resolution**2)] [+ privileged_latency(2)]
         parts = [gravity_vec, ang_vel, quat, joint_pos, joint_vel, self._prev_action, command, phase_clock]
         if self.use_terrain_heightmap:
             parts.append(self._local_heightmap())
         if self.use_lidar:
             parts.append(self._lidar_obs())
+        if self.use_camera:
+            parts.append(self._camera_obs())
         if self.privileged_latency_obs:
             parts.append(self._privileged_latency_obs())
         obs = np.concatenate(parts).astype(np.float32)
@@ -1192,6 +1238,19 @@ class Go1FlatEnv(gym.Env):
         raw = self.data.sensordata[self._lidar_sensor_adr]
         normalized = np.where(raw < 0, 1.0, np.clip(raw, 0.0, self.lidar_max_range) / self.lidar_max_range)
         return normalized.astype(np.float32)
+
+    def _camera_obs(self) -> np.ndarray:
+        """Flattened camera_resolution x camera_resolution depth image from the onboard, forward-
+        and-down-facing depth_cam (see assets/go2_mesh_camera.xml), normalized to [0, 1]: 0 = touching
+        the lens, 1 = at/beyond camera_max_range. MuJoCo's own no-hit sentinel is a large FINITE value
+        (verified empirically: ~200, not inf/nan), so plain clipping handles it correctly with no
+        special case, unlike _lidar_obs's negative-sentinel convention. Real rendering, not an
+        approximation -- responds to terrain/stairs/obstacles the same way an onboard camera
+        genuinely would, same "only sees what it actually could" property as _lidar_obs."""
+        self._camera_renderer.update_scene(self.data, camera="depth_cam")
+        depth = self._camera_renderer.render()
+        normalized = np.clip(depth, 0.0, self.camera_max_range) / self.camera_max_range
+        return normalized.reshape(-1).astype(np.float32)
 
     def _privileged_latency_obs(self) -> np.ndarray:
         """Ground-truth action/observation latency for THIS episode, each normalized to its own
