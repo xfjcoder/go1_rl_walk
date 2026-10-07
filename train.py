@@ -307,6 +307,17 @@ def main():
                     help="Upper end of the command range at the start of the run; ramps linearly to "
                          "--speed-range-max over --speed-curriculum-steps.")
     g.add_argument("--speed-curriculum-steps", type=int, default=8_000_000)
+    g.add_argument("--target-lateral-speed", type=float, default=0.0,
+                    help="Fixed target sideways speed (m/s, body frame, +y = left if "
+                         "--body-frame-velocity). Ignored if --lateral-speed-range-min is set. "
+                         "0.0 (default) = walk straight, matching every run before this flag existed.")
+    g.add_argument("--lateral-speed-range-min", type=float, default=None,
+                    help="Enable per-episode lateral command sampling: target_lateral_speed ~ "
+                         "U(min, max). Needs --lateral-speed-range-max. No curriculum ramp (unlike "
+                         "--speed-range-min) -- sideways speeds are small and don't need one. "
+                         "Default: fixed --target-lateral-speed.")
+    g.add_argument("--lateral-speed-range-max", type=float, default=0.3,
+                    help="Upper end of the sampled lateral command range (m/s).")
 
     # ---- gait clock (prescribed diagonal-trot timing) ----
     g = parser.add_argument_group("gait clock")
@@ -390,6 +401,10 @@ def main():
                          "2-2 diagonal trot rhythm when a stair is tall enough to need a different "
                          "support pattern. 0 = off (always full strength). Only affects stair "
                          "episodes.")
+    g.add_argument("--phase-match-slope-relax", type=float, default=0.0,
+                    help="Degrees: mirrors --phase-match-stair-relax, but keyed on the current "
+                         "episode's slope angle instead of stair height. 0 = off (always full "
+                         "strength regardless of slope).")
     g.add_argument("--static-stability-weight", type=float, default=0.0,
                     help="Reward weight for having MORE than 2 feet down, scaled by how tall the "
                          "current stair is (0 at stair_h=0, full weight at "
@@ -500,6 +515,10 @@ def main():
     g.add_argument("--slope-curriculum-start", type=float, default=0.0,
                     help="Slope angle max at the start of the run (deg); ramps to --slope-max-deg.")
     g.add_argument("--slope-curriculum-steps", type=int, default=10_000_000)
+    g.add_argument("--slope-uphill-prob", type=float, default=0.5,
+                    help="Probability a --slope-max-deg episode samples uphill (vs downhill). 0.5 "
+                         "(default) is the original unbiased 50/50 coin flip. Lower it to oversample "
+                         "downhill for hard-mining, mirroring --stair-ascending-prob.")
     g.add_argument("--ramp-length", type=float, default=8.0,
                     help="Horizontal distance (m) a slope climbs/descends over before leveling into a "
                          "plateau. Longer = gentler effective grade at the same angle.")
@@ -665,9 +684,13 @@ def main():
         air_time_cap=args.air_time_cap,
         command_speed_range=([args.speed_range_min, args.speed_range_max]
                              if args.speed_range_min is not None else None),
+        target_lateral_speed=args.target_lateral_speed,
+        lateral_speed_range=([args.lateral_speed_range_min, args.lateral_speed_range_max]
+                             if args.lateral_speed_range_min is not None else None),
         gait_period_fast=args.gait_period_fast, gait_period_fast_speed=args.gait_period_fast_speed,
         terrain_amplitude_range=([args.terrain_amp_min, args.terrain_amp_max] if args.terrain_amp_max is not None else None),
         slope_range=([args.slope_min_deg, args.slope_max_deg] if args.slope_max_deg is not None else None),
+        slope_uphill_prob=args.slope_uphill_prob,
         ramp_length=args.ramp_length,
         stair_height_range=([args.stair_height_min, args.stair_height_max] if args.stair_height_max is not None else None),
         stair_depth=args.stair_depth, num_stairs=args.num_stairs,
@@ -698,6 +721,7 @@ def main():
         gait_clock_grace_steps=args.gait_clock_grace_steps,
         phase_match_weight=initial_phase_match_weight, air_time_weight=args.air_time_weight,
         phase_match_stair_relax=args.phase_match_stair_relax,
+        phase_match_slope_relax=args.phase_match_slope_relax,
         static_stability_weight=args.static_stability_weight,
         static_stability_ref_height=args.static_stability_ref_height,
         target_air_time=args.target_air_time, kp=args.kp, kd=args.kd,

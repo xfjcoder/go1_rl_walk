@@ -31,6 +31,8 @@ def main():
     ap.add_argument("--stair-height", type=float, default=None, help="evaluate on stairs of this riser height (m, signed: + ascending, - descending)")
     ap.add_argument("--obstacle-height", type=float, default=None, help="evaluate with discrete obstacles of this height (m)")
     ap.add_argument("--target-speed", type=float, default=None, help="fixed command speed (default: the run's)")
+    ap.add_argument("--target-lateral-speed", type=float, default=None,
+                    help="fixed sideways command speed (m/s, body frame, +y = left; default: the run's, else 0.0)")
     ap.add_argument("--seconds", type=float, default=20.0)
     args = ap.parse_args()
 
@@ -41,7 +43,11 @@ def main():
     kw = json.load(open(os.path.join(args.run_dir, "env_kwargs.json")))
     if args.target_speed is not None:
         kw["target_speed"] = args.target_speed
+    if args.target_lateral_speed is not None:
+        kw["target_lateral_speed"] = args.target_lateral_speed
+    kw.setdefault("target_lateral_speed", 0.0)
     kw["command_speed_range"] = None      # fixed command for diagnostics
+    kw["lateral_speed_range"] = None      # ditto for --target-lateral-speed
     kw["terrain_amplitude_range"] = None
     kw["terrain_amplitude"] = args.terrain_amplitude
     kw["slope_range"] = None
@@ -73,7 +79,8 @@ def main():
                                      e.data.sensordata[e._imu_vel_adr:e._imu_vel_adr + 3]))
     T, fx, fz, vb = np.array(touch), np.array(fx), np.array(fz), np.array(vb)
     n = len(T)
-    print(f"command={kw['target_speed']:.2f} m/s  {path}.zip  seed={args.seed}  steps={n}  x={info[0]['base_pos'][0]:+.2f} y={ys[-1]:+.2f} yaw={yaws[-1]:+.1f}deg  "
+    lat_s = "" if kw['target_lateral_speed'] == 0.0 else f" lateral={kw['target_lateral_speed']:+.2f} m/s"
+    print(f"command={kw['target_speed']:.2f} m/s{lat_s}  {path}.zip  seed={args.seed}  steps={n}  x={info[0]['base_pos'][0]:+.2f} y={ys[-1]:+.2f} yaw={yaws[-1]:+.1f}deg  "
           f"body vx={vb[:, 0].mean():+.3f} vy={vb[:, 1].mean():+.3f}")
     print("contact timeline (1 char = 0.02 s, # = on ground), t=10..11.5 s:")
     for k in range(4):

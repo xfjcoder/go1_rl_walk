@@ -1501,6 +1501,202 @@ this experiment (`use_lidar`/`go2_mesh_lidar.xml` already existed); the
 value was the empirical result and the reusable "verify with GIF +
 gait_stats before trusting a 0%-fall-rate stage" discipline.
 
+## Stage 8: sideways and backward walking (Go2, trained from scratch)
+
+Motivation: teach Go2 to walk sideways (strafe) and backward, not just
+forward. The observation's `command` vector already reserved `vy`/`yaw_rate`
+slots (always hardcoded to 0.0); `body_frame_velocity=True` (every adopted
+checkpoint) already rotates `lin_vel` into the body's own forward/left
+frame, exactly what's needed to command "strafe left" or "walk backward"
+meaningfully. Added `target_lateral_speed`/`lateral_speed_range` (new
+command dimension, defaults to 0.0 = old behavior exactly), generalized
+`r_lateral`/`r_lat_track`/the `r_heading` drift term to track a commanded
+lateral velocity instead of unconditionally pulling toward zero, and fixed
+a real bug for backward commands: `vel_error / max(self.target_speed, 0.1)`
+collapsed to `max(negative, 0.1) == 0.1` regardless of magnitude — now
+`max(abs(self.target_speed), 0.1)`. All changes verified backward-
+compatible by direct before/after `gait_stats.py` comparison (byte-
+identical output) against `pretrained/go2_gaitclock`, not just by reading
+the diff.
+
+**First attempt: fine-tune `go2_gaitclock`.** `runs/go2_lateral_backward`
+(8M steps, full speed range extended to -0.4..1.0 m/s, lateral range
+-0.3..0.3 m/s) learned backward and most lateral combinations, but showed
+a severe, direction-specific hole: left-strafe combined with any forward
+speed fell 50-88%, while right-strafe combined with speed was ~0%. A
+dedicated hard-mining pass (`go2_lateral_hardmine`, lateral range skewed
+toward left) made the problem *worse*, not better (72%→81%, 31%→47% at
+the two weakest combos) — a clean negative result.
+
+**Is the asymmetry structural or stochastic?** Measured the *ancestor*
+`go2_gaitclock` policy's own per-leg hip-joint angle bias during plain
+forward walking (no lateral command at all): right legs sit at -0.064 to
+-0.168 rad, left legs at +0.109 to +0.134 rad — a real, pre-existing
+stance-width bias. Also confirmed empirically (direct MuJoCo perturbation
+test, not just reading the XML) that Go2's hip-joint axis convention is
+NOT mirrored between left/right legs — a positive hip command moves every
+foot's y-coordinate the same way in world frame, a genuine property of
+the official Menagerie model, not a bug. Retraining with a different seed
+(`go2_lateral_backward_seed1`) reproduced the identical left-strafe
+failure — at first this looked like it ruled out "stochastic," since both
+runs share the same `go2_gaitclock` ancestor and would inherit the same
+bias regardless of seed. The real test was a **second, independent
+training lineage from scratch** (below): it reproduced the same severity
+of asymmetry but in the **opposite direction** (right-strafe broke, left
+was fine) — conclusive evidence the direction is a stochastic, training-
+path-dependent local optimum, not a fixed structural property of the
+robot. (The fine-tuned lineage's own left-strafe hole was never revisited
+after this; `pretrained/go2_gaitclock` is unchanged and still the
+general-purpose default if lateral/backward capability isn't needed.)
+
+**Training the whole capability from scratch**, to test whether avoiding
+an already-converged forward-only ancestor's entrenched bias helps (it
+partially does, per the lidar experiment's precedent above) — and,
+separately, because the user asked to extend this into a genuinely
+general-purpose checkpoint (terrain + slopes + stairs on top), not just a
+flat-ground proof of concept:
+
+1. **Bootstrap (flat, fixed 0.3 m/s, 0 lateral)** — this stage alone took
+   four attempts. `--seed 0` and `--seed 1`, using the same reward recipe
+   as every other Go2 bootstrap (`trot-weight 0.15`, `foot-duty-weight
+   0.3`, `phase-match-weight 0` off), both produced a genuinely broken
+   gait: one leg at 0 steps/s, 0% duty, permanently airborne for the
+   entire measurement window — caught by `gait_stats.py`, not the fall-
+   rate metric (the robot balances fine on 3 legs). Root cause: `train.py`
+   docstring's own `--trot-weight` warning says plainly "a heavier weight
+   ... was gamed into a hobble on a single diagonal pair ... the working
+   recipe uses `--phase-match-weight` for gait timing and leaves this at
+   0" — exactly the combination used here, just inverted (phase_match off,
+   trot_weight on, the combination explicitly warned against). Switching
+   to `phase_match_weight=0.5` (seed 2) fixed the dead leg but left a
+   visible, real postural defect the user caught by eye: nose-down,
+   hindquarters-up, front feet duty 0.76-0.84 vs rear feet 0.39-0.52 (one
+   leg visibly dragging). Tightening `foot_duty_weight` to 0.6 and the
+   duty-cycle band to [0.3, 0.65] (narrower, centered on the symmetric 0.5
+   trot) fixed this too — confirmed both numerically (spread 1.78→1.17)
+   and visually (level trunk posture across every sampled frame).
+2. **Open the full speed (-0.4..1.0 m/s) and lateral (-0.3..0.3 m/s) range
+   jointly** (`go2_latback_scratch_speedcurr2`/`3`, 24M steps total) —
+   the reward curve was still visibly climbing (187→930) at the end of
+   the first 12M-step pass, so it was extended rather than judged
+   prematurely; the second 12M-step pass climbed from 707 to ~2000 before
+   leveling off. Early in this stage, commands other than forward
+   produced a literal "freeze in place" degenerate solution (one foot
+   stuck fully airborne, near-zero velocity tracking, but technically not
+   falling) — an under-training symptom that resolved with the extra
+   steps, not a dead end.
+3. **Hard-mine the weak corner** — here a second, previously-undocumented
+   measurement bug surfaced and cost real time: `--terrain-amplitude 0`
+   (passed to force a single-amplitude eval grid) silently enables a
+   MuJoCo *heightfield* geom at zero amplitude, a different collision
+   model than the true flat *plane* (`terrain_amplitude=None`) that
+   `gait_stats.py`/`play.py` use by default. For a checkpoint never
+   trained with terrain enabled, this is a genuine out-of-distribution
+   surface, not an equivalent "flat ground." It produced a large false
+   "right-strafe regressed to 84-100%" reading that reversed completely
+   (to 0%) once re-measured on the true plane — confirmed by a direct,
+   controlled A/B (identical model, identical seeds, only the terrain
+   flag changed). Re-running hard-mining with this fixed, two short
+   (8-12M step) passes — one skewed toward right-strafe, one toward left,
+   plus a final balanced consolidation pass — reached **0% falls across
+   all 12 forward x lateral combinations on true flat ground**
+   (`go2_latback_scratch_consolidate`), confirmed by `gait_stats.py`
+   (step-rate spread 1.00-2.22, every foot participating normally) and
+   GIF.
+
+<p align="center">
+  <img src="media/go2_scratch_consolidate_fwd08_rightstrafe03.gif" width="500" alt="Go2 from-scratch checkpoint walking forward and strafing simultaneously on flat ground">
+</p>
+
+*`go2_latback_scratch_consolidate`, 0.8 m/s forward + right-strafe simultaneously — the combo that was 100% falls earlier in hard-mining, now clean.*
+
+4. **Terrain** (0-12cm heightfield, `go2_latback_scratch_terrain`, then
+   `_terrhardmine` narrowed to 6-12cm): broad improvement across nearly
+   every combined speed+lateral combo on rough terrain (e.g. 4cm
+   0.3fwd+left 56%→0%, 8cm 0.3fwd+right 81%→44%), one narrow corner
+   (max speed + right-strafe + 8-12cm terrain) stayed stuck at 100% and
+   was accepted as a known limit at the time — but see the final combined
+   numbers below, where it later improved anyway as a side effect of the
+   slopes/stairs stages.
+5. **Slopes** (0-20°, `go2_latback_scratch_slopes`) revealed a severe,
+   broad downhill-specific failure: at -20°, even *pure forward* walking
+   (no lateral command at all) fell 100% of the time. A dedicated
+   downhill-biased hard-mining pass required a new mechanism first —
+   `uphill = bool(self._rng.integers(0, 2))` was a hardcoded, unbiasable
+   50/50 coin flip (exactly the same limitation `stair_ascending_prob` was
+   added to fix for stairs, years earlier in this project) — so added
+   `slope_uphill_prob` (default 0.5, verified backward-compatible),
+   mirroring `stair_ascending_prob` exactly. The resulting hard-mining
+   pass made **no measurable improvement at all** (flat, noisy reward
+   curve the whole 8M steps, unlike the clearly-still-climbing lateral
+   case) — a genuinely different, stuck failure mode. Traced to a second,
+   more specific cause: `phase_match_weight`'s rigid 2-2 diagonal-trot
+   timing constraint has a documented precedent for conflicting with
+   terrain that needs adaptive footwork (`phase_match_stair_relax` exists
+   for exactly this reason, for stairs) — but **no equivalent relax
+   existed for slopes**, so the constraint stayed at full strength
+   through the steepest, most footwork-demanding downhill episodes. Added
+   `phase_match_slope_relax` (mirrors `phase_match_stair_relax`, keyed on
+   `abs(slope_deg)` instead of stair height, combines multiplicatively if
+   both are set, default 0.0 = old behavior, verified backward-compatible
+   by the same before/after `gait_stats.py` comparison). This meaningfully
+   fixed most of the -10° degradation and several combined-command cases
+   at -20°, but **not** the core problem: descending -20° at real forward
+   speed stayed at or near 100% fail. Accepted as a known limit — even the
+   original fine-tuned lineage's own `go2_slopes` never fully solved this
+   either (12% falls at -20°/0.3 m/s was its own accepted soft spot, not
+   0%).
+6. **Stairs** (0-12cm risers, `go2_latback_scratch_stairs`, then
+   `_gaitclock` biased toward descending): the exact same pattern as
+   Stage 7's own motivation for the event-driven gait clock recurred here
+   — ascending was excellent (0-31% fail) but descending was severely
+   broken (44-100%, worse at -12cm), especially combined with any forward
+   speed. Added `gait_clock_wait_for_contact`/`gait_clock_grace_steps=12`
+   (the exact proven Stage 7 mechanism, never previously used in this
+   from-scratch lineage) with a hard-mining pass biased toward descending
+   (`stair_ascending_prob=0.15`, mirroring `go2_stairs_hardmine`). Result:
+   -6cm fixed cleanly (56%→0%, 44%→0% at the two weakest pure-forward
+   combos), but **-12cm stayed stuck** (reward curve plateaued at 500-615
+   for the second half of the 8M-step run, the same "genuinely stuck, not
+   slow" signature as the slopes case) — accepted as a known limit,
+   mirroring the project's own long, never-fully-solved descending-stairs
+   history.
+
+**Final results** (`go2_latback_scratch_stairs_gaitclock`, the complete
+checkpoint — flat lateral/backward + terrain + slopes + stairs all
+trained in): re-measuring terrain and slopes on this final checkpoint
+(not just the intermediate hard-mining checkpoints each limit was found
+on) showed the later stages' extra training *further improved* both,
+not just avoided regressing them — e.g. terrain's previously-stuck 12cm
++0.8fwd+right-strafe corner (100% at the terrain-hardmining stage) fell
+to 31% here, and slope's -20°/0.8fwd pure-forward corner (100% at the
+slope-relax stage) fell to 88%. Pure forward walking is robust across
+nearly the entire difficulty range on every axis (0-6% fail up to 8cm
+terrain / -10° slope / -6cm stairs, only breaking down at the single most
+extreme setting on each axis); combined forward-or-backward + lateral
+commands are fragile at more moderate difficulty than that, in specific
+direction-dependent combinations, not a general degradation.
+
+**Known limits, accepted (not solved further):**
+- Descending -20° slope combined with real forward speed (pure forward:
+  25% at 0.3 m/s, 88% at 0.8 m/s; worse combined with lateral).
+- Descending -12cm stairs combined with real forward speed (100% at both
+  0.3 and 0.8 m/s, pure forward or combined with lateral).
+
+**New reusable code, all default-off / exactly backward-compatible**
+(each verified by direct before/after `gait_stats.py` byte-identical
+comparison against a pre-existing checkpoint, not just by reading the
+diff): `target_lateral_speed`/`lateral_speed_range` (env + `train.py` +
+`play.py`/`eval_policy.py`/`gait_stats.py` override flags),
+`slope_uphill_prob`, `phase_match_slope_relax`.
+
+**DECISION: pending user review of this writeup** — not yet promoted to
+`pretrained/`. `pretrained/go2_gaitclock` remains the default
+general-purpose Go2 checkpoint (forward-only); `runs/
+go2_latback_scratch_stairs_gaitclock` is the complete
+lateral+backward+terrain+slopes+stairs checkpoint from this stage,
+staying as a `runs/` experiment pending an explicit adopt decision.
+
 ## Next stages
 
 Terrain-aware observation and a non-trot gait mode were both tried already

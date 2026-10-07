@@ -123,6 +123,9 @@ class Go1FlatEnv(gym.Env):
                                                # episode) over ramp_length, then a flat plateau. Sampled
                                                # like terrain_amplitude_range (U(lo, slope_deg_max_current)).
         slope_deg: float | None = None,        # fixed slope (deg, signed: + uphill, - downhill) -- for evaluation
+        slope_uphill_prob: float = 0.5,        # probability a slope_range episode samples uphill (vs downhill).
+                                               # 0.5 (default) is the original unbiased 50/50 coin flip, unchanged.
+                                               # Lower it to oversample downhill, mirroring stair_ascending_prob.
         ramp_length: float = DEFAULT_RAMP_LENGTH,  # metres of horizontal run to reach the target slope height
         stair_height_range: tuple | None = None,  # (lo, hi) metres: enable stairs -- flat pad, then num_stairs
                                                # steps of stair_depth tread x this riser height (random direction
@@ -166,6 +169,15 @@ class Go1FlatEnv(gym.Env):
                                                # 0 = off (phase_match_weight always full strength, old
                                                # behavior). Only affects stair episodes; 0 on flat/bump/
                                                # slope/obstacle-only episodes regardless of this setting.
+        phase_match_slope_relax: float = 0.0,  # degrees: mirrors phase_match_stair_relax above, but keyed
+                                               # on the current episode's |slope_deg| instead of stair
+                                               # height -- a steep slope (esp. downhill) can likewise need
+                                               # footwork that breaks the rigid 2-2 diagonal trot rhythm
+                                               # (e.g. a held/delayed step to arrest a slide) that a fixed
+                                               # phase_match_weight forbids. 0 = off (old behavior, full
+                                               # strength regardless of slope). Combines multiplicatively
+                                               # with phase_match_stair_relax if both are set (either
+                                               # condition alone justifies relaxing).
         static_stability_weight: float = 0.0,  # reward weight for having MORE than 2 feet down
                                                # (n_contacts-2, so +1 for 3 feet, +2 for 4), scaled by
                                                # how tall the current stair is (0 at stair_h=0, full
@@ -260,6 +272,19 @@ class Go1FlatEnv(gym.Env):
                                                # if body_frame_velocity). Fixes crabbing: h_clock drifted 4.6 cm/s
                                                # sideways while heading stayed straight.
         lateral_tracking_sigma: float = 0.1,
+        target_lateral_speed: float = 0.0,     # m/s, sideways walking speed to track (body frame,
+                                               # +y = left if body_frame_velocity, else world +y).
+                                               # 0.0 (default) matches every run before this flag
+                                               # existed exactly: the command's vy slot was hardcoded
+                                               # to 0.0 and r_lateral/r_lat_track/r_heading's drift
+                                               # term all unconditionally pulled lin_vel[1]/y_pos
+                                               # toward zero, which is exactly what a 0.0 target
+                                               # reward term still does below.
+        lateral_speed_range: tuple | None = None,  # (lo, hi): sample target_lateral_speed ~ U(lo, hi)
+                                               # every reset, independent of command_speed_range's
+                                               # curriculum ramp (no ramp here -- lateral speeds are
+                                               # small and don't need one). None (default) = fixed
+                                               # target_lateral_speed above.
         air_time_cap: bool = False,            # cap the touchdown air-time credit at target_air_time
                                                # (credit = min(air, target) - target <= 0). Uncapped, one long
                                                # 457 ms lift of a single leg out-earned several normal steps
@@ -479,6 +504,7 @@ class Go1FlatEnv(gym.Env):
         self.terrain_amp_max_current = self.terrain_amplitude_range[1] if self.terrain_amplitude_range else None
         self.slope_range = tuple(slope_range) if slope_range else None
         self.slope_deg = slope_deg
+        self.slope_uphill_prob = slope_uphill_prob
         self.slope_deg_max_current = self.slope_range[1] if self.slope_range else None
         self.ramp_length = ramp_length
         self.stair_height_range = tuple(stair_height_range) if stair_height_range else None
@@ -522,6 +548,8 @@ class Go1FlatEnv(gym.Env):
         self.gait_period_fast_speed = gait_period_fast_speed
         self.lateral_tracking_weight = lateral_tracking_weight
         self.lateral_tracking_sigma = lateral_tracking_sigma
+        self.target_lateral_speed = target_lateral_speed
+        self.lateral_speed_range = tuple(lateral_speed_range) if lateral_speed_range else None
         self._episode_gait_period = gait_period
         self.lateral_position_weight = lateral_position_weight
         self.max_foot_duty_cycle = max_foot_duty_cycle
@@ -531,6 +559,7 @@ class Go1FlatEnv(gym.Env):
         self.gait_period = gait_period
         self.phase_match_weight = phase_match_weight
         self.phase_match_stair_relax = phase_match_stair_relax
+        self.phase_match_slope_relax = phase_match_slope_relax
         self.static_stability_weight = static_stability_weight
         self.static_stability_ref_height = static_stability_ref_height
         self._episode_stair_h = 0.0
@@ -693,6 +722,8 @@ class Go1FlatEnv(gym.Env):
         if self.command_speed_range is not None:
             lo = self.command_speed_range[0]
             self.target_speed = float(self._rng.uniform(lo, max(self.speed_max_current, lo)))
+        if self.lateral_speed_range is not None:
+            self.target_lateral_speed = float(self._rng.uniform(*self.lateral_speed_range))
         stair_h = 0.0   # overwritten below if stairs are enabled; needed here for the gait-period stretch
 
         if self.mass_scale_range is not None:
@@ -741,7 +772,7 @@ class Go1FlatEnv(gym.Env):
             elif self.slope_range is not None:
                 slope_deg = float(self._rng.uniform(self.slope_range[0],
                                                     max(self.slope_deg_max_current, self.slope_range[0])))
-                uphill = bool(self._rng.integers(0, 2))
+                uphill = bool(self._rng.uniform() < self.slope_uphill_prob)
             else:
                 slope_deg, uphill = 0.0, True
             if self.stair_height is not None:
@@ -761,11 +792,11 @@ class Go1FlatEnv(gym.Env):
                 obstacle_h = 0.0
             self._generate_terrain(amp, slope_deg, uphill, stair_h, ascending, obstacle_h)
             self._episode_stair_h = stair_h
-            if self.phase_match_stair_relax > 1e-6:
-                relax_frac = float(np.clip(1.0 - stair_h / self.phase_match_stair_relax, 0.0, 1.0))
-                self._episode_phase_match_weight = self.phase_match_weight * relax_frac
-            else:
-                self._episode_phase_match_weight = self.phase_match_weight
+            stair_relax_frac = (float(np.clip(1.0 - stair_h / self.phase_match_stair_relax, 0.0, 1.0))
+                                 if self.phase_match_stair_relax > 1e-6 else 1.0)
+            slope_relax_frac = (float(np.clip(1.0 - slope_deg / self.phase_match_slope_relax, 0.0, 1.0))
+                                 if self.phase_match_slope_relax > 1e-6 else 1.0)
+            self._episode_phase_match_weight = self.phase_match_weight * stair_relax_frac * slope_relax_frac
             if self.velocity_smoothness_stair_relax > 1e-6:
                 vs_relax_frac = float(np.clip(1.0 - stair_h / self.velocity_smoothness_stair_relax, 0.0, 1.0))
                 self._episode_velocity_smoothness_weight = self.velocity_smoothness_weight * vs_relax_frac
@@ -811,6 +842,10 @@ class Go1FlatEnv(gym.Env):
                 mujoco.mj_forward(self.model, self.data)
         self._prev_action[:] = 0.0
         self._prev_lin_vel_x = 0.0  # true at reset -- the stand keyframe has zero velocity
+        self._lateral_ref_pos = 0.0  # moving reference for r_heading's y-drift term, accumulated
+                                      # by target_lateral_speed each step; starts at the keyframe's
+                                      # y=0, so at target_lateral_speed=0 it stays 0 forever --
+                                      # exactly reproducing the old "drift from the start line" term
         self._step_count = 0
         self._phase = 0.0
         self._stance_wait[:] = 0.0
@@ -1040,6 +1075,9 @@ class Go1FlatEnv(gym.Env):
                 + h[r0 + 1, c0] * (1 - wx) * wy + h[r0 + 1, c0 + 1] * wx * wy)
 
     def _period_for_speed(self, speed: float, stair_h: float = 0.0) -> float:
+        speed = abs(speed)  # backward (negative) commands should speed up the clock exactly like
+                             # forward ones of the same magnitude -- a no-op for every pre-existing
+                             # (non-negative) speed, so this is exactly backward-compatible.
         if self.gait_period_fast is None:
             period = self.gait_period
         else:
@@ -1057,6 +1095,7 @@ class Go1FlatEnv(gym.Env):
         """Same interpolation as _period_for_speed, applied to gait_duty instead: slow commands
         keep gait_duty (the safe default, 0.5 = no flight window), fast commands narrow toward
         gait_duty_fast. None (default) means duty is gait_duty at every speed, unconditionally."""
+        speed = abs(speed)  # see _period_for_speed: backward commands treated like forward ones
         if self.gait_duty_fast is None:
             return self.gait_duty
         f = float(np.clip((speed - 0.3) / (self.gait_period_fast_speed - 0.3), 0.0, 1.0))
@@ -1124,7 +1163,7 @@ class Go1FlatEnv(gym.Env):
         joint_pos = self.data.qpos[self._joint_qpos_adr] - DEFAULT_JOINT_POS
         joint_vel = self.data.qvel[self._joint_qvel_adr]
 
-        command = np.array([self.target_speed, 0.0, 0.0], dtype=np.float32)  # vx, vy, yaw_rate
+        command = np.array([self.target_speed, self.target_lateral_speed, 0.0], dtype=np.float32)  # vx, vy, yaw_rate
 
         phase = self._gait_phase()
         phase_clock = np.array([np.sin(2 * np.pi * phase), np.cos(2 * np.pi * phase)], dtype=np.float32)
@@ -1183,7 +1222,11 @@ class Go1FlatEnv(gym.Env):
         # to the same relative degree (~0.135) regardless of target_speed.
         lin_vel = self._quat_rotate_inv(quat, lin_vel_world) if self.body_frame_velocity else lin_vel_world
         vel_error = self.target_speed - lin_vel[0]
-        normalized_error = vel_error / max(self.target_speed, 0.1)
+        # abs() here (not just target_speed) so a BACKWARD command (negative target_speed) gets the
+        # same relative normalization as a forward one of equal magnitude, instead of always
+        # collapsing to max(negative, 0.1) == 0.1 regardless of how fast backward was actually asked
+        # for. A no-op for every pre-existing (non-negative) target_speed.
+        normalized_error = vel_error / max(abs(self.target_speed), 0.1)
         r_velocity = np.exp(-2.0 * normalized_error ** 2)
 
         # 1b. Penalize frame-to-frame forward-velocity JERK directly (not just action-rate,
@@ -1200,10 +1243,14 @@ class Go1FlatEnv(gym.Env):
         r_velocity_smoothness = -self._episode_velocity_smoothness_weight * (lin_vel[0] - self._prev_lin_vel_x) ** 2
         self._prev_lin_vel_x = lin_vel[0]
 
-        # 2. Penalize lateral / vertical VELOCITY drift
-        r_lateral = -0.5 * (lin_vel[1] ** 2 + lin_vel[2] ** 2)
+        # 2. Penalize lateral / vertical VELOCITY drift -- or, if target_lateral_speed != 0 (sideways
+        # walking command), drift away from THAT target instead of zero. lat_vel_err reduces to
+        # lin_vel[1] exactly when target_lateral_speed is 0 (the default), so both terms below are
+        # exactly backward-compatible.
+        lat_vel_err = lin_vel[1] - self.target_lateral_speed
+        r_lateral = -0.5 * (lat_vel_err ** 2 + lin_vel[2] ** 2)
         r_yaw_rate = -self.yaw_rate_weight * ang_vel[2] ** 2
-        r_lat_track = self.lateral_tracking_weight * float(np.exp(-(lin_vel[1] / self.lateral_tracking_sigma) ** 2))
+        r_lat_track = self.lateral_tracking_weight * float(np.exp(-(lat_vel_err / self.lateral_tracking_sigma) ** 2))
 
         # 2b. Penalize lateral / heading POSITION drift directly. The velocity term
         # above only discourages instantaneous sideways speed -- a small, constant
@@ -1216,7 +1263,15 @@ class Go1FlatEnv(gym.Env):
         y_pos = self.data.qpos[1]
         qw, qx, qy, qz = quat
         yaw = np.arctan2(2 * (qw * qz + qx * qy), 1 - 2 * (qy ** 2 + qz ** 2))
-        r_heading = -self.heading_weight * (yaw ** 2) - self.lateral_position_weight * (y_pos ** 2)
+        # lateral_err is measured against a MOVING reference line (self._lateral_ref_pos), which
+        # accumulates target_lateral_speed each step starting from the reset y=0. At
+        # target_lateral_speed=0 (default) the reference never moves, so lateral_err reduces to
+        # the plain y_pos used before -- exactly backward-compatible. With a nonzero sideways
+        # command this instead penalizes falling behind/ahead of the commanded strafe, not the
+        # strafe itself.
+        lateral_err = y_pos - self._lateral_ref_pos
+        r_heading = -self.heading_weight * (yaw ** 2) - self.lateral_position_weight * (lateral_err ** 2)
+        self._lateral_ref_pos += self.target_lateral_speed / self.control_hz
 
         # 3. Penalize roll/pitch (staying upright): gravity_vec should be ~[0,0,-1].
         # NOTE: this term is blind to yaw -- pure yaw rotation doesn't change the
