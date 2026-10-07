@@ -1690,12 +1690,22 @@ diff): `target_lateral_speed`/`lateral_speed_range` (env + `train.py` +
 `play.py`/`eval_policy.py`/`gait_stats.py` override flags),
 `slope_uphill_prob`, `phase_match_slope_relax`.
 
-**DECISION: pending user review of this writeup** — not yet promoted to
-`pretrained/`. `pretrained/go2_gaitclock` remains the default
-general-purpose Go2 checkpoint (forward-only); `runs/
-go2_latback_scratch_stairs_gaitclock` is the complete
-lateral+backward+terrain+slopes+stairs checkpoint from this stage,
-staying as a `runs/` experiment pending an explicit adopt decision.
+**DECISION: adopted.** Promoted (from `runs/go2_latback_scratch_stairs_gaitclock`)
+to `pretrained/go2_latback/`, alongside (not replacing) `pretrained/go2_gaitclock`
+— the two are genuine specializations, not a strict improvement either way:
+`go2_gaitclock` is forward-only but has more fine-tuning behind its
+terrain/slopes/stairs handling (never regressed for lateral/backward
+capability it doesn't have), while `go2_latback` adds sideways and backward
+walking at the cost of the two accepted known limits above (-20° downhill
+slope, -12cm descending stairs, both at real forward speed) that
+`go2_gaitclock`'s own equivalent corners handle somewhat better. Use
+`go2_latback` when sideways/backward capability is needed; `go2_gaitclock`
+otherwise.
+
+```bash
+python play.py --run-dir pretrained/go2_latback --target-speed 0.0 --target-lateral-speed 0.3 --record out.gif
+python eval_policy.py --run-dir pretrained/go2_latback --episodes 16 --target-speed -0.3 0 0.3 0.8 --target-lateral-speed -0.3 0 0.3
+```
 
 ## Next stages
 
