@@ -50,9 +50,21 @@ class CameraMlpExtractor(BaseFeaturesExtractor):
     image keys, passthrough for the rest) without needing a Dict observation space.
 
     Only used when --use-camera is set (see train.py's policy_kwargs wiring below); the default
-    MlpPolicy/FlattenExtractor (plain passthrough) is used otherwise, completely unchanged."""
+    MlpPolicy/FlattenExtractor (plain passthrough) is used otherwise, completely unchanged.
 
-    def __init__(self, observation_space, proprio_dim: int, camera_resolution: int, cnn_features_dim: int = 128):
+    cnn_features_dim default lowered 128->32 after a real regression: the first bootstrap attempt
+    at 128 reproduced the exact front-heavy/nose-down posture bug from this project's earlier
+    (non-camera) lateral/backward bootstrap work, DESPITE using the identical reward-shaping fix
+    (foot_duty_weight=0.6, a narrowed duty-cycle band) that resolved it there -- and unlike that
+    earlier bug, a different training seed alone did NOT fix it here (confirmed across 3 seeds,
+    one showing an even more extreme version: front-foot duty 0.87-0.92, rear 0.21). Hypothesis:
+    at 128, the CNN branch dominates the combined feature vector width (128 vs proprio_dim's 51,
+    i.e. 71% of what the policy/value MLP heads see), making it harder for them to weight the
+    comparatively narrow proprioceptive signal (like duty-cycle balance) as strongly as they did
+    in the non-camera case, even with an identical reward penalty. Not yet confirmed by a
+    follow-up training run -- if this doesn't fix it either, reconsider."""
+
+    def __init__(self, observation_space, proprio_dim: int, camera_resolution: int, cnn_features_dim: int = 32):
         total_dim = int(np.prod(observation_space.shape))
         expected_dim = proprio_dim + camera_resolution ** 2
         if total_dim != expected_dim:
