@@ -972,6 +972,17 @@ class Go1FlatEnv(gym.Env):
                 "yaw": float(np.arctan2(2 * (qw * qz + qx * qy), 1 - 2 * (qy ** 2 + qz ** 2)))}
         return obs, reward, terminated, truncated, info
 
+    def set_command(self, target_speed: float, target_lateral_speed: float = 0.0) -> None:
+        """Overwrite the commanded forward/lateral velocity directly, bypassing reset()'s own
+        per-episode randomization (command_speed_range/lateral_speed_range). Call between step()s
+        to drive the policy with a time-varying command instead of one fixed per episode -- e.g.
+        navigate.py recomputes these every control step from the current vector to a goal. A thin
+        convenience setter over the exact two attributes _get_obs()/_compute_reward() already read
+        each step, bundled into one call so a SubprocVecEnv-wrapped env only needs one env_method
+        round trip per step instead of two separate set_attr calls."""
+        self.target_speed = float(target_speed)
+        self.target_lateral_speed = float(target_lateral_speed)
+
     def render(self, camera: str | None = None):
         if self.render_mode == "rgb_array":
             renderer = mujoco.Renderer(self.model, height=480, width=640)

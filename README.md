@@ -96,6 +96,12 @@ failure and fix, in [HISTORY.md](HISTORY.md)):
    information content at this configuration may not be meaningfully
    richer than lidar's sparse rays for that specific problem. Not adopted,
    infrastructure kept for a possible better-scoped retry.
+10. **Point-to-goal navigation** (Go2) — a new direction on top of walking:
+    drive `go2_latback` toward an arbitrary world-frame goal with a thin
+    proportional outer loop and **zero retraining**, exploiting the fact
+    that the walking reward already holds heading fixed. 94-100% success,
+    0% falls across flat and rough terrain (32 randomized goals each);
+    obstacle avoidance and real turning are scoped as possible follow-ups.
 
 ## Repository layout
 
@@ -110,6 +116,8 @@ go1_rl_walk/
 ├── eval_policy.py          # Randomized multi-episode eval: fall rate, speed, drift
 ├── gait_stats.py           # Per-foot diagnostics: step rate, duty, swing height
 ├── play.py                 # Load a checkpoint (--run-dir) and watch it walk
+├── navigate.py             # Drive a checkpoint toward a world-frame (x, y) goal, no retraining
+├── eval_navigate.py        # Randomized multi-episode nav eval: success rate, time-to-goal, path efficiency
 ├── distill_student.py      # Behavior-cloning distillation (teacher -> latency-robust student)
 ├── expand_obs_checkpoint.py # Warm-start a larger-observation policy from a smaller one
 ├── smoke_test.py           # Sanity-check the model with no RL deps; also runs the crawl gait

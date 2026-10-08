@@ -1630,6 +1630,102 @@ compatible) as reusable infrastructure if camera-based perception is revisited l
 possibly with a steeper camera tilt or closer mounting to better resolve near-field stair
 structure, which was not tried.
 
+## Stage 10a: point-to-goal navigation (Go2) — zero retraining needed
+
+A new project direction on top of the walking work: not "walk when told which way" but "walk to
+a point." Branch/worktree unchanged (`stage7-lidar`). Before writing any navigation logic, the
+key enabling fact was checked directly in `envs/go1_env.py`, not assumed: `r_heading` penalizes
+absolute world yaw squared (not yaw relative to an arbitrary start pose), so a converged policy
+holds its heading near world-+x throughout an episode regardless of what forward/lateral speed
+is commanded. That means world frame stays close enough to body frame that a goal vector can be
+fed almost directly into the existing command, using `pretrained/go2_latback` (already trained
+to walk forward, backward, and sideways simultaneously) completely unmodified — **no fine-tuning,
+no new mechanism**, just a thin outer loop recomputing the command every control step.
+
+**Added two small, reusable, zero-risk pieces of infrastructure:**
+- `Go1FlatEnv.set_command(target_speed, target_lateral_speed)` (envs/go1_env.py) — a convenience
+  setter over the exact two attributes `_get_obs()`/`_compute_reward()` already read each step,
+  bundled into one call so a `SubprocVecEnv`-wrapped env only needs one `env_method` round trip
+  per control step instead of two separate `set_attr` calls. Purely additive (a new method, calls
+  nothing else), so there's nothing to verify for backward-compatibility — no existing code path
+  changed.
+- `navigate.py` (single/demo run, mirrors `play.py`'s structure) and `eval_navigate.py`
+  (randomized multi-episode harness, mirrors `eval_policy.py`'s `SubprocVecEnv` pattern) — a
+  proportional controller: each control step, compute the vector to the goal in world frame,
+  rotate it into the robot's current frame using its own measured yaw (so a residual heading
+  error doesn't silently bias the command — not assumed to be exactly zero, read back from
+  `info["yaw"]` each step), clip each axis to the checkpoint's own trained command range, command
+  zero and stop once within `--tolerance`.
+- A real, worth-noting subtlety caught before it corrupted the eval numbers: `reset()` resamples
+  `target_speed`/`target_lateral_speed` itself whenever `command_speed_range`/`lateral_speed_range`
+  are non-`None`, and that resample happens *inside* the `obs` that `reset()` returns — one step
+  before an external controller's own override ever takes effect. `eval_navigate.py` explicitly
+  blanks both ranges (and zeroes both targets) in `env_kwargs` before construction, exactly
+  mirroring `navigate.py`'s and `play.py`'s own established convention, with an assertion guarding
+  against silently reintroducing this. Also: `max_episode_seconds` defaults to 20s and isn't saved
+  in a run's `env_kwargs.json` — both new scripts explicitly set it to match their own `--seconds`
+  budget, otherwise a distant goal would silently get truncated by the env's own unrelated default
+  before the navigation controller's time budget ran out.
+
+**A real bug in `navigate.py` (the demo script only, NOT `eval_navigate.py`), found by the user
+watching the first two demo GIFs: "the dog walk on the spot, then walk left and forward."**
+`navigate.py`'s stop condition re-stamped `t_reached = step / 50.0` on EVERY step the robot
+stayed within `--tolerance` of the goal, not just the first — so once it arrived and lingered
+nearby (distance oscillating under the tolerance band rather than exactly zero), the "stop 1s
+after reaching" check compared the current step against itself every time and never fired,
+running the full time budget with the robot standing in place for the remainder. The two first
+demo GIFs (goal reached in reality around 7s) consequently showed 8 extra seconds of idling and
+printed the wrong "reached in 15.0s"/"12.0s". Fixed by latching `t_reached` only the first time
+(`if not reached: reached, t_reached = True, step / 50.0`); both GIFs below are the corrected,
+re-recorded versions (actual reach times 7.0s and 6.9s). **`eval_navigate.py` never had this bug**
+— its own time-to-goal measurement (`if reached_now[i] and res[i] is None: ...`) already guarded
+against re-latching, so the quantitative table below is unaffected and was not re-run.
+
+**Result: randomized multi-episode evaluation (32 episodes, goal distance 1.5-4m, bearing 0-360deg
+so backward/lateral-only goals are included, `pretrained/go2_latback`, no fine-tuning) —**
+
+| terrain | success rate | fall rate | time to goal (mean) | path efficiency (mean) |
+|---|---|---|---|---|
+| flat | 100% | 0% | 9.6s | 0.65 |
+| 8cm rough | 100% | 0% | 9.8s | 0.64 |
+| 12cm rough | 94% | 0% | 10.3s | 0.63 |
+
+Zero falls at every setting. The two 12cm-terrain non-reaches were timeouts (25s budget), not
+falls — not yet root-caused (an unlucky bearing/distance draw, or a mid-course random push
+needing recovery time, are both plausible; `push_velocity` is active in this checkpoint's env
+regardless of `domain_randomize`, confirmed directly in `envs/go1_env.py`'s `reset()`, not a new
+mechanism added for this). Path efficiency (straight-line distance / actual distance walked)
+sitting around 0.63-0.65 rather than close to 1.0 is an expected property of this simple
+proportional law — it has no path-planning concept, each axis's command is clipped to a different
+range (forward -0.4..1.0 m/s, lateral -0.3..0.3 m/s), so the forward error typically resolves
+faster than the lateral one, producing a visibly curved rather than straight-line path — not a
+bug, just the cost of the zero-retraining approach's simplicity.
+
+<p align="center">
+  <img src="media/go2_navigate_diagonal_fwd3_left1.5.gif" width="320" alt="Go2 navigating diagonally to a forward+left goal, no turning">
+  <img src="media/go2_navigate_backward_2m.gif" width="320" alt="Go2 navigating to a goal 2m behind it, walking backward the whole way">
+</p>
+
+*Left: navigating to a goal 3m forward + 1.5m left, walking diagonally the entire way (forward and
+lateral commands blended continuously, not sequenced). Right: navigating to a goal 2m directly
+behind the start, walking backward the whole way without ever turning around — visually confirmed
+the heading stays fixed throughout (same side of the trunk faces the camera in both the first and
+last frame).*
+
+**Deliberately out of scope for this first increment** (full roadmap in memory / proposed to the
+user before starting): slopes and stairs were not tested here at all — the heightfield ramps/risers
+run as a ridge along world-y (a function of x only), so a goal that requires crossing one at an
+angle (rather than straight-on, which is all every prior stage ever tested) is a genuinely untested
+case, not assumed to work. Static obstacle avoidance (10b) and a real turning capability (10c, so
+the robot could face a slope/stair before crossing it instead of only ever approaching straight-on)
+are both scoped as possible follow-ups, deliberately not started until these numbers were in.
+
+**DECISION: Stage 10a adopted as-is.** `navigate.py`/`eval_navigate.py`/`set_command` committed;
+no existing checkpoint or script behavior changed (both new scripts are pure additions). Given the
+clean, consistent 94-100%-success/0%-fall result across the whole tested range, 10b (obstacle
+avoidance) is the natural next increment rather than 10c (turning) — nothing in these numbers
+suggests the strafe-only approach is the bottleneck.
+
 ## Next stages
 
 Terrain-aware observation and a non-trot gait mode were both tried already
