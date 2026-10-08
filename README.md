@@ -1781,27 +1781,34 @@ answered that more cheaply than another multi-hour training run would have:
   <img src="media/go2_camera_view_demo_stairs_desc12cm.gif" width="640" alt="External view (left) vs. what the onboard depth camera actually sees (right), teleported down a descending 12cm staircase">
 </p>
 
-*Left: external view, teleported down the staircase (bypassing the controller -- this just shows
-what the sensor perceives at a sequence of positions, not a walking demonstration). Right: the
-onboard depth camera's own view at each position, normalized/colorized (white = far, black =
-near).*
+*Left: external view, teleported down the staircase (bypassing the controller -- the trained
+checkpoint never learned to attempt this terrain at all, confirmed separately: placed right at
+the first riser's edge and left running, it simply stands still rather than falling or
+proceeding, the same frozen out-of-distribution response seen elsewhere in this project, not
+fear of an imminent drop). Right: the onboard depth camera's own view at each position,
+normalized/colorized (white = far, black = near).*
 
-**The depth view shows a smooth, essentially featureless gradient throughout the ENTIRE
-descent — it does not visually resolve the individual stair risers as discrete features**,
-even directly at a riser edge. Confirmed in the raw depth numbers too, not just the
-colorized image: every row is uniform left-to-right (a smoothly graded surface, not discrete
-steps) and changes smoothly in magnitude as the robot's position changes, with no
-discontinuities at tread boundaries. Most likely cause: this project's heightfield-based stairs
-are already a series of short, smoothed ramps rather than sharp vertical risers (a known,
-previously-documented approximation -- "a steep ramp over one HF_CELL (5cm), not a perfect right
-angle"), and at 32x32 resolution with this camera's tilt/mounting, that smoothing combined with
-the sensor's own resolution limit reads as an overall continuous slope, not a step pattern a
-policy could exploit for precise per-step foot placement. **This directly supports the original
-skepticism**: the camera does correctly perceive general distance/gradient information (useful
-for knowing the ground continues to drop away), but for the specific never-solved descending-
-stairs problem, its information content at this configuration is considerably less rich than
-"just add a camera" might suggest -- it may not actually be qualitatively different from what
-lidar's sparse rays could already tell the policy.
+**An honest methodological note, not a clean result either way.** A first version of this
+teleport script set the robot's trunk height to exactly track the LOCAL terrain height at
+every x position -- which, confirmed directly in the raw depth numbers, made the depth reading
+EXACTLY CONSTANT while on a single tread (changing only when the robot's own standing level
+changed), an artifact of the test, not a property of the sensor: it accidentally cancels out
+the very depth-to-upcoming-terrain signal being tested for, since a real walking body's trunk
+height doesn't track every local bump instantaneously the way that script assumed. That version
+wrongly concluded the camera "doesn't resolve stairs at all" -- corrected here by using a
+smoothed trunk-height trajectory (linear ramp from the pad height to the plateau height, not
+instantaneous local terrain) for a more physically reasonable viewpoint. With that fix, the
+depth reading DOES genuinely vary now (confirmed non-constant across positions, unlike the
+buggy first version) -- but it's still a smooth, monotonic gradient rather than a clear
+sawtooth that would unambiguously show individual risers being resolved, most likely because
+the near-field ray's ground intersection (~0.7m ahead at this mounting height/tilt) only spans
+2-3 tread-depths (each tread is 0.25m), so this coarse scripted test can't cleanly confirm or
+rule out riser-level resolution either way. **Getting a real answer would require an actual
+trained, stairs-capable camera policy** -- exactly the multi-hour investment this investigation
+decided to stop short of, given the upfront skepticism already laid out above. This demo
+honestly shows what's easy to check cheaply (the camera does perceive genuine, varying distance
+information, not a frozen signal) and is explicit about what it can't answer (whether that
+information is fine-grained enough for a policy to actually exploit for stair descent).
 
 **DECISION: stopped here, NOT adopted.** None of `runs/go2_camera_h_clock*` were promoted to
 `pretrained/` -- all stay as gitignored `runs/` experiments. `pretrained/go2_gaitclock` and
