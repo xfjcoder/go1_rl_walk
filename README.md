@@ -1608,7 +1608,19 @@ flat-ground proof of concept:
   <img src="media/go2_scratch_consolidate_fwd08_rightstrafe03.gif" width="500" alt="Go2 from-scratch checkpoint walking forward and strafing simultaneously on flat ground">
 </p>
 
-*`go2_latback_scratch_consolidate`, 0.8 m/s forward + right-strafe simultaneously — the combo that was 100% falls earlier in hard-mining, now clean.*
+*`go2_latback_scratch_consolidate`, 0.8 m/s forward + right-strafe simultaneously — the combo that was 100% falls earlier in hard-mining, now clean (0% falls).*
+
+**Correction, found later by the user watching this exact GIF (not caught by the `gait_stats.py`
+check above, which happened to land on a single favorable seed):** RR takes consistently shorter,
+quicker, lower-contact steps than its RL counterpart specifically for this forward+right-strafe
+combo -- confirmed real and repeatable across 3 different seeds (RR stance-travel 7.9-8.4cm vs
+RL's 13.1-13.5cm; RR duty 0.28-0.29 vs RL's 0.45-0.46), not a single-seed artifact or a visual
+illusion from the camera angle. Fall rate for this exact checkpoint+combo is still separately
+confirmed 0% across 32 random seeds (see the full grid above) -- this is a real, visible
+gait-smoothness/symmetry issue, not a reliability one, and it was wrongly reported as fully
+resolved ("spread=1.00, clean") in an earlier pass of this same investigation. **Accepted as a
+known cosmetic limitation of `pretrained/go2_latback`, not fixed** -- nothing in this project
+currently has a per-leg clearance/stride-symmetry mechanism to address it with.
 
 4. **Terrain** (0-12cm heightfield, `go2_latback_scratch_terrain`, then
    `_terrhardmine` narrowed to 6-12cm): broad improvement across nearly
@@ -1682,6 +1694,12 @@ direction-dependent combinations, not a general degradation.
   25% at 0.3 m/s, 88% at 0.8 m/s; worse combined with lateral).
 - Descending -12cm stairs combined with real forward speed (100% at both
   0.3 and 0.8 m/s, pure forward or combined with lateral).
+- RR takes consistently shorter, quicker, lower-duty steps than its RL
+  counterpart on flat ground, most visibly when forward speed is combined
+  with lateral strafing (confirmed real and repeatable across seeds, not a
+  single-seed artifact -- see the correction above). A gait-smoothness/
+  symmetry issue, not a reliability one (fall rate unaffected, still 0%
+  for the affected combo).
 
 **New reusable code, all default-off / exactly backward-compatible**
 (each verified by direct before/after `gait_stats.py` byte-identical
