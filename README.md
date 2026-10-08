@@ -1725,6 +1725,92 @@ python play.py --run-dir pretrained/go2_latback --target-speed 0.0 --target-late
 python eval_policy.py --run-dir pretrained/go2_latback --episodes 16 --target-speed -0.3 0 0.3 0.8 --target-lateral-speed -0.3 0 0.3
 ```
 
+## Stage 9: onboard depth camera (Go2) — tried, stopped early, NOT adopted
+
+Motivation: this project's progressively richer sensing experiments (analytic heightmap, then
+lidar) were both aimed at the same never-solved problem -- descending stairs/slopes at real
+forward speed. Lidar (Stage 7) gave a net regression at the hardest corners despite genuinely
+helping in places. Before investing in another full staged buildout, tested whether a real
+onboard camera -- far richer information than lidar's 9 sparse rays -- fares any better, with an
+explicit acknowledgment going in that there's no strong reason to expect it will: a camera
+requires a strictly harder CNN-based feature-learning problem than lidar's near-raw signal, so if
+the easier case already caused shared-network interference, the harder case had no obvious reason
+to do better.
+
+Added `assets/go2_mesh_camera.xml` (a forward-and-down-facing onboard depth camera, `depth_cam`,
+mounted at the trunk's front tip -- an earlier mounting attempt near the front hip joint looked
+almost entirely at the robot's own legs, confirmed by rendering an actual RGB test image, not
+just the depth numbers), `use_camera`/`camera_resolution`/`camera_max_range` on `Go1FlatEnv`
+(depth flattened into the same single Box observation convention used by every other optional
+sensor here, not a Dict space, verified backward-compatible), and `CameraMlpExtractor` (`train.py`)
+-- a small CNN branch for the flattened depth portion, concatenated with the untouched
+proprioceptive portion for the policy/value MLP heads, mirroring SB3's own CombinedExtractor
+pattern without needing a Dict observation space.
+
+**Benchmarked rendering cost before implementing**: single-process depth rendering at 32x32 costs
+~14x vs physics alone, but 16-concurrent-process benchmarking showed the GPU is a shared
+bottleneck capping aggregate throughput around ~1200-1400 steps/sec regardless of process count --
+combined with this pipeline's own existing per-step overhead, the real cost came out to ~400 fps
+in practice (not the ~1200-1400 the benchmark alone suggested), making an 8M-step-equivalent
+bootstrap stage take ~4 hours instead of ~1.
+
+**Bootstrap attempt 1 (`cnn_features_dim=128`) reproduced the exact front-heavy/nose-down posture
+bug** from this project's earlier (non-camera) lateral/backward bootstrap work, despite using the
+identical reward-shaping fix (`foot_duty_weight=0.6`, a narrowed duty-cycle band) that resolved it
+there. Unlike that earlier bug, a different training seed alone did NOT fix it here (confirmed
+across 3 seeds; one showed an even more extreme version: front-foot duty 0.87-0.92, rear 0.21).
+
+**Hypothesis: the 128-dim CNN branch dominates the combined feature vector** (71% of what the
+policy/value MLP heads see vs. the 51-dim proprioceptive portion), making it harder for them to
+weight the comparatively narrow proprioceptive signal (duty-cycle balance) as strongly as in the
+non-camera case, even with an identical reward penalty. Lowering `cnn_features_dim` to 32
+partially confirmed this: the front/rear posture bug visibly resolved (level trunk posture
+confirmed across multiple frames, front/rear duty gap narrowed from 0.87-0.92/0.21 to
+0.57-0.60/0.39-0.51) -- but a NEW, different asymmetry appeared instead: one specific leg (FL)
+consistently cycled 2.5-3x faster than the other three (confirmed across 3 seeds), visible in the
+GIF as the dog's rear end rocking up and down slightly as it walks. A real trade -- one problem for
+a different one -- not a clean fix, matching this project's own repeated "fixing one corner can
+trade it for another" pattern.
+
+**Decided against further architecture iteration** (each attempt costs ~4 hours) once the actual
+goal was reconsidered: the real question was never "can a bootstrap gait look clean," it was
+whether camera perception helps with the stairs-descent problem specifically. A direct check
+answered that more cheaply than another multi-hour training run would have:
+
+<p align="center">
+  <img src="media/go2_camera_view_demo_stairs_desc12cm.gif" width="640" alt="External view (left) vs. what the onboard depth camera actually sees (right), teleported down a descending 12cm staircase">
+</p>
+
+*Left: external view, teleported down the staircase (bypassing the controller -- this just shows
+what the sensor perceives at a sequence of positions, not a walking demonstration). Right: the
+onboard depth camera's own view at each position, normalized/colorized (white = far, black =
+near).*
+
+**The depth view shows a smooth, essentially featureless gradient throughout the ENTIRE
+descent — it does not visually resolve the individual stair risers as discrete features**,
+even directly at a riser edge. Confirmed in the raw depth numbers too, not just the
+colorized image: every row is uniform left-to-right (a smoothly graded surface, not discrete
+steps) and changes smoothly in magnitude as the robot's position changes, with no
+discontinuities at tread boundaries. Most likely cause: this project's heightfield-based stairs
+are already a series of short, smoothed ramps rather than sharp vertical risers (a known,
+previously-documented approximation -- "a steep ramp over one HF_CELL (5cm), not a perfect right
+angle"), and at 32x32 resolution with this camera's tilt/mounting, that smoothing combined with
+the sensor's own resolution limit reads as an overall continuous slope, not a step pattern a
+policy could exploit for precise per-step foot placement. **This directly supports the original
+skepticism**: the camera does correctly perceive general distance/gradient information (useful
+for knowing the ground continues to drop away), but for the specific never-solved descending-
+stairs problem, its information content at this configuration is considerably less rich than
+"just add a camera" might suggest -- it may not actually be qualitatively different from what
+lidar's sparse rays could already tell the policy.
+
+**DECISION: stopped here, NOT adopted.** None of `runs/go2_camera_h_clock*` were promoted to
+`pretrained/` -- all stay as gitignored `runs/` experiments. `pretrained/go2_gaitclock` and
+`pretrained/go2_latback` are unaffected. `use_camera`/`camera_resolution`/`camera_max_range`
+and `CameraMlpExtractor` stay in the codebase (default off / opt-in, verified backward-
+compatible) as reusable infrastructure if camera-based perception is revisited later --
+possibly with a steeper camera tilt or closer mounting to better resolve near-field stair
+structure, which was not tried.
+
 ## Next stages
 
 Terrain-aware observation and a non-trot gait mode were both tried already
