@@ -100,8 +100,11 @@ failure and fix, in [HISTORY.md](HISTORY.md)):
     drive `go2_latback` toward an arbitrary world-frame goal with a thin
     proportional outer loop and **zero retraining**, exploiting the fact
     that the walking reward already holds heading fixed. 94-100% success,
-    0% falls across flat and rough terrain (32 randomized goals each);
-    obstacle avoidance and real turning are scoped as possible follow-ups.
+    0% falls across flat and rough terrain (32 randomized goals each).
+    Extended with static obstacle avoidance (a simplified potential field):
+    0% collisions even where an obstacle sat directly on the path, with a
+    well-understood (not chased further) convergence weak spot when a goal
+    happens to land near an obstacle. Real turning remains a scoped follow-up.
 
 ## Repository layout
 

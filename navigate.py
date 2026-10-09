@@ -1,5 +1,6 @@
 """
-Stage 10a: drive a trained walking policy toward a world-frame (x, y) goal, with NO retraining.
+Stage 10a/10b: drive a trained walking policy toward a world-frame (x, y) goal, with NO
+retraining, optionally steering around static obstacles along the way.
 
 Why this works at all: the reward (`r_heading` in envs/go1_env.py) actively penalizes any yaw
 deviation from 0, so a converged policy holds its heading near world-+x throughout an episode --
@@ -7,18 +8,20 @@ confirmed directly in envs/go1_env.py, not assumed. World frame therefore stays 
 body frame that a goal vector can be fed straight in as a (target_speed, target_lateral_speed)
 command, using pretrained/go2_latback exactly as trained (it already supports forward, backward,
 and sideways walking simultaneously). No new mechanism, no fine-tuning -- just a thin outer loop:
-a proportional controller recomputes the command every control step from the live vector to the
-goal (rotated into the robot's current frame using its measured yaw, so a residual heading error
-doesn't silently bias the command), decelerating smoothly as the goal nears and stopping within
---tolerance.
+a proportional controller (see compute_nav_command below) recomputes the command every control
+step from the live vector to the goal (rotated into the robot's current frame using its measured
+yaw, so a residual heading error doesn't silently bias the command) plus a repulsive term from any
+nearby obstacles (--nav-obstacles; ground-truth positions, queried from the env, not sensed),
+decelerating smoothly as the goal nears and stopping within --tolerance.
 
-Deliberately NOT attempted here (see HISTORY.md / memory for the full Stage 10 roadmap): obstacle
-avoidance (10b) and genuine turning (10c) -- this script only answers "can the existing checkpoint
-reach an arbitrary flat-ground point ahead/behind/beside it," nothing more.
+Deliberately NOT attempted here (see HISTORY.md / memory for the full Stage 10 roadmap): genuine
+turning (10c, the still-unused yaw-rate command slot) and perception-based (rather than
+ground-truth) obstacle detection.
 
 Usage:
     python navigate.py --goal-x 3.0 --goal-y 1.0 --record out.gif
     python navigate.py --goal-x -2.0 --goal-y 0.0 --terrain-amplitude 0.08 --record out.gif
+    python navigate.py --goal-x 4.0 --goal-y 0.0 --nav-obstacles 4 --record out.gif
 """
 import argparse
 import json
@@ -32,6 +35,34 @@ from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
 
 from envs.go1_env import Go1FlatEnv
 from eval_policy import latest_checkpoint
+
+
+def compute_nav_command(x, y, yaw, goal_x, goal_y, obstacles, kp, speed_lo, speed_hi, lat_lo, lat_hi,
+                         obstacle_gain=1.5, obstacle_influence=0.8):
+    """Proportional goal-attraction + linear obstacle-repulsion steering law (a simplified
+    artificial potential field -- linear falloff instead of the textbook 1/d^2 term, so there's no
+    singularity to guard against as the robot nears an obstacle's surface). Computed in world
+    frame, then rotated into the robot's own frame via its measured yaw (not assumed zero) and
+    clipped per-axis to the checkpoint's trained command range.
+
+    obstacles: list of (ox, oy, radius) tuples -- ground truth, meant to come straight from
+    Go1FlatEnv.obstacle_positions (+ its shared nav_obstacle_radius), not a sensed estimate.
+    Scalar-only (one robot at a time) -- eval_navigate.py's parallel episodes call this once per
+    episode index in a loop, since each one has its own independently-randomized obstacle set."""
+    wx, wy = goal_x - x, goal_y - y   # attractive component: straight toward the goal
+    for ox, oy, r in obstacles:
+        ex, ey = x - ox, y - oy       # vector FROM the obstacle's centre TO the robot
+        center_dist = max(float(np.hypot(ex, ey)), 1e-3)
+        clearance = center_dist - r   # distance to the obstacle's own surface, not its centre
+        if clearance < obstacle_influence:
+            strength = obstacle_gain * (obstacle_influence - clearance) / obstacle_influence
+            wx += strength * ex / center_dist
+            wy += strength * ey / center_dist
+    c, s = np.cos(yaw), np.sin(yaw)
+    fwd_err, lat_err = wx * c + wy * s, -wx * s + wy * c    # world vector -> robot's own frame
+    fwd_cmd = float(np.clip(kp * fwd_err, speed_lo, speed_hi))
+    lat_cmd = float(np.clip(kp * lat_err, lat_lo, lat_hi))
+    return fwd_cmd, lat_cmd
 
 
 def main():
@@ -52,6 +83,16 @@ def main():
                          help="Navigate across rough terrain of this amplitude (m, peak-to-peak). "
                               "Stage 10a is scoped to flat/rough terrain only -- slope/stairs form a "
                               "ridge along world-y, so a goal crossing one at an angle is untested.")
+    parser.add_argument("--nav-obstacles", type=int, default=0,
+                         help="Scatter this many static, impassable cylinder obstacles in the "
+                              "course (Stage 10b) and steer around them. 0 (default) = none.")
+    parser.add_argument("--nav-obstacle-radius", type=float, default=0.15)
+    parser.add_argument("--nav-obstacle-height", type=float, default=0.5)
+    parser.add_argument("--obstacle-avoid-gain", type=float, default=1.5,
+                         help="Repulsive-field strength; only matters with --nav-obstacles > 0.")
+    parser.add_argument("--obstacle-influence-radius", type=float, default=0.8,
+                         help="Distance (m, from an obstacle's surface) at which its repulsion "
+                              "starts being felt at all; only matters with --nav-obstacles > 0.")
     parser.add_argument("--record", type=str, default=None, help="Save an offscreen-rendered GIF.")
     parser.add_argument("--slowmo", type=float, default=1.0)
     parser.add_argument("--frame-stride", type=int, default=2)
@@ -89,6 +130,9 @@ def main():
     env_kwargs["stair_height"] = None
     env_kwargs["obstacle_height_range"] = None
     env_kwargs["obstacle_height"] = None
+    env_kwargs["nav_obstacles"] = args.nav_obstacles
+    env_kwargs["nav_obstacle_radius"] = args.nav_obstacle_radius
+    env_kwargs["nav_obstacle_height"] = args.nav_obstacle_height
 
     def make_env():
         return Go1FlatEnv(render_mode=render_mode, domain_randomize=False, camera=args.camera, **env_kwargs)
@@ -107,6 +151,9 @@ def main():
     if args.seed is not None:
         env.seed(args.seed)
     obs = env.reset()
+    obstacles = [(ox, oy, raw_env.nav_obstacle_radius) for ox, oy in raw_env.obstacle_positions]
+    if obstacles:
+        print(f"obstacles (ground truth): {[(round(o[0], 2), round(o[1], 2)) for o in obstacles]}")
 
     max_steps = int(args.seconds * 50)
     goal = np.array([args.goal_x, args.goal_y])
@@ -114,26 +161,27 @@ def main():
     frames = []
     reached, fell = False, False
     t_reached = None
+    closest_clearance = float("inf")
 
     for step in range(1, max_steps + 1):
-        dx, dy = goal[0] - x, goal[1] - y
-        dist = float(np.hypot(dx, dy))
+        dist = float(np.hypot(goal[0] - x, goal[1] - y))
         if dist <= args.tolerance:
             if not reached:            # latch the FIRST time only -- otherwise t_reached keeps
                 reached, t_reached = True, step / 50.0   # re-stamping to "now" every step the
             raw_env.set_command(0.0, 0.0)                # robot stays near the goal, and the
                                                           # linger-then-stop check below never fires
         else:
-            c, s = np.cos(yaw), np.sin(yaw)
-            fwd_err, lat_err = dx * c + dy * s, -dx * s + dy * c    # world vector -> robot's own frame
-            fwd_cmd = float(np.clip(args.kp * fwd_err, speed_lo, speed_hi))
-            lat_cmd = float(np.clip(args.kp * lat_err, lat_lo, lat_hi))
+            fwd_cmd, lat_cmd = compute_nav_command(
+                x, y, yaw, goal[0], goal[1], obstacles, args.kp, speed_lo, speed_hi, lat_lo, lat_hi,
+                args.obstacle_avoid_gain, args.obstacle_influence_radius)
             raw_env.set_command(fwd_cmd, lat_cmd)
 
         action, _ = model.predict(obs, deterministic=True)
         obs, _, done, info = env.step(action)
         x, y = float(info[0]["base_pos"][0]), float(info[0]["base_pos"][1])
         yaw = float(info[0]["yaw"])
+        for ox, oy, r in obstacles:
+            closest_clearance = min(closest_clearance, float(np.hypot(x - ox, y - oy)) - r)
 
         if args.record:
             frame = raw_env.render(camera=args.camera)
@@ -157,6 +205,9 @@ def main():
     else:
         print(f"Did NOT reach the goal within {args.seconds:.0f}s "
               f"(final distance {final_dist:.2f} m, started {np.hypot(*goal):.2f} m away).")
+    if obstacles:
+        print(f"Closest approach to any obstacle's surface: {closest_clearance:.2f} m "
+              f"({'collision' if closest_clearance < 0 else 'clear'}).")
 
     env.close()
     if args.record and frames:

@@ -491,6 +491,25 @@ class Go1FlatEnv(gym.Env):
                                                # If clearance ends up happening on the wrong half
                                                # of the cycle, flip this value's sign and retrain.
         calf_residual_scale: float = 0.15,    # policy's residual authority over calf target, rad
+        nav_obstacles: int = 0,                # number of static, FIXED (impassable, not steppable --
+                                               # unlike obstacle_height_range's walkable terrain bumps
+                                               # above) cylinder obstacles scattered in the course each
+                                               # episode, for Stage 10b (navigation obstacle avoidance).
+                                               # 0 (default) = none, no model change at all (the model
+                                               # build path is identical to before this flag existed).
+                                               # Ground-truth centre positions are exposed via
+                                               # obstacle_positions (list[(x, y)]) for an external
+                                               # navigation controller to steer around -- NOT part of
+                                               # the policy's own observation (this is privileged
+                                               # information for the outer-loop navigator, same
+                                               # "ground truth first, perception later" sequencing as
+                                               # every other Stage 10 increment).
+        nav_obstacle_radius: float = 0.15,     # metres, fixed radius of every nav_obstacles cylinder
+        nav_obstacle_height: float = 0.5,      # metres, tall enough to be a genuine obstacle (unlike
+                                               # the walkable obstacle_height_range bumps), not a kerb
+        nav_obstacle_min_dist: float = 0.8,    # metres: obstacles are resampled away from the origin
+                                               # (the robot's own spawn point) by at least this much,
+                                               # so one never spawns on top of the robot at reset
         kp: float = 40.0,                      # PD position gain, N*m/rad. A standalone scripted-
                                                # walking test confirmed 40.0 gives poor OPEN-LOOP
                                                # tracking under load (~20 degree error) and 80.0
@@ -611,9 +630,22 @@ class Go1FlatEnv(gym.Env):
         self._kp_value = kp
         self._kd_value = kd
         self.camera = camera
+        self.nav_obstacles = nav_obstacles
+        self.nav_obstacles_enabled = nav_obstacles > 0
+        self.nav_obstacle_radius = nav_obstacle_radius
+        self.nav_obstacle_height = nav_obstacle_height
+        self.nav_obstacle_min_dist = nav_obstacle_min_dist
+        self.obstacle_positions: list[tuple[float, float]] = []  # ground truth for an external
+                                                                  # navigation controller; empty
+                                                                  # unless nav_obstacles > 0
 
-        if self.terrain_enabled:
-            self.model = mujoco.MjModel.from_xml_string(self._terrain_xml(xml_path))
+        if self.terrain_enabled or self.nav_obstacles_enabled:
+            xml = self._read_and_fix_meshdir(xml_path)
+            if self.terrain_enabled:
+                xml = self._inject_terrain_xml(xml)
+            if self.nav_obstacles_enabled:
+                xml = self._inject_nav_obstacles_xml(xml, nav_obstacles, nav_obstacle_radius, nav_obstacle_height)
+            self.model = mujoco.MjModel.from_xml_string(xml)
         else:
             self.model = mujoco.MjModel.from_xml_path(xml_path)
         self.data = mujoco.MjData(self.model)
@@ -744,6 +776,10 @@ class Go1FlatEnv(gym.Env):
             self._hf_adr = int(self.model.hfield_adr[hid])
             self._hf_x0, self._hf_y0 = HF_CX - HF_HALF_X, -HF_HALF_Y
             self._terrain_h = np.zeros((self._hf_nrow, self._hf_ncol))
+        self._nav_obstacle_geom_ids = np.array([
+            mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_GEOM, f"nav_obstacle{i}")
+            for i in range(self.nav_obstacles)
+        ], dtype=np.int32) if self.nav_obstacles_enabled else np.array([], dtype=np.int32)
         self._next_push_step = 10**9
 
         self._viewer = None
@@ -870,6 +906,19 @@ class Go1FlatEnv(gym.Env):
                 # foot contact -- randomizing only the floor never touched the feet. On terrain runs randomize
                 # the foot friction too (flat runs keep the old behaviour so they stay reproducible).
                 self.model.geom_friction[self._foot_geom_ids, 0] = mu
+
+        if self.nav_obstacles_enabled:
+            self.obstacle_positions = []
+            for gid in self._nav_obstacle_geom_ids:
+                while True:
+                    ox = float(self._rng.uniform(-4.0, 4.0))
+                    oy = float(self._rng.uniform(-4.0, 4.0))
+                    if np.hypot(ox, oy) >= self.nav_obstacle_min_dist:
+                        break
+                self.model.geom_pos[gid, 0] = ox
+                self.model.geom_pos[gid, 1] = oy
+                self.model.geom_pos[gid, 2] = self._terrain_height(ox, oy) + self.nav_obstacle_height / 2
+                self.obstacle_positions.append((ox, oy))
 
         mujoco.mj_forward(self.model, self.data)
         if self.terrain_enabled:
@@ -1007,22 +1056,28 @@ class Go1FlatEnv(gym.Env):
         return force > self.contact_force_threshold
 
     # ------------------------------------------------------------------ #
-    # Rough terrain (heightfield)
+    # Rough terrain (heightfield) / static nav obstacles -- both injected by simple text
+    # replacement into the raw XML, composably, so the model is only built via
+    # from_xml_string() once regardless of which combination is active.
     # ------------------------------------------------------------------ #
     @staticmethod
-    def _terrain_xml(xml_path: str) -> str:
-        """The flat model with a random-heightfield geom injected. The floor plane drops 5 cm as a safety net so
-        it never coincides with the terrain surface (heights are >= 0)."""
+    def _read_and_fix_meshdir(xml_path: str) -> str:
+        """Read xml_path's raw text. from_xml_string() (used for terrain/nav-obstacle injection)
+        has no file context of its own, so a relative <compiler meshdir="..."/> (needed by any
+        mesh-based model, e.g. assets/go1_mesh.xml) can't resolve -- rewrite it to an absolute path
+        relative to xml_path's own directory. No-op for meshdir-less models (e.g. the primitive go1.xml)."""
         with open(xml_path) as f:
             xml = f.read()
-        # from_xml_string() (used below) has no file context of its own, so a relative <compiler meshdir="..."/>
-        # (needed by any mesh-based model, e.g. assets/go1_mesh.xml) can't resolve -- rewrite it to an absolute
-        # path relative to xml_path's own directory. No-op for meshdir-less models (e.g. the primitive go1.xml).
-        xml = re.sub(
+        return re.sub(
             r'(<compiler\b[^>]*\bmeshdir=")([^"]+)(")',
             lambda m: m.group(1) + os.path.abspath(os.path.join(os.path.dirname(xml_path), m.group(2))) + m.group(3),
             xml,
         )
+
+    @staticmethod
+    def _inject_terrain_xml(xml: str) -> str:
+        """xml with a random-heightfield geom injected. The floor plane drops 5 cm as a safety net so
+        it never coincides with the terrain surface (heights are >= 0)."""
         nrow, ncol = int(round(2 * HF_HALF_Y / HF_CELL)) + 1, int(round(2 * HF_HALF_X / HF_CELL)) + 1
         edits = [
             ("</asset>", f'<hfield name="terrain" nrow="{nrow}" ncol="{ncol}" '
@@ -1032,9 +1087,26 @@ class Go1FlatEnv(gym.Env):
                                   f'rgba="0.36 0.5 0.36 1" friction="0.9 0.02 0.01" condim="3"/>\n    <light name="sun"'),
         ]
         for old, new in edits:
-            assert xml.count(old) == 1, f"cannot inject terrain: {old!r} not found exactly once in {xml_path}"
+            assert xml.count(old) == 1, f"cannot inject terrain: {old!r} not found exactly once"
             xml = xml.replace(old, new)
         return xml
+
+    @staticmethod
+    def _inject_nav_obstacles_xml(xml: str, n: int, radius: float, height: float) -> str:
+        """xml with n static, FIXED (no joint -- can't be pushed or toppled, unlike a freejoint body)
+        cylinder obstacles injected into the worldbody, named nav_obstacle0..N-1, parked at a
+        placeholder position far underground. reset() moves each one to a randomized in-course
+        (x, y) every episode via model.geom_pos (mutable at runtime without rebuilding the model --
+        the same pattern this file already uses for geom_friction/body_mass), so the model is only
+        built from this XML once, not regenerated every episode."""
+        geoms = "\n".join(
+            f'    <geom name="nav_obstacle{i}" type="cylinder" size="{radius} {height / 2}" '
+            f'pos="0 0 -10" rgba="0.75 0.15 0.15 1" friction="0.9 0.02 0.01" condim="3"/>'
+            for i in range(n)
+        )
+        marker = '<light name="sun"'
+        assert xml.count(marker) == 1, f"cannot inject nav obstacles: {marker!r} not found exactly once"
+        return xml.replace(marker, geoms + f"\n    {marker}")
 
     def _generate_terrain(self, amp: float, slope_deg: float = 0.0, uphill: bool = True,
                           stair_h: float = 0.0, ascending: bool = True, obstacle_h: float = 0.0):

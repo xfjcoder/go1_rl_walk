@@ -1726,6 +1726,80 @@ clean, consistent 94-100%-success/0%-fall result across the whole tested range, 
 avoidance) is the natural next increment rather than 10c (turning) — nothing in these numbers
 suggests the strafe-only approach is the bottleneck.
 
+## Stage 10b: static obstacle avoidance (Go2)
+
+The natural next increment after 10a's clean result, per the roadmap scoped before 10a started.
+Deliberately NOT the existing `obstacle_height_range` terrain bumps from Stage 3c/Go2's own
+discrete-obstacle work — those are walkable (already solved zero-shot, 0-6% falls up to 18-22cm),
+so "avoiding" them tests nothing real. This needed genuinely impassable obstacles instead.
+
+**Added:**
+- `Go1FlatEnv`: `nav_obstacles`/`nav_obstacle_radius`/`nav_obstacle_height`/`nav_obstacle_min_dist`
+  (all default to off/0 = no model change at all). `nav_obstacles` static, FIXED (no joint) cylinder
+  geoms are injected into the worldbody via the same text-replacement pattern the heightfield
+  already uses (`_inject_terrain_xml`/`_inject_nav_obstacles_xml`, refactored out of the old
+  `_terrain_xml` so both injections compose into a single `from_xml_string()` build regardless of
+  which combination is active). Repositioned randomly each episode via `model.geom_pos` (mutable
+  at runtime, same pattern as `geom_friction`/`body_mass` elsewhere in this file) rather than
+  rebuilding the model every reset -- resampled at least `nav_obstacle_min_dist` from the robot's
+  own spawn point so one never lands on top of it. Ground-truth centres exposed via
+  `obstacle_positions` for an external navigation controller -- privileged information for the
+  outer-loop navigator, not part of the policy's own observation, same "ground truth first,
+  perception later" sequencing as every other Stage 10 increment.
+- `Go1FlatEnv.set_command()` was the only per-step integration point needed -- no other env changes
+  touch physics/reward at all, so there's nothing to verify for backward-compatibility beyond the
+  refactor itself (confirmed byte-identical `gait_stats.py` output on `pretrained/go2_gaitclock`
+  before/after the `_terrain_xml` split, same stash/compare pattern as every other change in this
+  project) and a direct no-obstacle regression check on `navigate.py` (identical 7.0s result on the
+  same seed/goal as Stage 10a's own fixed demo, before and after adding the obstacle-avoidance code
+  path).
+- `compute_nav_command()` (navigate.py, imported into `eval_navigate.py` rather than duplicated): a
+  simplified artificial potential field -- the same proportional goal-attraction as 10a, plus a
+  repulsive term from every obstacle within `--obstacle-influence-radius` of the robot, strength
+  rising LINEARLY as clearance shrinks (not the textbook 1/d² term, specifically to avoid a
+  singularity as the robot nears an obstacle's surface -- a division-by-near-zero blowup right
+  when precision matters most would be a bad trade for textbook fidelity). Both scripts gained
+  `--nav-obstacles`/`--nav-obstacle-radius`/`--nav-obstacle-height`/`--obstacle-avoid-gain`/
+  `--obstacle-influence-radius` flags.
+- `eval_navigate.py` also tags each episode with whether a NAIVE straight-line path (ignoring
+  avoidance entirely) would have come within (obstacle radius + a rough 0.3m robot half-width) of
+  any obstacle -- obstacles scattered uniformly over a wide area often land nowhere near a given
+  episode's own short goal segment, so an unconditional average would silently dilute the very
+  thing being measured. Reports both the overall numbers and this "path actually blocked" subset
+  separately.
+
+**Result (32 episodes, 10 obstacles scattered per episode, goal distance 1.5-4m, bearing 0-360deg,
+`pretrained/go2_latback`, no fine-tuning):** 88% success, 0% falls, 0% collisions overall (closest
+mean approach to any obstacle's surface: 0.72m). Of the 5/32 episodes where an obstacle actually sat
+on the direct path: **0% collision rate held even there** -- the avoidance mechanism itself works --
+but success rate dropped to 40% (2/5).
+
+**Traced the 3 non-reaches directly (not left as an unexplained number):** none fell, none
+collided (clearance 0.29-0.56m in every case) -- all three timed out at 25s sitting 0.29-0.39m
+from the goal, just outside the 0.15m success tolerance. Checked each one's obstacle layout
+directly: in all three, an obstacle sat very close to the GOAL itself (0.36-0.49m away -- well
+inside the 0.8m default influence radius), not just somewhere along the path. This is a textbook,
+well-known limitation of artificial potential fields, not a bug: when a goal is near an obstacle,
+the repulsive push-away and the attractive pull-toward partially cancel right at the destination,
+so the controller can hover close without ever fully closing the last fraction of a metre within
+the time budget. A real fix (e.g. decaying the repulsive term specifically near the goal, or
+switching to a method without this failure mode, like a sampling-based planner) wasn't attempted --
+noted as the natural next fix if this becomes a priority, not chased here.
+
+<p align="center">
+  <img src="media/go2_navigate_obstacle_avoidance.gif" width="480" alt="Go2 navigating around three static obstacles to reach a goal, wide overhead view">
+</p>
+
+*Wide overhead free-camera view (not the close-following track camera used elsewhere -- it doesn't
+show enough of the course to see an avoidance maneuver at all) of the robot steering around an
+obstacle sitting directly on its path to the goal, then continuing on to reach it.*
+
+**DECISION: Stage 10b adopted.** `nav_obstacles`/`set_command`/`compute_nav_command` committed; no
+existing checkpoint or script behavior changed. The goal-near-obstacle non-convergence pattern is
+left as a known, explained limitation rather than chased further -- 10c (turning) remains the
+other scoped-but-not-started follow-up, still not indicated by anything found so far (the failures
+here are a convergence artifact of the potential-field method, not a strafe-only limitation).
+
 ## Next stages
 
 Terrain-aware observation and a non-trot gait mode were both tried already
