@@ -1805,7 +1805,7 @@ here are a convergence artifact of the potential-field method, not a strafe-only
 Nothing in 10a/10b's numbers indicated this was needed (0% collisions even where an obstacle sat
 directly on the path), and it's a materially bigger undertaking than 10a/10b (training the policy
 itself, not just an outer-loop script) -- explicitly flagged to the user before starting. User chose
-to pursue it anyway. Six training runs and two real bugs later, this section documents a genuine,
+to pursue it anyway. Seven training runs and two real bugs later, this section documents a genuine,
 well-investigated negative result, not a quick abandonment.
 
 **Design** (mirrors `target_lateral_speed`'s own established pattern, not a new mechanism): added
@@ -1927,33 +1927,125 @@ wobble, don't commit to the harder sustained-asymmetric-gait behavior real turni
 
 *Commanded 0.3 m/s forward + a continuous 0.3 rad/s turn for the entire 12-second clip (should
 curve into roughly two-thirds of a full circle) -- instead walks in an almost dead-straight line
-with only a barely perceptible wobble. This is the cleanest (from-scratch, attempt 6) of three
+with only a barely perceptible wobble. This is the cleanest (from-scratch, attempt 6) of four
 structurally different attempts that all produced the same qualitative failure.*
 
-**DECISION: stopped here, NOT adopted.** None of `runs/go2_turn_footwork*`/`go2_turn_scratch` were
-promoted to `pretrained/`; `go2_gaitclock`/`go2_latback` are unaffected. `target_yaw_rate`/
-`yaw_rate_range`/`yaw_rate_tracking_weight`/`yaw_rate_footwork_weight`/the `_heading_ref` wrapping
-fix all stay in the codebase (default off / zero target, verified backward-compatible) as reusable
-infrastructure if this is revisited with a better-scoped approach -- candidates not tried: a much
-narrower yaw-rate range (a gentle drift rather than a real turn), or restructuring the reward to
-directly track cumulative heading change rather than instantaneous rate.
+**Attempt 7: a genuinely different architecture, not a repeat -- user asked "maybe the policy
+network could be structured differently," which led to checking the codebase directly (not from
+memory) rather than guessing.** Found `use_gait_reference`: a mechanism, already built into
+`envs/go1_env.py`, that FORCES the thigh joints along a prescribed sinusoidal swing (the policy
+only contributes a small residual, `thigh_residual_scale=0.15` vs `gait_swing_amplitude=0.35`),
+added specifically because "reward shaping alone... still repeatedly let some legs 'opt out' of
+stepping entirely" -- the identical failure shape as the turning saga. **It had never been turned
+on for `go2_latback` or any of the first 6 Stage 10c runs, and `train.py` had NO CLI flags for it
+at all** -- genuinely dormant infrastructure, built into the env but never exercised by a real
+training run before this.
+
+New mechanism: `yaw_rate_swing_gain` biases EACH leg's own prescribed swing amplitude by
+`target_yaw_rate * that leg's left/right offset` (only active with `use_gait_reference=True`) --
+the real quadruped foot-placement idea, baked into the mechanical reference this time instead of
+just a reward incentive. **Verified two sign conventions empirically before trusting either** (the
+project's own established discipline, applied twice over): (1) confirmed via direct FK that a
+LARGER thigh angle moves this robot's foot BACKWARD, so swing amplitude does control stride length
+as assumed; (2) also went back and empirically verified the PRE-EXISTING (built before Stage 10c,
+also never used) calf-reference sign convention, whose own code comment admitted it was "inferred...
+not empirically verified (no MuJoCo in this sandbox)" -- confirmed correct (more-negative calf =
+higher foot clearance), closing out a loose end that predates this investigation. Verified
+byte-identical backward-compatible (both mechanisms default off/unused by every existing
+checkpoint).
+
+Ran the identical scope as attempt 6 (from-scratch, flat-only, fixed values) for a clean
+comparison, adding only `--use-gait-reference --use-calf-reference --yaw-rate-swing-gain 1.5`. A
+quick smoke test (50K steps) ran clean before committing to the full 12M-step run.
+
+**Result: the same qualitative failure a 4th time, AND a new, more severe regression on top.**
+`gait_stats.py` showed the best step-rate spread of any attempt (1.22) but a wobblier feet-down
+distribution (57% of time with 0-1 feet in contact, vs a clean trot's usual ~70-80% at 2 feet). The
+wide-camera trajectory trace showed the identical pattern as every prior attempt: final heading
+-6.5° after 12s at a commanded +0.3 rad/s (should be ~206°). A follow-up multi-seed check (8 seeds
+each at +0.3/0.0/-0.3 target_yaw_rate) found something worse than "no turning": **at
+target_yaw_rate=0.0 -- the simplest possible case, no turn asked for at all -- the policy fell in
+ALL 8 SEEDS.** Every previous attempt, including the plain from-scratch one, could reliably walk
+forward without falling; this combination couldn't, even in its easiest condition. Final heading at
+±0.3 showed no consistent directional relationship to the commanded sign either (mean -2.84° at
++0.3, -3.48° at -0.3, both with very high seed-to-seed variance) -- not a weaker version of
+turning, just noise. Read: `use_gait_reference` itself, forcing a mechanically large swing
+(0.35 rad) correctable only by a thin residual (0.15 rad), appears to destabilize basic balance
+before the turning question even gets a fair test -- conflating "does a mechanical reference help
+turning" with "is this specific mechanical reference viable at all" on the very first attempt to
+use it for anything.
+
+**Research context, prompted by asking "has anyone else used RL for this at all" rather than
+assuming the answer:** turning via RL is a well-established, largely-solved problem in the broader
+legged-robot literature, including with the SAME core algorithm (PPO) this project uses, and in
+some cases the same robot family (Unitree Go1/A1). ETH Zurich's RSL lab (Hwangbo et al. 2019;
+Lee et al. 2020, "Learning quadrupedal locomotion over challenging terrain"; Miki et al. 2022) train
+exactly the `(vx, vy, yaw_rate)` command structure used here and demonstrate real sustained turning
+on hardware. Kumar et al. 2021 ("Rapid Motor Adaptation for Legged Robots") do the same on the A1.
+Rudin et al. 2022 ("Learning to Walk in Minutes Using Massively Parallel Deep Reinforcement
+Learning" -- already cited by name in this project's own air-time reward comment, Stage 8/7) is a
+commonly-replicated omnidirectional-velocity baseline. Margolis & Agrawal 2022 ("Walk These Ways")
+and Iscen et al. 2018 ("Policies Modulating Trajectory Generators" -- the paper that originated the
+trajectory-generator-plus-residual idea `use_gait_reference` is a version of) are further
+precedent. NVIDIA's own Isaac Gym/Isaac Lab example environments ship this exact command structure
+as a standard tutorial baseline. **This means the limitation hit here is almost certainly about
+this project's own compute scale and setup, not a fundamental property of RL or PPO.** The most
+likely real differences, roughly in order of weight: (1) these works typically use thousands of
+GPU-parallel simulated environments (Rudin et al.: 4096+) reaching on the order of a billion total
+environment steps, vs. this project's 16 CPU-parallel environments and tens of millions of steps --
+if undirected joint-space exploration struggling to discover a coordinated asymmetric gait is the
+real bottleneck (the working hypothesis from the first 6 attempts), far more total random tries is
+the actual fix most of these papers use, not a smarter architecture; (2) much more gradual curricula
+on the command range, typically ramped across the entire training run; (3) observation history or
+outright recurrent policies -- this project's policy is a single-timestep memoryless snapshot
+(already flagged elsewhere, re: the Stage 7 latency-distillation work), and most successful
+published approaches use some form of memory; (4) when a trajectory-generator approach is used in
+the literature, it's a carefully-tuned, dedicated component built for the task from the start, not
+retrofitted onto an unrelated, never-validated mechanism in a single attempt the way attempt 7 did
+it. None of these are cheap to replicate in this project's current CPU-based pipeline -- a genuine
+move to massively-parallel GPU simulation would be new infrastructure, not a training-recipe tweak.
+
+**DECISION: stopped here, NOT adopted.** None of `runs/go2_turn_footwork*`/`go2_turn_scratch*`
+were promoted to `pretrained/`; `go2_gaitclock`/`go2_latback` are unaffected (both run directories
+from attempt 7 and the prior 6 attempts were deleted after this decision, ~106MB freed, disk had
+ample room regardless). `target_yaw_rate`/`yaw_rate_range`/`yaw_rate_tracking_weight`/
+`yaw_rate_footwork_weight`/the `_heading_ref` wrapping fix/`yaw_rate_swing_gain` all stay in the
+codebase (default off / zero target, verified backward-compatible) as reusable infrastructure if
+this is revisited -- candidates not tried: a much narrower yaw-rate range as a gentle drift rather
+than a real turn; restructuring the reward around cumulative heading change instead of instantaneous
+rate; validating `use_gait_reference` on its own (zero yaw-rate bias) as a standalone experiment
+before combining it with anything else; or, the biggest lever based on the research context above,
+genuinely more total training experience (GPU-parallel simulation, a materially bigger
+undertaking than any training-recipe change tried here).
 
 **Reusable lessons from this investigation, independent of whether turning itself ever gets
 revisited:**
 - The LR-schedule-dilution finding (progress_remaining computed against full historical lineage on
   `--resume`) is general and project-wide, not Stage-10c-specific -- worth remembering for any
   future fine-tune of a long-lineage checkpoint.
-- Reward curves alone proved insufficient TWICE in this investigation (attempt 3's and attempt
-  5/6's much-improved numbers both hid the same unchanged qualitative failure) -- the wide-camera
-  trajectory/heading-over-time trace was the only check that actually caught it, reinforcing this
-  project's existing "reward curve alone can hide a broken behavior" lesson in a new form.
+- Reward curves alone proved insufficient on (at least) two separate occasions in this
+  investigation (attempt 3's and attempt 5/6's much-improved numbers both hid the same unchanged
+  qualitative failure) -- the wide-camera trajectory/heading-over-time trace was the only check
+  that actually caught it, reinforcing this project's existing "reward curve alone can hide a
+  broken behavior" lesson in a new form.
 - A real quadruped's foot-placement mechanism (vary per-leg stride length with commanded curvature,
   don't just loosen gait timing) is a better mental model for RL reward design here than "relax a
   constraint and hope" -- even though it didn't fully solve this specific problem, it did fix a
-  real regression and is likely useful for any future turning attempt.
+  real regression (attempt 3) and is likely useful for any future turning attempt.
 - Verify a tricky kinematics formula numerically (pure rigid-body simulation, independent of
   MuJoCo) before trusting it in a reward -- caught a sign-flip near-miss this way before it ever
-  reached training.
+  reached training, and the same discipline caught a second, PRE-EXISTING unverified sign
+  assumption (the calf-reference mechanism) that had been sitting in the codebase since before
+  Stage 10c even started.
+- Before concluding something is a fundamental limitation of an approach (here: RL/PPO for
+  sustained turning), check whether anyone else has actually solved the same problem with the same
+  method -- in this case, yes, extensively, which reframed the finding from "RL can't do this" to
+  "this project's compute scale and setup can't do this yet," a materially different and more
+  useful conclusion.
+- Combining two previously-separate, individually-untested changes in one attempt (here: a
+  dormant mechanism + a brand-new bias term) makes a negative result ambiguous -- attempt 7 can't
+  cleanly say whether `use_gait_reference` itself is unviable, whether `yaw_rate_swing_gain` is
+  wrong, or whether it's the combination; a cleaner follow-up would validate each in isolation first.
 
 ## Next stages
 

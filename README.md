@@ -106,10 +106,14 @@ failure and fix, in [HISTORY.md](HISTORY.md)):
     well-understood (not chased further) convergence weak spot when a goal
     happens to land near an obstacle. Real turning capability was then
     attempted (training the policy itself, not just the outer loop) and
-    found a genuine, repeatable limit: three structurally different
+    found a genuine, repeatable limit: four structurally different
     training approaches all converged on the same failure — the robot
     holds a small bounded heading wobble instead of sustaining a turn.
-    Two real bugs were found and fixed along the way (one general, project-
+    Research context suggests this is specific to this project's compute
+    scale, not a fundamental limit of RL — others have solved the same
+    problem with the same algorithm (PPO) using orders of magnitude more
+    training experience via massively-parallel GPU simulation. Two real
+    bugs were found and fixed along the way (one general, project-
     wide lesson about `--resume`'s learning-rate schedule); not adopted.
 
 ## Repository layout

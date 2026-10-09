@@ -471,6 +471,36 @@ def main():
                     help="Control steps (~60ms at 50Hz) a leg may be overdue for stance before "
                          "--gait-clock-wait-for-contact treats it as a real stall worth pausing "
                          "for, rather than ordinary swing-to-stance landing lag.")
+
+    # ---- mechanical gait reference (a MECHANICAL guarantee, not a reward incentive -- built but
+    # never actually used by any working run so far) ----
+    g = parser.add_argument_group("mechanical gait reference")
+    g.add_argument("--use-gait-reference", action=argparse.BooleanOptionalAction, default=False,
+                    help="Force the thigh joints to follow a prescribed diagonal-trot oscillation; "
+                         "the policy's action for these 4 indices only contributes a small residual "
+                         "(--thigh-residual-scale) on top, so it can't cancel the swing out the way "
+                         "reward-only shaping repeatedly let some legs 'opt out' of stepping "
+                         "entirely. Default False = unused by every checkpoint so far.")
+    g.add_argument("--gait-swing-amplitude", type=float, default=0.35,
+                    help="Radians of prescribed thigh oscillation. Only matters with "
+                         "--use-gait-reference.")
+    g.add_argument("--thigh-residual-scale", type=float, default=0.15,
+                    help="Policy's residual authority over the thigh target, rad -- kept well below "
+                         "--gait-swing-amplitude so the reference always dominates.")
+    g.add_argument("--use-calf-reference", action=argparse.BooleanOptionalAction, default=False,
+                    help="ALSO force a prescribed calf-flexion oscillation for foot clearance. Only "
+                         "matters with --use-gait-reference.")
+    g.add_argument("--calf-lift-amplitude", type=float, default=0.3)
+    g.add_argument("--calf-residual-scale", type=float, default=0.15)
+    g.add_argument("--yaw-rate-swing-gain", type=float, default=0.0,
+                    help="Stage 10c attempt 7: bias EACH leg's own prescribed swing amplitude by "
+                         "target_yaw_rate * that leg's left/right offset -- the real mechanism a "
+                         "quadruped's foot-placement controller uses to turn (outside leg gets a "
+                         "longer prescribed stride), baked into the MECHANICAL reference instead of "
+                         "just a reward incentive. Only matters with --use-gait-reference. 0.0 "
+                         "(default) = off.")
+
+    g = parser.add_argument_group("gait clock (prescribed diagonal-trot timing), continued")
     g.add_argument("--phase-match-weight", type=float, default=0.0,
                     help="Reward for matching the prescribed diagonal-trot timing above. This is "
                          "what actually fixed the front/rear step-rate mismatch (see README) -- "
@@ -835,6 +865,13 @@ def main():
         flight_bonus_scale=args.flight_bonus_scale,
         gait_clock_wait_for_contact=args.gait_clock_wait_for_contact,
         gait_clock_grace_steps=args.gait_clock_grace_steps,
+        use_gait_reference=args.use_gait_reference,
+        gait_swing_amplitude=args.gait_swing_amplitude,
+        thigh_residual_scale=args.thigh_residual_scale,
+        use_calf_reference=args.use_calf_reference,
+        calf_lift_amplitude=args.calf_lift_amplitude,
+        calf_residual_scale=args.calf_residual_scale,
+        yaw_rate_swing_gain=args.yaw_rate_swing_gain,
         phase_match_weight=initial_phase_match_weight, air_time_weight=args.air_time_weight,
         phase_match_stair_relax=args.phase_match_stair_relax,
         phase_match_slope_relax=args.phase_match_slope_relax,

@@ -509,6 +509,29 @@ class Go1FlatEnv(gym.Env):
                                                # smoke_test.py --record before re-enabling this for
                                                # real training.
         gait_swing_amplitude: float = 0.35,   # radians of prescribed thigh oscillation
+        yaw_rate_swing_gain: float = 0.0,     # Stage 10c, attempt 7: bias EACH leg's own prescribed
+                                               # swing amplitude by target_yaw_rate * that leg's
+                                               # left/right offset, mirroring yaw_rate_footwork_weight's
+                                               # reward-only incentive but baked into the MECHANICAL
+                                               # reference this time (only takes effect when
+                                               # use_gait_reference=True) -- a real quadruped's
+                                               # foot-placement controller works this way: the
+                                               # outside leg gets a longer prescribed stride, the
+                                               # inside leg a shorter one, so the policy only has to
+                                               # learn a small residual correction around an
+                                               # already-turning-shaped reference, instead of having
+                                               # to discover the whole asymmetric gait via reward
+                                               # pressure on an undirected (and therefore much
+                                               # harder to stumble into) joint-space exploration.
+                                               # Sign verified empirically (not just derived): a
+                                               # LARGER thigh angle moves this robot's foot BACKWARD
+                                               # (confirmed via direct FK, not assumed), so a bigger
+                                               # swing amplitude means a longer fore-aft stride --
+                                               # the formula below increases amplitude for the leg on
+                                               # the outside of the turn, decreases it for the
+                                               # inside leg. 0.0 (default) = off, unchanged behavior
+                                               # (also a no-op whenever use_gait_reference=False,
+                                               # i.e. every checkpoint trained before this).
         thigh_residual_scale: float = 0.15,   # policy's residual authority over thigh target,
                                                # rad -- kept well below gait_swing_amplitude so
                                                # the reference always dominates and can't be
@@ -668,6 +691,7 @@ class Go1FlatEnv(gym.Env):
         self._stance_wait = np.zeros(4)
         self.use_calf_reference = use_calf_reference
         self.gait_swing_amplitude = gait_swing_amplitude
+        self.yaw_rate_swing_gain = yaw_rate_swing_gain
         self.thigh_residual_scale = thigh_residual_scale
         self.calf_lift_amplitude = calf_lift_amplitude
         self.calf_residual_scale = calf_residual_scale
@@ -1043,8 +1067,14 @@ class Go1FlatEnv(gym.Env):
             # well below gait_swing_amplitude), it can no longer cancel the swing out.
             phase = self._gait_phase()
             leg_phases = (phase + GAIT_PHASE_OFFSETS[self.gait_style]) % 1.0
+            # Stage 10c, attempt 7: bias each leg's own prescribed swing amplitude by
+            # target_yaw_rate * that leg's left/right offset (see yaw_rate_swing_gain's
+            # docstring above for the verified sign) -- a no-op (identical per-leg amplitude)
+            # at yaw_rate_swing_gain=0 or target_yaw_rate=0, exactly backward-compatible.
+            per_leg_amplitude = self.gait_swing_amplitude - \
+                self.yaw_rate_swing_gain * self.target_yaw_rate * self._nominal_foot_y
             thigh_reference = DEFAULT_JOINT_POS[THIGH_IDX] + \
-                self.gait_swing_amplitude * np.sin(2 * np.pi * leg_phases)
+                per_leg_amplitude * np.sin(2 * np.pi * leg_phases)
             target_qpos[THIGH_IDX] = thigh_reference + self.thigh_residual_scale * action[THIGH_IDX]
 
             if self.use_calf_reference:
