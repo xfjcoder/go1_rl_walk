@@ -1975,6 +1975,16 @@ before the turning question even gets a fair test -- conflating "does a mechanic
 turning" with "is this specific mechanical reference viable at all" on the very first attempt to
 use it for anything.
 
+<p align="center">
+  <img src="media/go2_turn_rate_gaitref_attempt7.gif" width="420" alt="Go2 attempt 7 (mechanical gait reference + yaw-rate bias), still walking nearly straight but visibly less stable">
+</p>
+
+*Attempt 7's own trajectory trace, same 0.3 m/s + 0.3 rad/s command as above -- still an almost
+straight path (final heading -6.5°, same qualitative failure), but the gait itself reads as
+visibly less composed than attempt 6's, consistent with the 8/8-falls result found at the
+no-turn-commanded baseline: the forced mechanical swing appears to cost basic stability before the
+turning question ever gets a fair test.*
+
 **Research context, prompted by asking "has anyone else used RL for this at all" rather than
 assuming the answer:** turning via RL is a well-established, largely-solved problem in the broader
 legged-robot literature, including with the SAME core algorithm (PPO) this project uses, and in
