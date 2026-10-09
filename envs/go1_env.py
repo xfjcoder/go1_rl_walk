@@ -310,6 +310,42 @@ class Go1FlatEnv(gym.Env):
                                                # curriculum ramp (no ramp here -- lateral speeds are
                                                # small and don't need one). None (default) = fixed
                                                # target_lateral_speed above.
+        target_yaw_rate: float = 0.0,          # rad/s, commanded turning rate (Stage 10c). 0.0
+                                               # (default) matches every run before this flag existed
+                                               # exactly: the command's yaw-rate slot was hardcoded to
+                                               # 0.0, and r_heading's yaw term pulled absolute yaw
+                                               # toward zero unconditionally -- which is exactly what
+                                               # tracking a heading reference that never moves (see
+                                               # _heading_ref below) still does at target_yaw_rate=0.
+        yaw_rate_range: tuple | None = None,   # (lo, hi): sample target_yaw_rate ~ U(lo, hi) every
+                                               # reset, mirrors lateral_speed_range exactly. None
+                                               # (default) = fixed target_yaw_rate above.
+        yaw_rate_tracking_weight: float = 0.0,  # reward exp(-((ang_vel[2]-target_yaw_rate)/sigma)^2)
+                                               # for matching the commanded turn rate -- mirrors
+                                               # lateral_tracking_weight's own pattern exactly. 0.0
+                                               # (default) = off, unchanged behavior. NOTE: using this
+                                               # together with a nonzero yaw_rate_weight (below) is
+                                               # self-defeating -- that term penalizes ANY turning,
+                                               # which directly fights a nonzero commanded rate; keep
+                                               # yaw_rate_weight at 0 when yaw_rate_range is active.
+        yaw_rate_tracking_sigma: float = 0.3,
+        yaw_rate_footwork_weight: float = 0.0,  # reward weight for each STANCE foot's body-frame
+                                               # forward velocity matching a PER-LEG target that
+                                               # differs by how far left/right of centerline that
+                                               # leg sits -- the real mechanism a quadruped's foot-
+                                               # placement controller uses to turn (outside leg
+                                               # takes a longer effective stride than inside leg),
+                                               # verified via pure rigid-body kinematics before
+                                               # implementing: for a perfectly-planted (non-slipping)
+                                               # foot, body-frame forward velocity during stance is
+                                               # -target_speed + target_yaw_rate*foot_y_nominal --
+                                               # i.e. more negative (foot receding faster relative to
+                                               # the body) for the outside leg, less negative for the
+                                               # inside leg, during a turn. 0.0 (default) = off,
+                                               # unchanged behavior (also a no-op at target_yaw_rate=0
+                                               # regardless of weight, since the target then reduces
+                                               # to -target_speed for every leg identically).
+        yaw_rate_footwork_sigma: float = 0.2,  # m/s
         air_time_cap: bool = False,            # cap the touchdown air-time credit at target_air_time
                                                # (credit = min(air, target) - target <= 0). Uncapped, one long
                                                # 457 ms lift of a single leg out-earned several normal steps
@@ -597,6 +633,14 @@ class Go1FlatEnv(gym.Env):
         self.lateral_tracking_sigma = lateral_tracking_sigma
         self.target_lateral_speed = target_lateral_speed
         self.lateral_speed_range = tuple(lateral_speed_range) if lateral_speed_range else None
+        self.target_yaw_rate = target_yaw_rate
+        self.yaw_rate_range = tuple(yaw_rate_range) if yaw_rate_range else None
+        self.yaw_rate_tracking_weight = yaw_rate_tracking_weight
+        self.yaw_rate_tracking_sigma = yaw_rate_tracking_sigma
+        self.yaw_rate_footwork_weight = yaw_rate_footwork_weight
+        self.yaw_rate_footwork_sigma = yaw_rate_footwork_sigma
+        self._prev_foot_body_xy = None  # set each reset(); None means "skip this step's finite
+                                         # difference" (first step after reset has no prior sample)
         self._episode_gait_period = gait_period
         self.lateral_position_weight = lateral_position_weight
         self.max_foot_duty_cycle = max_foot_duty_cycle
@@ -675,6 +719,20 @@ class Go1FlatEnv(gym.Env):
         )
         self._foot_radius = float(self.model.geom_size[self._foot_geom_ids[0], 0])  # site is at sphere centre
         self._contact_force = np.zeros(6)
+        # Nominal per-foot body-frame LEFT/RIGHT offset at the standing pose (Stage 10c: used by
+        # yaw_rate_footwork_weight to target each leg's stance-phase velocity differently based on
+        # how far left/right of centerline it sits -- a real quadruped's outside leg needs a
+        # longer effective stride than its inside leg when turning, mirroring a Raibert-style
+        # foot-placement controller rather than just loosening the gait-timing constraint).
+        # Fixed robot geometry, computed once here rather than varying per-episode.
+        key_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_KEY, "stand")
+        mujoco.mj_resetDataKeyframe(self.model, self.data, key_id)
+        mujoco.mj_forward(self.model, self.data)
+        trunk_pos0, quat0 = self.data.qpos[0:3].copy(), self.data.qpos[3:7].copy()
+        self._nominal_foot_y = np.array([
+            self._quat_rotate_inv(quat0, self.data.site_xpos[sid] - trunk_pos0)[1]
+            for sid in self._foot_site_ids
+        ])
         self._touch_sensor_adr = {
             n: self.model.sensor_adr[mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_SENSOR, n)]
             for n in FOOT_TOUCH_SENSORS
@@ -803,6 +861,8 @@ class Go1FlatEnv(gym.Env):
             self.target_speed = float(self._rng.uniform(lo, max(self.speed_max_current, lo)))
         if self.lateral_speed_range is not None:
             self.target_lateral_speed = float(self._rng.uniform(*self.lateral_speed_range))
+        if self.yaw_rate_range is not None:
+            self.target_yaw_rate = float(self._rng.uniform(*self.yaw_rate_range))
         stair_h = 0.0   # overwritten below if stairs are enabled; needed here for the gait-period stretch
 
         if self.mass_scale_range is not None:
@@ -934,10 +994,15 @@ class Go1FlatEnv(gym.Env):
                 mujoco.mj_forward(self.model, self.data)
         self._prev_action[:] = 0.0
         self._prev_lin_vel_x = 0.0  # true at reset -- the stand keyframe has zero velocity
+        self._prev_foot_body_xy = None  # skip the footwork finite-difference for this episode's first step
         self._lateral_ref_pos = 0.0  # moving reference for r_heading's y-drift term, accumulated
                                       # by target_lateral_speed each step; starts at the keyframe's
                                       # y=0, so at target_lateral_speed=0 it stays 0 forever --
                                       # exactly reproducing the old "drift from the start line" term
+        self._heading_ref = 0.0      # moving reference for r_heading's yaw term (Stage 10c),
+                                      # accumulated by target_yaw_rate each step, mirroring
+                                      # _lateral_ref_pos exactly -- at target_yaw_rate=0 it stays 0
+                                      # forever, exactly reproducing the old "pull yaw to zero" term
         self._step_count = 0
         self._phase = 0.0
         self._stance_wait[:] = 0.0
@@ -1289,7 +1354,10 @@ class Go1FlatEnv(gym.Env):
         joint_pos = self.data.qpos[self._joint_qpos_adr] - DEFAULT_JOINT_POS
         joint_vel = self.data.qvel[self._joint_qvel_adr]
 
-        command = np.array([self.target_speed, self.target_lateral_speed, 0.0], dtype=np.float32)  # vx, vy, yaw_rate
+        command = np.array([self.target_speed, self.target_lateral_speed, self.target_yaw_rate],
+                           dtype=np.float32)  # vx, vy, yaw_rate -- yaw_rate was hardcoded 0.0 before
+                                              # Stage 10c; self.target_yaw_rate defaults to 0.0 too,
+                                              # so this is exactly backward-compatible unless set.
 
         phase = self._gait_phase()
         phase_clock = np.array([np.sin(2 * np.pi * phase), np.cos(2 * np.pi * phase)], dtype=np.float32)
@@ -1393,6 +1461,11 @@ class Go1FlatEnv(gym.Env):
         r_lateral = -0.5 * (lat_vel_err ** 2 + lin_vel[2] ** 2)
         r_yaw_rate = -self.yaw_rate_weight * ang_vel[2] ** 2
         r_lat_track = self.lateral_tracking_weight * float(np.exp(-(lat_vel_err / self.lateral_tracking_sigma) ** 2))
+        # Stage 10c: reward matching the COMMANDED turn rate, mirroring r_lat_track's own pattern.
+        # Reduces to a no-op at the default target_yaw_rate=0 / yaw_rate_tracking_weight=0.
+        yaw_rate_err = ang_vel[2] - self.target_yaw_rate
+        r_yaw_rate_track = self.yaw_rate_tracking_weight * float(
+            np.exp(-(yaw_rate_err / self.yaw_rate_tracking_sigma) ** 2))
 
         # 2b. Penalize lateral / heading POSITION drift directly. The velocity term
         # above only discourages instantaneous sideways speed -- a small, constant
@@ -1412,8 +1485,24 @@ class Go1FlatEnv(gym.Env):
         # command this instead penalizes falling behind/ahead of the commanded strafe, not the
         # strafe itself.
         lateral_err = y_pos - self._lateral_ref_pos
-        r_heading = -self.heading_weight * (yaw ** 2) - self.lateral_position_weight * (lateral_err ** 2)
+        # heading_err is measured against a MOVING reference (self._heading_ref), mirroring
+        # lateral_err above exactly -- accumulates target_yaw_rate each step starting from the
+        # reset's own 0.0, so at target_yaw_rate=0 (default) it stays 0 forever and heading_err
+        # reduces to plain yaw, exactly backward-compatible. NOT a full curved-path tracker: while
+        # actually turning, lateral_err above still assumes straight-line world-frame motion (the
+        # lateral-position reference doesn't rotate with the commanded turn) -- a known, accepted
+        # scope limit for Stage 10c, not an oversight (see HISTORY.md).
+        # CRITICAL: yaw (from atan2) is always wrapped to [-pi, pi], but _heading_ref accumulates
+        # UNWRAPPED (e.g. 10 rad after 20s at target_yaw_rate=0.5 rad/s) -- a raw subtraction
+        # explodes to several radians of spurious "error" every time yaw wraps around, even for a
+        # policy tracking the commanded rate perfectly. Wrap the DIFFERENCE to [-pi, pi] instead.
+        # No-op at target_yaw_rate=0 (heading_ref stays 0, and realistic yaw never nears +-pi), so
+        # still exactly backward-compatible.
+        heading_err = yaw - self._heading_ref
+        heading_err = (heading_err + np.pi) % (2 * np.pi) - np.pi
+        r_heading = -self.heading_weight * (heading_err ** 2) - self.lateral_position_weight * (lateral_err ** 2)
         self._lateral_ref_pos += self.target_lateral_speed / self.control_hz
+        self._heading_ref += self.target_yaw_rate / self.control_hz
 
         # 3. Penalize roll/pitch (staying upright): gravity_vec should be ~[0,0,-1].
         # NOTE: this term is blind to yaw -- pure yaw rotation doesn't change the
@@ -1445,6 +1534,24 @@ class Go1FlatEnv(gym.Env):
         foot_heights_for_contact = foot_xyz[:, 2] - self._foot_radius - self._terrain_height(foot_xyz[:, 0], foot_xyz[:, 1])  # sole height above the ground
         touches = self._foot_contacts()
         n_contacts = touches.sum()
+
+        # Stage 10c: per-leg stance-phase stride asymmetry for turning (see
+        # yaw_rate_footwork_weight's docstring above for the verified formula). Finite-difference
+        # each foot's body-frame XY position against last step's (skipped on the first step after
+        # reset, when there's no prior sample yet).
+        trunk_pos = self.data.qpos[0:3]
+        foot_body_xy = np.array([self._quat_rotate_inv(quat, foot_xyz[i] - trunk_pos)[:2] for i in range(4)])
+        if self._prev_foot_body_xy is not None and self.yaw_rate_footwork_weight > 1e-9:
+            foot_vel_body_x = (foot_body_xy[:, 0] - self._prev_foot_body_xy[:, 0]) * self.control_hz
+            target_foot_vel_x = -self.target_speed + self.target_yaw_rate * self._nominal_foot_y
+            footwork_err = foot_vel_body_x - target_foot_vel_x
+            stance = touches.astype(np.float32)
+            r_yaw_rate_footwork = self.yaw_rate_footwork_weight * (
+                float(np.sum(stance * np.exp(-(footwork_err / self.yaw_rate_footwork_sigma) ** 2)) / max(stance.sum(), 1.0))
+            )
+        else:
+            r_yaw_rate_footwork = 0.0
+        self._prev_foot_body_xy = foot_body_xy
 
         # Gait-phase reference: per-leg desired stance/swing from a periodic clock (trot:
         # diagonal pairs FR+RL / FL+RR alternate; bound: front pair / rear pair alternate),
@@ -1602,6 +1709,8 @@ class Go1FlatEnv(gym.Env):
             lateral=r_lateral,
             yaw_rate=r_yaw_rate,
             lateral_tracking=r_lat_track,
+            yaw_rate_tracking=r_yaw_rate_track,
+            yaw_rate_footwork=r_yaw_rate_footwork,
             heading=r_heading,
             orientation=r_orientation,
             ang_vel=r_ang_vel,

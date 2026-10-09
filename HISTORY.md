@@ -1800,6 +1800,161 @@ left as a known, explained limitation rather than chased further -- 10c (turning
 other scoped-but-not-started follow-up, still not indicated by anything found so far (the failures
 here are a convergence artifact of the potential-field method, not a strafe-only limitation).
 
+## Stage 10c: real turning capability (Go2) — tried, stopped, NOT adopted
+
+Nothing in 10a/10b's numbers indicated this was needed (0% collisions even where an obstacle sat
+directly on the path), and it's a materially bigger undertaking than 10a/10b (training the policy
+itself, not just an outer-loop script) -- explicitly flagged to the user before starting. User chose
+to pursue it anyway. Six training runs and two real bugs later, this section documents a genuine,
+well-investigated negative result, not a quick abandonment.
+
+**Design** (mirrors `target_lateral_speed`'s own established pattern, not a new mechanism): added
+`target_yaw_rate`/`yaw_rate_range` -- the command vector's long-reserved 3rd slot (always hardcoded
+`0.0` before this) now carries it. `r_heading`'s yaw term changed from penalizing absolute yaw²
+toward 0 to penalizing deviation from a moving reference `self._heading_ref` that accumulates
+`target_yaw_rate` each step, exactly mirroring how `self._lateral_ref_pos` already works for
+lateral position -- at `target_yaw_rate=0` (every existing checkpoint) `heading_ref` stays 0
+forever, bit-identical to the old behavior. New `yaw_rate_tracking_weight`/`yaw_rate_tracking_sigma`
+reward term mirrors `lateral_tracking_weight`.
+
+**Bug #1, found from the first training run's own live tensorboard numbers, not a final eval:**
+`heading` reward showed -8.66, wildly large. Root cause: `yaw` (from `atan2`) is always wrapped to
+`[-pi, pi]`, but `_heading_ref` accumulates UNWRAPPED (~10 rad after a 20s episode at 0.5 rad/s) --
+a raw subtraction exploded by multiples of 2π every time `yaw` wrapped, punishing a policy tracking
+the command perfectly for an angle difference that's an artifact of not wrapping. Fixed:
+`heading_err = (heading_err + pi) % (2*pi) - pi`. Verified directly: the same target heading now
+gives an identical wrapped error regardless of how many extra full turns `heading_ref` had
+accumulated (was growing unbounded before: -3.63, -9.91, -16.19, -22.48... per extra turn). Re-
+verified byte-identical backward-compatible on `go2_gaitclock` and `go2_latback` after the fix.
+
+**Finding #2, general and reusable, not Stage-10c-specific: `train.py --resume`'s learning-rate
+schedule silently dilutes as a checkpoint's lineage grows.** The first bug-fixed training run
+showed `yaw_rate_tracking` reward flat the ENTIRE 8M steps, `approx_kl`/`clip_fraction` collapsed
+to ~0, `learning_rate` ending at 1.02e-08 -- essentially no learning happened. Traced to SB3's own
+`_setup_learn` (read directly, not assumed): on `--resume`, `total_timesteps = args.timesteps +
+num_timesteps_already_in_checkpoint`, so `progress_remaining` (and therefore the learning-rate
+schedule) is computed against the FULL historical step count, not just the new run's own budget.
+`go2_latback` already had 128,122,880 cumulative steps; an 8M-step fine-tune therefore only got
+`8M/136M ≈ 5.9%` of the nominal LR range, starting already-decayed (observed 1.74e-05 at the very
+first logged iteration, vs the `--learning-rate 3e-4` default it should start near). **The longer a
+checkpoint's own lineage, the smaller the effective LR window every subsequent fine-tune gets,
+unless explicitly compensated.** Not retroactively audited against every past stage's own
+fine-tunes, but flagged as a plausible partial explanation for some past "fine-tune barely moved
+the needle" results project-wide that were attributed entirely to other causes -- this mechanism
+was never checked as a contributing factor before now. Fixed for this run by computing the exact
+compensation factor so the run's own window gets a properly-scoped 3e-4→0 decay
+(`--learning-rate = 3e-4 / (budget/(prior+budget))`).
+
+**Attempt 2 (properly LR-compensated): fixed the flat-reward problem, caused a worse one.**
+`gait_stats.py` (not just the now-healthy-looking reward curve) revealed a genuine regression: the
+forward+turn combo had a permanently dead leg (FR, 0 steps/s, robot barely moved -- x=+0.08m after
+a 20s episode commanded at 0.8m/s), and even PLAIN forward walking (no turn) regressed vs
+`go2_latback`'s own clean baseline (step-rate spread 3.53 vs 1.21). The compensated learning rate,
+while correctly scoped, was simply too large for a checkpoint this deep into convergence --
+checked and ruled out a structural reward conflict first (`body_frame_velocity`'s rotation uses the
+robot's live yaw, correctly follows a turning body, no conflict there).
+
+**The user asked "how does the real Go2 handle this" -- this reframed the fix materially.** Real
+quadruped controllers (classical MPC/Raibert-heuristic ones and most learned-RL ones) don't relax
+gait TIMING to permit turning -- they vary per-leg STRIDE LENGTH/foot placement based on the
+commanded body twist: the leg outside the turn takes a longer effective stride than the inside leg
+(like a car's differential), while the trot RHYTHM itself stays essentially fixed. This reframed the
+fix away from the originally-planned "relax the existing stairs/slopes-style phase-match
+constraint" toward a new, more targeted mechanism.
+
+**`yaw_rate_footwork_weight`/`yaw_rate_footwork_sigma`** (new): for each STANCE foot, reward its
+body-frame forward velocity matching a PER-LEG target: `-target_speed + target_yaw_rate *
+foot_y_nominal[leg]` (`foot_y_nominal` = each foot's fixed left/right offset from centerline at the
+standing pose, computed once via FK on the "stand" keyframe -- FR/RR=-0.142, FL/RL=+0.142, matching
+the project's own "+y=left" convention). **Verified the formula via pure rigid-body kinematics
+before implementing** (a near-miss worth noting: caught myself flipping a sign mid-derivation by
+hand first) -- simulated a world-fixed point under a commanded body twist, finite-differenced its
+body-frame position, confirmed it matches for both a left and right foot. Then verified the actual
+CODE (not just the math) via a crafted scenario where the finite-differenced velocity exactly
+equals the target -- reward correctly peaked at 1.0. Verified byte-identical backward-compatible
+afterward (touches `__init__` via a new keyframe FK read, and the reward hot path).
+
+**Attempt 3 (footwork mechanism + a gentler re-compensated LR, targeting an effective start of
+~1e-4 instead of ~3e-4): fixed the catastrophic regression, but real turning still didn't emerge.**
+`gait_stats.py`: no dead leg, healthy 4-leg gait both pure-forward (spread 1.68) and forward+turn
+combo (spread 1.72-2.02). `eval_policy.py`: 0% falls across yaw-rate -0.5/0/+0.5 at 0.8m/s (a first
+attempt at this accidentally triggered `go2_latback`'s own full 225-675-combination auto-sweep grid
+by only pinning 2 of 6 trained axes -- several minutes' runtime, not a bug, just the existing
+"sweep every unpinned trained axis" design doing exactly what it's built to do). But a wide-camera
+trajectory trace (not just the reward numbers, which looked fine) told a different story: commanded
+0.8 m/s forward + 0.3 rad/s turn for 12s should produce ~206° of rotation; actual final heading was
+8.0°. The policy learned to survive and track forward speed while mostly IGNORING the turn command.
+
+**Attempts 4/5 (2.4x stronger `yaw_rate_tracking_weight`/`yaw_rate_footwork_weight`, 50% more
+steps, continuing from the attempt-3 checkpoint): reward numbers nearly doubled, the qualitative
+failure stayed identical.** `ep_rew_mean` went -109→+76.5 (first positive mean reward of any
+attempt), `yaw_rate_tracking` 0.189→0.507, `yaw_rate_footwork` 0.184→0.422 -- looked like real
+progress. The trajectory trace said otherwise: final heading only ~11.3° (still nowhere near 206°),
+and critically the yaw trace OSCILLATED (11.5→10.1→8.2→13.4→11.3° over the episode) rather than
+growing -- the policy finds a small, bounded heading offset and holds it, doesn't sustain rotation.
+**Improving the aggregate reward metric didn't change the qualitative behavior** -- strong evidence
+this isn't a simple weight/LR-tuning problem.
+
+**Attempt 6: training from scratch, not fine-tuning the already-converged (now turn-naive-biased)
+`go2_latback` lineage -- mirrors Stage 8's own precedent exactly** (lateral/backward capability
+only became robust when trained from scratch, not fine-tuned onto `go2_gaitclock`, due to
+"shared-network interference" from an already-converged ancestor). Deliberately scoped down for a
+fast, clean test of the core hypothesis: flat ground only, fixed single values (not ranges;
+target_speed=0.3, target_yaw_rate=0.3, target_lateral_speed=0.0 -- lateral deliberately left out to
+isolate yaw-rate as the one new variable), mirroring Stage 8's own proven first-bootstrap recipe
+exactly (`phase_match_weight=0.5`, `trot_weight=0`, `foot_duty_weight=0.6`, duty band [0.3,0.65] --
+the precise fixes that resolved Stage 8's own dead-leg and posture bugs). A from-scratch run also
+sidesteps the LR-dilution issue entirely (confirmed `learning_rate=0.0003` at the first log, as
+expected with no `--resume`). **Same qualitative failure a third time**, arguably the cleanest
+demonstration of it: `ep_rew_mean=442`, the highest of any attempt -- but final heading was -3.8°
+(wrong SIGN, despite a positive commanded rate the entire episode), oscillating -4.2° to 14.3°
+throughout, never accumulating.
+
+**Three structurally different approaches -- a fine-tune at normal weights, a fine-tune at 2.4x
+weights with more steps, and training completely from scratch -- converged on the identical
+qualitative failure.** That is the same strength of evidence this project has used elsewhere
+(ascending stairs, flight-phase gait, sim-to-real latency) to call something a genuine limit rather
+than a tuning problem. Working hypothesis, not fully proven: sustaining a constant nonzero yaw rate
+while walking is a continuously-unstable control problem (constantly fighting the trot gait's own
+natural tendency to self-stabilize toward straight-line symmetry), unlike forward-velocity tracking
+which has a natural restoring tendency -- small heading deviations cost little, so across every
+optimizer path tried, the policy keeps finding the same cheap local optimum: absorb a small bounded
+wobble, don't commit to the harder sustained-asymmetric-gait behavior real turning requires.
+
+<p align="center">
+  <img src="media/go2_turn_rate_straight_not_curved.gif" width="420" alt="Go2 commanded to turn continuously while walking forward, but walking an almost straight line instead">
+</p>
+
+*Commanded 0.3 m/s forward + a continuous 0.3 rad/s turn for the entire 12-second clip (should
+curve into roughly two-thirds of a full circle) -- instead walks in an almost dead-straight line
+with only a barely perceptible wobble. This is the cleanest (from-scratch, attempt 6) of three
+structurally different attempts that all produced the same qualitative failure.*
+
+**DECISION: stopped here, NOT adopted.** None of `runs/go2_turn_footwork*`/`go2_turn_scratch` were
+promoted to `pretrained/`; `go2_gaitclock`/`go2_latback` are unaffected. `target_yaw_rate`/
+`yaw_rate_range`/`yaw_rate_tracking_weight`/`yaw_rate_footwork_weight`/the `_heading_ref` wrapping
+fix all stay in the codebase (default off / zero target, verified backward-compatible) as reusable
+infrastructure if this is revisited with a better-scoped approach -- candidates not tried: a much
+narrower yaw-rate range (a gentle drift rather than a real turn), or restructuring the reward to
+directly track cumulative heading change rather than instantaneous rate.
+
+**Reusable lessons from this investigation, independent of whether turning itself ever gets
+revisited:**
+- The LR-schedule-dilution finding (progress_remaining computed against full historical lineage on
+  `--resume`) is general and project-wide, not Stage-10c-specific -- worth remembering for any
+  future fine-tune of a long-lineage checkpoint.
+- Reward curves alone proved insufficient TWICE in this investigation (attempt 3's and attempt
+  5/6's much-improved numbers both hid the same unchanged qualitative failure) -- the wide-camera
+  trajectory/heading-over-time trace was the only check that actually caught it, reinforcing this
+  project's existing "reward curve alone can hide a broken behavior" lesson in a new form.
+- A real quadruped's foot-placement mechanism (vary per-leg stride length with commanded curvature,
+  don't just loosen gait timing) is a better mental model for RL reward design here than "relax a
+  constraint and hope" -- even though it didn't fully solve this specific problem, it did fix a
+  real regression and is likely useful for any future turning attempt.
+- Verify a tricky kinematics formula numerically (pure rigid-body simulation, independent of
+  MuJoCo) before trusting it in a reward -- caught a sign-flip near-miss this way before it ever
+  reached training.
+
 ## Next stages
 
 Terrain-aware observation and a non-trot gait mode were both tried already

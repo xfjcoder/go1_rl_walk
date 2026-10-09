@@ -383,6 +383,27 @@ def main():
                          "Default: fixed --target-lateral-speed.")
     g.add_argument("--lateral-speed-range-max", type=float, default=0.3,
                     help="Upper end of the sampled lateral command range (m/s).")
+    g.add_argument("--target-yaw-rate", type=float, default=0.0,
+                    help="Fixed target turning rate (rad/s). Ignored if --yaw-rate-range-min is set. "
+                         "0.0 (default) = no turning, matching every run before this flag existed.")
+    g.add_argument("--yaw-rate-range-min", type=float, default=None,
+                    help="Enable per-episode yaw-rate command sampling: target_yaw_rate ~ U(min, max). "
+                         "Needs --yaw-rate-range-max. Default: fixed --target-yaw-rate.")
+    g.add_argument("--yaw-rate-range-max", type=float, default=0.5,
+                    help="Upper end of the sampled yaw-rate command range (rad/s).")
+    g.add_argument("--yaw-rate-tracking-weight", type=float, default=0.0,
+                    help="Reward weight for matching the commanded turn rate (Stage 10c). 0.0 "
+                         "(default) = off. Needs a nonzero --yaw-rate-range/--target-yaw-rate to do "
+                         "anything useful; also make sure --yaw-rate-weight is 0 (it penalizes ANY "
+                         "turning, which directly fights this).")
+    g.add_argument("--yaw-rate-tracking-sigma", type=float, default=0.3)
+    g.add_argument("--yaw-rate-footwork-weight", type=float, default=0.0,
+                    help="Reward weight for each stance foot's body-frame forward velocity "
+                         "matching a per-leg target based on how far left/right of centerline it "
+                         "sits (Stage 10c) -- the real foot-placement mechanism a quadruped uses "
+                         "to turn (outside leg takes a longer stride), not a relaxed gait rhythm. "
+                         "0.0 (default) = off.")
+    g.add_argument("--yaw-rate-footwork-sigma", type=float, default=0.2)
 
     # ---- gait clock (prescribed diagonal-trot timing) ----
     g = parser.add_argument_group("gait clock")
@@ -773,6 +794,13 @@ def main():
         target_lateral_speed=args.target_lateral_speed,
         lateral_speed_range=([args.lateral_speed_range_min, args.lateral_speed_range_max]
                              if args.lateral_speed_range_min is not None else None),
+        target_yaw_rate=args.target_yaw_rate,
+        yaw_rate_range=([args.yaw_rate_range_min, args.yaw_rate_range_max]
+                        if args.yaw_rate_range_min is not None else None),
+        yaw_rate_tracking_weight=args.yaw_rate_tracking_weight,
+        yaw_rate_tracking_sigma=args.yaw_rate_tracking_sigma,
+        yaw_rate_footwork_weight=args.yaw_rate_footwork_weight,
+        yaw_rate_footwork_sigma=args.yaw_rate_footwork_sigma,
         gait_period_fast=args.gait_period_fast, gait_period_fast_speed=args.gait_period_fast_speed,
         terrain_amplitude_range=([args.terrain_amp_min, args.terrain_amp_max] if args.terrain_amp_max is not None else None),
         slope_range=([args.slope_min_deg, args.slope_max_deg] if args.slope_max_deg is not None else None),

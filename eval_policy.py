@@ -100,6 +100,10 @@ def main():
                     help="sideways command speed(s) (m/s, body frame, +y = left) to evaluate at. "
                          "Default: the run's fixed target_lateral_speed (0.0 if unset), or "
                          "-0.3 0.0 0.3 for a run trained with a lateral-speed range.")
+    ap.add_argument("--target-yaw-rate", type=float, nargs="+", default=None,
+                    help="turning command(s) (rad/s) to evaluate at. Default: the run's fixed "
+                         "target_yaw_rate (0.0 if unset), or -0.5 0.0 0.5 for a run trained with "
+                         "a yaw-rate range.")
     ap.add_argument("--robot-xml", default=None,
                     help="path to an alternate MJCF file (e.g. assets/go1_mesh.xml) to evaluate the checkpoint "
                          "against, in place of whatever assets/*.xml it was trained on. For sim-to-sim transfer "
@@ -134,6 +138,12 @@ def main():
         lat_speeds = [-0.3, 0.0, 0.3]
     else:
         lat_speeds = [env_kwargs.get("target_lateral_speed", 0.0)]
+    if args.target_yaw_rate is not None:
+        yaw_rates = args.target_yaw_rate
+    elif env_kwargs.get("yaw_rate_range"):
+        yaw_rates = [-0.5, 0.0, 0.5]
+    else:
+        yaw_rates = [env_kwargs.get("target_yaw_rate", 0.0)]
     if args.terrain_amplitude is not None:
         amps = args.terrain_amplitude
     elif trained_on_terrain:
@@ -165,22 +175,25 @@ def main():
                 for ob in obstacles:
                     for v in speeds:
                         for lv in lat_speeds:
-                            # fixed command, terrain amplitude, slope, stair height, obstacle height per evaluation
-                            kw = dict(env_kwargs, target_speed=v, command_speed_range=None,
-                                      target_lateral_speed=lv, lateral_speed_range=None,
-                                      terrain_amplitude_range=None, terrain_amplitude=a,
-                                      slope_range=None, slope_deg=s,
-                                      stair_height_range=None, stair_height=st,
-                                      obstacle_height_range=None, obstacle_height=ob)
-                            e = evaluate(model_path, vec, kw, args.episodes, args.seconds)
-                            terr = "flat" if a is None else f"terrain {a * 100:.0f} cm"
-                            slope_s = "" if s is None else f" slope {s:+.0f}deg"
-                            stair_s = "" if st is None else f" stairs {st * 100:+.0f}cm"
-                            obs_s = "" if ob is None else f" obstacles {ob * 100:.0f}cm"
-                            lat_s = "" if lv == 0.0 else f" lateral {lv:+.2f}m/s"
-                            print(f"{terr:>11s}{slope_s:>11s}{stair_s:>13s}{obs_s:>14s} | command {v:.2f} m/s{lat_s}: fall_rate={e['fall_rate']:.2f}  survival={e['mean_survival_s']:5.1f}s/{args.seconds:.0f}s"
-                                  f"  speed mean={e['speed_mean']:+.3f} median={e['speed_median']:+.3f}"
-                                  f"  |y|={e['abs_y_mean']:.2f} m  |yaw|={e['abs_yaw_mean']:.1f} deg", flush=True)
+                            for yr in yaw_rates:
+                                # fixed command, terrain amplitude, slope, stair height, obstacle height per evaluation
+                                kw = dict(env_kwargs, target_speed=v, command_speed_range=None,
+                                          target_lateral_speed=lv, lateral_speed_range=None,
+                                          target_yaw_rate=yr, yaw_rate_range=None,
+                                          terrain_amplitude_range=None, terrain_amplitude=a,
+                                          slope_range=None, slope_deg=s,
+                                          stair_height_range=None, stair_height=st,
+                                          obstacle_height_range=None, obstacle_height=ob)
+                                e = evaluate(model_path, vec, kw, args.episodes, args.seconds)
+                                terr = "flat" if a is None else f"terrain {a * 100:.0f} cm"
+                                slope_s = "" if s is None else f" slope {s:+.0f}deg"
+                                stair_s = "" if st is None else f" stairs {st * 100:+.0f}cm"
+                                obs_s = "" if ob is None else f" obstacles {ob * 100:.0f}cm"
+                                lat_s = "" if lv == 0.0 else f" lateral {lv:+.2f}m/s"
+                                yaw_s = "" if yr == 0.0 else f" yaw-rate {yr:+.2f}rad/s"
+                                print(f"{terr:>11s}{slope_s:>11s}{stair_s:>13s}{obs_s:>14s} | command {v:.2f} m/s{lat_s}{yaw_s}: fall_rate={e['fall_rate']:.2f}  survival={e['mean_survival_s']:5.1f}s/{args.seconds:.0f}s"
+                                      f"  speed mean={e['speed_mean']:+.3f} median={e['speed_median']:+.3f}"
+                                      f"  |y|={e['abs_y_mean']:.2f} m  |yaw|={e['abs_yaw_mean']:.1f} deg", flush=True)
 
 
 if __name__ == "__main__":

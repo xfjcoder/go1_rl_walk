@@ -50,6 +50,8 @@ def main():
     parser.add_argument("--target-lateral-speed", type=float, default=None,
                          help="Sideways command speed (m/s, body frame, +y = left). "
                               "Default: the run's own with --run-dir, else 0.0.")
+    parser.add_argument("--target-yaw-rate", type=float, default=None,
+                         help="Turning command (rad/s). Default: the run's own with --run-dir, else 0.0.")
     parser.add_argument("--record", type=str, default=None,
                          help="Save an offscreen-rendered GIF instead of opening a live viewer")
     parser.add_argument("--slowmo", type=float, default=1.0,
@@ -85,9 +87,13 @@ def main():
         env_kwargs["target_speed"] = args.target_speed
     if args.target_lateral_speed is not None:
         env_kwargs["target_lateral_speed"] = args.target_lateral_speed
+    if args.target_yaw_rate is not None:
+        env_kwargs["target_yaw_rate"] = args.target_yaw_rate
     env_kwargs["command_speed_range"] = None      # play at one fixed command (--target-speed, else the run's)
     env_kwargs["lateral_speed_range"] = None      # ditto for --target-lateral-speed
+    env_kwargs["yaw_rate_range"] = None           # ditto for --target-yaw-rate
     env_kwargs.setdefault("target_lateral_speed", 0.0)
+    env_kwargs.setdefault("target_yaw_rate", 0.0)
     env_kwargs["terrain_amplitude_range"] = None
     env_kwargs["terrain_amplitude"] = args.terrain_amplitude
     env_kwargs["slope_range"] = None

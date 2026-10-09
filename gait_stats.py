@@ -33,6 +33,8 @@ def main():
     ap.add_argument("--target-speed", type=float, default=None, help="fixed command speed (default: the run's)")
     ap.add_argument("--target-lateral-speed", type=float, default=None,
                     help="fixed sideways command speed (m/s, body frame, +y = left; default: the run's, else 0.0)")
+    ap.add_argument("--target-yaw-rate", type=float, default=None,
+                    help="fixed turning command (rad/s; default: the run's, else 0.0)")
     ap.add_argument("--seconds", type=float, default=20.0)
     args = ap.parse_args()
 
@@ -45,9 +47,13 @@ def main():
         kw["target_speed"] = args.target_speed
     if args.target_lateral_speed is not None:
         kw["target_lateral_speed"] = args.target_lateral_speed
+    if args.target_yaw_rate is not None:
+        kw["target_yaw_rate"] = args.target_yaw_rate
     kw.setdefault("target_lateral_speed", 0.0)
+    kw.setdefault("target_yaw_rate", 0.0)
     kw["command_speed_range"] = None      # fixed command for diagnostics
     kw["lateral_speed_range"] = None      # ditto for --target-lateral-speed
+    kw["yaw_rate_range"] = None           # ditto for --target-yaw-rate
     kw["terrain_amplitude_range"] = None
     kw["terrain_amplitude"] = args.terrain_amplitude
     kw["slope_range"] = None
