@@ -1,0 +1,6 @@
+numpy<2
+scipy<1.13
+matplotlib>=3.7,<3.9
+mujoco
+casadi
+pin

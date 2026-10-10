@@ -7,6 +7,9 @@ __pycache__/
 *.pyc
 MUJOCO_LOG.TXT
 
+# Stage 11 MPC exploration: separate venv (numpy<2/python<3.11-pinned deps, see mpc/README.md)
+mpc/venv/
+
 # Claude Code worktrees, if created inside the repo (git worktree add .claude/worktrees/...)
 .claude/
 

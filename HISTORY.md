@@ -2277,6 +2277,69 @@ sandbox) than anything attempted in this project so far, not undertaken here. `j
 were left installed in the venv (harmless, `mujoco` itself stays pinned to the newer 3.15.0 that
 came along as a dependency, confirmed backward-compatible) in case this benchmark is revisited.
 
+## Stage 11: MPC-based locomotion, as a path to real turning (Go2) — evaluation in progress
+
+A different angle on the turning problem Stage 10c couldn't solve with pure RL: rather than
+training a policy to discover turning from scratch, use a conventional MPC controller as the
+locomotion base (MIT Cheetah-style convex MPC naturally supports yaw-rate commands via its own
+footstep/gait scheduling -- this is literally how real quadruped hardware, including Unitree's own,
+usually does it), with RL as a possible later residual correction on top. Scoped as a staged plan:
+survey and pick an existing open-source MPC stack, get it walking standalone against this project's
+own Go2 model, define an RL-residual interface, train and evaluate the hybrid, decide.
+
+Isolated on its own branch (`stage11-mpc`) and its own Python environment (`mpc/venv` -- the chosen
+controller pins `numpy<2` and `python<3.11`; this project's own venv is numpy 2.x / Python 3.12).
+Nothing here touches `envs/go1_env.py`'s RL pipeline or `assets/go2_mesh.xml` itself. Full details
+in `mpc/README.md`; summary below.
+
+**Picked `go2-convex-mpc`** (MIT license, UC Berkeley MEng capstone, vendored as a git submodule at
+`third_party/go2-convex-mpc`) over the more mature `iit-DLSLab/Quadruped-PyMPC` (527 stars, two
+peer-reviewed papers, tested on real hardware) -- not because it's better, but because its install
+is dramatically simpler in this sandbox (`pip install -e .` vs. compiling `acados` from source),
+and it already ships an explicit yaw-rotation demo for exactly the Go2 + MuJoCo combination this
+project uses.
+
+**Step 1 (survey) and step 2 (get it running standalone) are done.** Verified physics-identical
+(byte-identical mass/inertia/joint-limits/actuator-limits, 3-seed check with nonzero actions) between
+the controller's bundled Go2 model and this project's own `assets/go2_mesh.xml`. Ran the controller's
+own 10-second command-scheduled demo (forward/sideways/stop/pure in-place rotation at 2.0 rad/s/
+combined forward+rotation/forward) against **this project's own Go2 model** (`mpc/go2_mesh_for_mpc.xml`,
+a cosmetically-adapted copy -- see its own header comment), headless (no interactive viewer; this
+sandbox has no display, same constraint `navigate.py`'s own `render_mode="human"` runs into --
+replaced with offscreen `mujoco.Renderer` instead, same workaround used throughout Stage 10's demos).
+
+Found a real integration bug along the way, not a model incompatibility: the controller copies
+MuJoCo's `qpos[7:]` into its own Pinocchio reference model *positionally*, with no name-based
+remapping -- and this project's `go2_mesh.xml` declares its four legs in a different order
+(FR,FL,RR,RL) than the controller's bundled model (FL,FR,RL,RR). Swapping in our XML without
+accounting for this silently swapped which leg's data went where (caught via a foot-position sanity
+check -- one foot landed at a wildly wrong position -- before it could produce a misleading result).
+Fixed by reordering the four leg `<body>` subtrees in the adapted copy to match the controller's own
+convention (XML declaration order doesn't affect physics, only array indexing -- reordering was
+verified not to change mass or body hierarchy).
+
+<p align="center">
+  <img src="media/mpc_turning_demo.gif" width="480" alt="Go2 (this project's own model) performing a command-scheduled walk, sidestep, in-place rotation, and combined walk+turn, driven by a vendored MPC controller">
+</p>
+
+*Tracking camera, this project's own `go2_mesh.xml` (note the "Go2" label and checkerboard floor
+matching every other demo in this project) -- driven by `third_party/go2-convex-mpc`'s own
+command schedule, not a custom script.*
+
+**Result: genuine, repeatable turning, against this project's own robot model.** Achieved yaw rate
+1.91 rad/s during the pure in-place rotation phase and 1.93 rad/s during the combined walk+turn
+phase, against a 2.0 rad/s command -- both slightly *tighter* than the controller's own bundled
+model achieved in the identical test (1.80 / 1.85 rad/s). No spurious rotation during straight-
+walking phases (<0.01 rad/s). This is exactly the simultaneous translation-and-rotation capability
+that four different from-scratch RL training attempts in Stage 10c could never sustain past "a small
+bounded heading wobble."
+
+**Not yet decided: adopt or not.** This is real, repeatable, verified evidence that MPC solves the
+turning problem RL couldn't, on this project's own hardware model -- but nothing has been merged to
+`main`, and the RL-residual integration (steps 3-5 of the staged plan: define the interface, train,
+evaluate, decide) hasn't started. See `mpc/README.md` for the reproducible setup and
+`go1-staged-plan.md` (memory) for current status.
+
 ## Next stages
 
 Terrain-aware observation and a non-trot gait mode were both tried already

@@ -131,6 +131,19 @@ failure and fix, in [HISTORY.md](HISTORY.md)):
     training experience via massively-parallel GPU simulation. Two real
     bugs were found and fixed along the way (one general, project-
     wide lesson about `--resume`'s learning-rate schedule); not adopted.
+11. **MPC-based locomotion, as a path to real turning** (Go2) — a
+    different angle on the turning problem above: use a conventional MPC
+    controller (which naturally supports yaw-rate commands) as the
+    locomotion base instead of training RL to discover turning from
+    scratch, with RL as a possible later residual correction. Evaluation
+    in progress on its own branch (`stage11-mpc`) — survey and "does it
+    actually work against this project's own Go2 model" are done:
+    genuine, repeatable turning (1.91/1.93 rad/s against a 2.0 rad/s
+    command) verified against `assets/go2_mesh.xml` itself, after finding
+    and fixing a real integration bug (positional, not name-based, joint
+    remapping between the controller and this project's model). **Not yet
+    decided whether to adopt** — the RL-residual integration hasn't
+    started. See `mpc/README.md`.
 
 ## Repository layout
 
