@@ -104,7 +104,9 @@ failure and fix, in [HISTORY.md](HISTORY.md)):
     Extended with static obstacle avoidance (a simplified potential field):
     0% collisions even where an obstacle sat directly on the path, with a
     well-understood (not chased further) convergence weak spot when a goal
-    happens to land near an obstacle. Real turning capability was then
+    happens to land near an obstacle. Further extended with multi-waypoint
+    patrol routes (`--waypoint`/`--loop`), reusing the same steering and
+    avoidance logic unchanged. Real turning capability was then
     attempted (training the policy itself, not just the outer loop) and
     found a genuine, repeatable limit: four structurally different
     training approaches all converged on the same failure — the robot

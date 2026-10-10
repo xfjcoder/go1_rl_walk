@@ -1800,6 +1800,40 @@ left as a known, explained limitation rather than chased further -- 10c (turning
 other scoped-but-not-started follow-up, still not indicated by anything found so far (the failures
 here are a convergence artifact of the potential-field method, not a strafe-only limitation).
 
+### Extension: multi-waypoint patrol routes
+
+The cheapest of three follow-up ideas for "extend navigation further" (the other two -- dynamic
+obstacles, perception-based obstacle detection -- are bigger asks, scoped separately below/after).
+Pure outer-loop scripting, no env changes, no retraining: `navigate.py` gained `--waypoint X Y`
+(repeatable, visited in the order given) and `--loop` (cycle back to the first waypoint after the
+last instead of stopping there), reusing `compute_nav_command` completely unchanged -- the only new
+behavior is switching the target on arrival instead of stopping and lingering. Single-goal mode
+(`--goal-x`/`--goal-y`, no `--waypoint` given) collapses to exactly one waypoint internally and was
+verified to still produce byte-identical output to before this change (same seed/goal as Stage 10a's
+own original fix verification: "Reached goal (3.00, 1.50) in 7.0s, final distance 0.07 m" --
+unchanged).
+
+<p align="center">
+  <img src="media/go2_navigate_patrol_loop.gif" width="480" alt="Go2 patrolling a 4-waypoint square loop, steering around an obstacle sitting on one edge">
+</p>
+
+*A 4-waypoint square patrol (`--waypoint 2 0 --waypoint 2 2 --waypoint 0 2 --waypoint 0 0 --loop`),
+1.5 loops shown, with a static obstacle sitting almost exactly on one edge of the route -- the
+existing per-step obstacle-avoidance steering (Stage 10b) needed no changes at all to keep working
+during a multi-leg patrol, since it was already recomputed fresh every control step regardless of
+which single waypoint is currently "the goal."*
+
+Verified combined with `--nav-obstacles` (works unmodified, since obstacle avoidance and waypoint
+switching are two independent concerns -- the obstacle list and the per-step steering law don't
+know or care that the "goal" might change mid-episode) and that `--loop`'s own degenerate case
+(a single waypoint with `--loop` passed by mistake) doesn't do anything strange: `n_wp == 1` always
+takes the original stop-and-linger path regardless of the flag, since there's nowhere else to patrol
+to.
+
+**DECISION: adopted.** `navigate.py`'s `--waypoint`/`--loop` committed; `eval_navigate.py` left
+unchanged (it's a randomized-statistics harness for single goals, not a demo tool -- a "patrol
+route success rate" metric would be a different kind of measurement, not attempted here).
+
 ## Stage 10c: real turning capability (Go2) — tried, stopped, NOT adopted
 
 Nothing in 10a/10b's numbers indicated this was needed (0% collisions even where an obstacle sat

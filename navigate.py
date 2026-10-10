@@ -22,6 +22,8 @@ Usage:
     python navigate.py --goal-x 3.0 --goal-y 1.0 --record out.gif
     python navigate.py --goal-x -2.0 --goal-y 0.0 --terrain-amplitude 0.08 --record out.gif
     python navigate.py --goal-x 4.0 --goal-y 0.0 --nav-obstacles 4 --record out.gif
+    python navigate.py --waypoint 2 0 --waypoint 2 2 --waypoint 0 2 --waypoint 0 0 --loop \
+        --seconds 60 --record patrol.gif
 """
 import argparse
 import json
@@ -71,8 +73,19 @@ def main():
                          help="A checkpoint that supports lateral/backward commands (the default, "
                               "go2_latback) -- go2_gaitclock has no lateral command dimension to drive.")
     parser.add_argument("--model", type=str, default=None)
-    parser.add_argument("--goal-x", type=float, required=True, help="Goal position, world frame, m.")
-    parser.add_argument("--goal-y", type=float, required=True)
+    parser.add_argument("--goal-x", type=float, default=None, help="Goal position, world frame, m. "
+                         "Ignored if --waypoint is given at all.")
+    parser.add_argument("--goal-y", type=float, default=None)
+    parser.add_argument("--waypoint", type=float, nargs=2, action="append", default=None,
+                         metavar=("X", "Y"),
+                         help="Add a waypoint (repeatable, visited in the order given) to a patrol "
+                              "route instead of a single goal -- e.g. "
+                              "'--waypoint 2 0 --waypoint 2 2 --waypoint 0 2' for a 3-stop route. "
+                              "Reuses the exact same per-step steering law for each leg; the only "
+                              "new behavior is switching targets on arrival instead of stopping.")
+    parser.add_argument("--loop", action=argparse.BooleanOptionalAction, default=False,
+                         help="With --waypoint: cycle back to the first waypoint after the last "
+                              "instead of stopping there. Ignored in single-goal mode.")
     parser.add_argument("--tolerance", type=float, default=0.15, help="Success radius, m.")
     parser.add_argument("--kp", type=float, default=1.0,
                          help="Proportional gain: commanded speed (m/s) per metre of remaining "
@@ -98,6 +111,13 @@ def main():
     parser.add_argument("--frame-stride", type=int, default=2)
     parser.add_argument("--camera", type=str, default="track", choices=["track", "chase_rear", "topdown"])
     args = parser.parse_args()
+
+    if args.waypoint:
+        route = [np.array(wp) for wp in args.waypoint]
+    elif args.goal_x is not None and args.goal_y is not None:
+        route = [np.array([args.goal_x, args.goal_y])]
+    else:
+        parser.error("give either --goal-x/--goal-y or at least one --waypoint")
 
     render_mode = "rgb_array" if args.record else "human"
 
@@ -156,20 +176,36 @@ def main():
         print(f"obstacles (ground truth): {[(round(o[0], 2), round(o[1], 2)) for o in obstacles]}")
 
     max_steps = int(args.seconds * 50)
-    goal = np.array([args.goal_x, args.goal_y])
+    n_wp = len(route)
+    current_idx = 0
+    goal = route[current_idx]
     x, y, yaw = 0.0, 0.0, 0.0   # domain_randomize=False -> the keyframe's exact start pose, no jitter
     frames = []
     reached, fell = False, False
     t_reached = None
     closest_clearance = float("inf")
+    visits = []            # (waypoint_idx, time_s) in the order each was reached, incl. repeats if looping
+    just_arrived_idx = None   # guards against re-logging the same arrival every step while lingering
 
     for step in range(1, max_steps + 1):
         dist = float(np.hypot(goal[0] - x, goal[1] - y))
+        # n_wp==1 always "stops" regardless of --loop (nothing else to cycle to -- reduces this whole
+        # block to the exact single-goal behavior byte-for-byte when no --waypoint was given at all).
+        at_final_stop = (current_idx == n_wp - 1) and (not args.loop or n_wp == 1)
         if dist <= args.tolerance:
-            if not reached:            # latch the FIRST time only -- otherwise t_reached keeps
-                reached, t_reached = True, step / 50.0   # re-stamping to "now" every step the
-            raw_env.set_command(0.0, 0.0)                # robot stays near the goal, and the
-                                                          # linger-then-stop check below never fires
+            if just_arrived_idx != current_idx:
+                visits.append((current_idx, step / 50.0))
+                just_arrived_idx = current_idx
+            if at_final_stop:
+                if not reached:        # latch the FIRST time only -- otherwise t_reached keeps
+                    reached, t_reached = True, step / 50.0   # re-stamping to "now" every step the
+            else:                      # robot stays near it, and the linger-then-stop check below
+                current_idx = (current_idx + 1) % n_wp        # never fires
+                goal = route[current_idx]
+                just_arrived_idx = None   # so the NEXT waypoint's own arrival gets logged too
+
+        if reached:
+            raw_env.set_command(0.0, 0.0)
         else:
             fwd_cmd, lat_cmd = compute_nav_command(
                 x, y, yaw, goal[0], goal[1], obstacles, args.kp, speed_lo, speed_hi, lat_lo, lat_hi,
@@ -197,14 +233,31 @@ def main():
             break
 
     final_dist = float(np.hypot(goal[0] - x, goal[1] - y))
-    if fell:
-        print(f"FELL before reaching the goal (final distance {final_dist:.2f} m).")
-    elif reached:
-        print(f"Reached goal ({goal[0]:.2f}, {goal[1]:.2f}) in {t_reached:.1f}s, "
-              f"final distance {final_dist:.2f} m.")
+    if n_wp == 1:
+        # exact original single-goal wording, unchanged
+        if fell:
+            print(f"FELL before reaching the goal (final distance {final_dist:.2f} m).")
+        elif reached:
+            print(f"Reached goal ({goal[0]:.2f}, {goal[1]:.2f}) in {t_reached:.1f}s, "
+                  f"final distance {final_dist:.2f} m.")
+        else:
+            print(f"Did NOT reach the goal within {args.seconds:.0f}s "
+                  f"(final distance {final_dist:.2f} m, started {np.hypot(*route[0]):.2f} m away).")
     else:
-        print(f"Did NOT reach the goal within {args.seconds:.0f}s "
-              f"(final distance {final_dist:.2f} m, started {np.hypot(*goal):.2f} m away).")
+        loop_s = " (looping)" if args.loop else ""
+        print(f"Route{loop_s}: {len(visits)} waypoint arrival(s) across {n_wp}-waypoint route:")
+        for idx, t in visits:
+            print(f"  waypoint {idx} ({route[idx][0]:+.2f}, {route[idx][1]:+.2f}) reached at t={t:.1f}s")
+        if fell:
+            print(f"FELL (final distance {final_dist:.2f} m from waypoint {current_idx}).")
+        elif reached:
+            print(f"Completed the route, held the final waypoint for 1s after t={t_reached:.1f}s.")
+        elif args.loop:
+            print(f"Time budget ({args.seconds:.0f}s) ran out mid-loop "
+                  f"(currently targeting waypoint {current_idx}, {final_dist:.2f} m away).")
+        else:
+            print(f"Did NOT complete the route within {args.seconds:.0f}s "
+                  f"(currently targeting waypoint {current_idx}, {final_dist:.2f} m away).")
     if obstacles:
         print(f"Closest approach to any obstacle's surface: {closest_clearance:.2f} m "
               f"({'collision' if closest_clearance < 0 else 'clear'}).")
