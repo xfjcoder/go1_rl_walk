@@ -118,27 +118,44 @@ about its own logic is touched; RL is a pure bolt-on correction.
 **Verification** (`verify_residual_interface.py`): with the residual held at exactly
 zero every step (command forced to the same 2.0 rad/s in-place rotation
 `verify_turning.py`'s own test used), the env ran stably for the full episode (no
-falls) and tracked the command in the right direction and approximately the right
-magnitude: **1.83-1.84 rad/s achieved**, consistently across the whole run (checked in
-0.5s windows -- not a transient that converges toward the reference value over time).
+falls) and tracked the command well: **1.955 rad/s achieved** against the 2.0 rad/s
+command, consistent with (even marginally exceeding) the standalone script's own
+1.91 rad/s result for the identical test.
 
-This is close to but not an exact match for the standalone script's own **1.91 rad/s**
-result for the same command. I checked two specific hypotheses for the gap and ruled
-both out directly rather than assuming:
-1. *Measurement convention* -- `verify_turning.py` reports Pinocchio's centroidal
-   angular velocity, this env's observation uses MuJoCo's raw base-body angular
-   velocity (`qvel[3:6]`). Compared both directly in the same run: 1.8349 vs 1.8325
-   rad/s -- effectively identical, not the cause.
-2. *Pre-loop trajectory-generator initialization* -- the standalone script's very
-   first (pre-loop) `traj.generate_traj()` call always uses a zero command, this env's
-   `reset()` used the actual target command for that same call. Patched the env to
-   match the original's zero-command initialization exactly: no change (1.838 rad/s).
+That number is from AFTER a self-review caught two real issues in the first version of
+this interface, worth recording since the first version's zero-residual result (1.83-
+1.84 rad/s) looked plausible enough that it could have gone unnoticed:
 
-Neither hypothesis explains it; the remaining likely candidates are OSQP's own
-warm-start/numerical sensitivity across separate process runs, or some other
-initialization-order detail not yet isolated. Reported honestly rather than claimed
-fixed -- this is a ~4% gap, not evidence the residual mechanism itself is broken (the
-interface reproduces stable, correctly-directioned, closely-tracking-magnitude
-behavior with zero intervention, which is the actual correctness bar for this step).
+1. **A real bug: `xml_path` was silently ignored.** `MuJoCo_GO2_Model()`'s constructor
+   hardcodes a *module-level* `XML_PATH` global -- it isn't a constructor argument. The
+   first version stored `self.xml_path` but never applied the
+   `mujoco_model_module.XML_PATH = ...` monkeypatch that `verify_turning.py` correctly
+   does, so the env was silently driving the submodule's own bundled model (confirmed:
+   its loaded model name was `"go2 scene"`, not `"go2_mesh"`) the whole time. This
+   fully explains the ~4% gap reported in an earlier version of this doc -- it wasn't a
+   mysterious OSQP sensitivity, it was the wrong robot model.
+2. **A severe performance bug: `reset()` cost ~2.4 seconds.** Timed each component
+   directly: `PinGo2Model()` and `ComTraj()` each cost ~1.2s on *every* instantiation
+   (not a one-time process cost -- confirmed by constructing each twice in the same
+   process), while `generate_traj()` and `CentroidalMPC()` are cheap (~3ms, ~6ms). At
+   2.4s/reset, real PPO training (needing thousands of episodes) would have been
+   impractical. Fixed by constructing `go2`/`traj`/`mujoco_go2`/`leg_controller`/`gait`
+   **once**, in `__init__`, and having `reset()` only reset *state* on those same
+   objects (`mj_resetData` + `update_with_q_pin` + re-sync Pinocchio + regenerate the
+   trajectory for the new episode's command) -- confirmed safe since
+   `ComTraj.generate_traj()`'s only coupling to `go2` is reading its current state each
+   call, not accumulating hidden state of its own. Result: reset() now costs **~8-10ms**
+   (a ~250x speedup), with the one-time ~2.6s cost paid once at env construction instead
+   of every episode.
 
-## Status: steps 1-3 of the staged plan done. Not yet started: step 4 (train the residual policy, same randomized multi-seed evaluation discipline as every other RL stage in this project) and step 5 (decide: adopt or document as a negative result, same as Stage 10c).
+Both fixes are in the committed version of `mpc_residual_env.py` -- the numbers above
+are from the corrected environment, not the one with these bugs.
+
+**Still worth a decision before step 4, not bugs**: control rate is 200Hz (matching the
+MPC's own leg-controller update rate), four times more steps per episode-second than
+this project's usual 50Hz RL control rate -- may be worth decimating RL's own decision
+rate for more standard PPO credit-assignment horizons. Fall thresholds (base height
+0.15m, tilt 0.9rad) are reasonable guesses, not yet empirically validated against this
+specific robot/controller's actual failure modes.
+
+## Status: steps 1-3 of the staged plan done (interface defined, reviewed, two real bugs found and fixed, re-verified). Not yet started: step 4 (train the residual policy, same randomized multi-seed evaluation discipline as every other RL stage in this project) and step 5 (decide: adopt or document as a negative result, same as Stage 10c).

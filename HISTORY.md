@@ -2342,15 +2342,25 @@ locomotion planning. Observation, reward, and domain-randomization conventions m
 the residual's job the same way every RL stage in this project has been scoped: handle what the base
 controller's simplified model doesn't plan for, not replace what it already does well.
 
-Verified with the residual held at exactly zero: stable for the full episode, tracking the same
-2.0 rad/s in-place rotation command at 1.83-1.84 rad/s (consistent across the whole run, not a
-transient) -- close to but not an exact match for the standalone script's own 1.91 rad/s. Checked and
-ruled out two specific hypotheses for that ~4% gap (a measurement-convention mismatch, and a
-pre-loop trajectory-generator initialization difference) rather than assuming either explained it;
-neither did. Reported as an open, honestly-unexplained small gap, not claimed fixed -- it doesn't
-change the actual correctness bar for this step (stable, correctly-directioned, closely-tracking
-behavior with zero intervention), but is worth keeping in mind if step 4's training results look
-systematically different from the standalone verification numbers.
+**Self-reviewed before trusting it, and found two real issues.** First verification pass (residual
+held at exactly zero, same 2.0 rad/s in-place rotation command) gave a plausible-looking 1.83-1.84
+rad/s -- close enough to the standalone script's 1.91 rad/s that it could have passed as "a small
+unexplained gap" and gone uninvestigated. A deliberate review caught two real problems instead:
+
+1. `MuJoCo_GO2_Model()`'s constructor hardcodes a *module-level* `XML_PATH` global, not a constructor
+   argument -- the interface stored `self.xml_path` but never applied the monkeypatch
+   `verify_turning.py` itself correctly does, so it was silently driving the submodule's own bundled
+   model (confirmed: loaded model name was `"go2 scene"`, not `"go2_mesh"`) the whole time. This
+   fully explains the earlier "unexplained gap" -- it wasn't OSQP sensitivity, it was the wrong robot.
+2. `reset()` cost ~2.4 seconds -- timed each component directly and found `PinGo2Model()` and
+   `ComTraj()` each cost ~1.2s on *every* instantiation (not a one-time process cost), which would
+   have made real PPO training (needing thousands of episodes) impractical. Fixed by constructing the
+   expensive objects once in `__init__` and having `reset()` only reset state on them -- reset() now
+   costs ~8-10ms, a ~250x speedup.
+
+After both fixes: zero-residual achieves **1.955 rad/s** against the 2.0 rad/s command, consistent
+with (even marginally exceeding) the standalone script's 1.91 rad/s -- the gap is gone, as the first
+bug predicted it would be once fixed.
 
 **Not yet decided: adopt or not.** This is real, repeatable, verified evidence that MPC solves the
 turning problem RL couldn't, on this project's own hardware model -- but nothing has been merged to

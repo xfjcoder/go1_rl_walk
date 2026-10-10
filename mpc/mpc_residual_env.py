@@ -34,7 +34,9 @@ from convex_mpc.com_trajectory import ComTraj
 from convex_mpc.gait import Gait
 from convex_mpc.go2_robot_data import PinGo2Model
 from convex_mpc.leg_controller import LegController
+import convex_mpc.mujoco_model as mujoco_model_module
 from convex_mpc.mujoco_model import MuJoCo_GO2_Model
+import pinocchio as pin
 
 DEFAULT_XML = Path(__file__).resolve().parent / "go2_mesh_for_mpc.xml"
 
@@ -96,16 +98,31 @@ class MPCResidualEnv(gym.Env):
         self.observation_space = spaces.Box(-np.inf, np.inf, shape=(obs_dim,), dtype=np.float32)
         self.action_space = spaces.Box(-1.0, 1.0, shape=(12,), dtype=np.float32)
 
-        # Built fresh each reset() (MPC carries internal trajectory-generator state that
-        # doesn't have a clean "rewind" -- rebuilding is simpler and correct, if not the
-        # fastest possible; a non-issue at this verification stage).
-        self.go2 = None
-        self.mujoco_go2 = None
-        self.leg_controller = None
-        self.traj = None
-        self.gait = None
+        # Built ONCE here, not per-reset(): PinGo2Model() and ComTraj() each cost ~1.2s
+        # to construct (confirmed by direct timing -- re-parsing the URDF / building
+        # CasADi's symbolic expression graph, not a one-time process-wide cost, genuinely
+        # ~1.2s on EVERY instantiation), which would make reset() cost ~2.4s and real
+        # training impractical. reset() below only resets STATE on these same objects
+        # (regenerates the trajectory for the new episode's command, resets MuJoCo data) --
+        # confirmed safe: ComTraj.generate_traj()'s only coupling to go2 is reading its
+        # CURRENT state each call (not accumulating hidden state of its own), and
+        # update_pin_with_mujoco() re-syncs go2's state from mujoco_go2 every step anyway.
+        mujoco_model_module.XML_PATH = Path(xml_path)   # see __init__ docstring note below --
+        # MuJoCo_GO2_Model() reads this MODULE-LEVEL global, not a constructor argument;
+        # forgetting this monkeypatch (an earlier bug, caught in review) silently loads
+        # the submodule's own bundled model instead of this project's go2_mesh_for_mpc.xml.
+        self.go2 = PinGo2Model()
+        self.mujoco_go2 = MuJoCo_GO2_Model()
+        self.leg_controller = LegController()
+        self.gait = Gait(GAIT_HZ, GAIT_DUTY)
+        self.traj = ComTraj(self.go2)
+        self.mujoco_go2.model.opt.timestep = 1.0 / SIM_HZ
+        self._q_init = self.go2.current_config.get_q().copy()
+        self._floor_geom_id = mj.mj_name2id(self.mujoco_go2.model, mj.mjtObj.mjOBJ_GEOM, "floor")
+        self._base_id = mj.mj_name2id(self.mujoco_go2.model, mj.mjtObj.mjOBJ_BODY, "base_link")
+        self._nominal_base_mass = float(self.mujoco_go2.model.body_mass[self._base_id])
+
         self.mpc = None
-        self._floor_geom_id = None
         self._ctrl_i = 0
         self._next_push_step = 10**9
         self.target_speed = 0.0
@@ -124,30 +141,30 @@ class MPCResidualEnv(gym.Env):
         self.target_lateral = float(self._rng.uniform(*self.lateral_range))
         self.target_yaw_rate = float(self._rng.uniform(*self.yaw_rate_range))
 
-        self.go2 = PinGo2Model()
-        self.mujoco_go2 = MuJoCo_GO2_Model()
-        self.leg_controller = LegController()
-        self.gait = Gait(GAIT_HZ, GAIT_DUTY)
-
-        q_init = self.go2.current_config.get_q()
-        self.mujoco_go2.update_with_q_pin(q_init)
-        self.mujoco_go2.model.opt.timestep = 1.0 / SIM_HZ
+        # Reset MuJoCo state fully (qpos/qvel/ctrl/warmstart etc. all zeroed, not just
+        # qpos -- update_with_q_pin() alone only ever writes qpos, so without this any
+        # leftover qvel from the PREVIOUS episode's final instant would silently carry
+        # into the new one) before setting the standing qpos.
+        mj.mj_resetData(self.mujoco_go2.model, self.mujoco_go2.data)
+        self.mujoco_go2.update_with_q_pin(self._q_init.copy())
 
         # Domain randomization, mirroring envs/go1_env.py's own conventions: floor
-        # friction and trunk mass scale sampled fresh each reset.
-        if self._floor_geom_id is None:
-            self._floor_geom_id = mj.mj_name2id(self.mujoco_go2.model, mj.mjtObj.mjOBJ_GEOM, "floor")
+        # friction and base mass scale sampled fresh each reset.
         mu = float(self._rng.uniform(*self.friction_range))
         if self._floor_geom_id >= 0:
             self.mujoco_go2.model.geom_friction[self._floor_geom_id, 0] = mu
-        base_id = mj.mj_name2id(self.mujoco_go2.model, mj.mjtObj.mjOBJ_BODY, "base_link")
-        nominal_mass = float(self.mujoco_go2.model.body_mass[base_id])
         scale = float(self._rng.uniform(*self.mass_scale_range))
-        self.mujoco_go2.model.body_mass[base_id] = nominal_mass * scale
+        self.mujoco_go2.model.body_mass[self._base_id] = self._nominal_base_mass * scale
 
-        self.traj = ComTraj(self.go2)
+        # Re-sync Pinocchio's state from the just-reset MuJoCo state (go2 is a
+        # long-lived, reused object -- its internal state otherwise still reflects
+        # wherever the PREVIOUS episode ended).
+        self.mujoco_go2.update_pin_with_mujoco(self.go2)
         self.traj.generate_traj(self.go2, self.gait, 0.0, self.target_speed, self.target_lateral,
                                  STAND_HEIGHT, self.target_yaw_rate, time_step=MPC_DT)
+        # CentroidalMPC() itself is cheap (~6ms, confirmed by direct timing) -- rebuilt
+        # fresh each reset anyway, to avoid any question of stale OSQP warm-start state
+        # leaking across episodes.
         self.mpc = CentroidalMPC(self.go2, self.traj)
         self._U_opt = np.zeros((12, self.traj.N), dtype=float)
 
@@ -161,7 +178,6 @@ class MPCResidualEnv(gym.Env):
     def _get_obs(self):
         data = self.mujoco_go2.data
         qw, qx, qy, qz = data.qpos[3:7]
-        import pinocchio as pin
         R = pin.Quaternion(qw, qx, qy, qz).toRotationMatrix()
         v_world = data.qvel[0:3]
         v_body = R.T @ v_world
