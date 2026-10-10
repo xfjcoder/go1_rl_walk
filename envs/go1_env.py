@@ -639,6 +639,9 @@ class Go1FlatEnv(gym.Env):
         self.use_terrain_heightmap = use_terrain_heightmap
         self.use_lidar = use_lidar
         self.lidar_max_range = lidar_max_range
+        self._lidar_site_ids = None    # lazy cache for get_lidar_obstacle_hits(), independent of
+                                       # use_lidar (a navigation-layer utility, not part of the
+                                       # policy's own observation -- see that method)
         self.use_camera = use_camera
         self.camera_resolution = camera_resolution
         self.camera_max_range = camera_max_range
@@ -1454,6 +1457,45 @@ class Go1FlatEnv(gym.Env):
         raw = self.data.sensordata[self._lidar_sensor_adr]
         normalized = np.where(raw < 0, 1.0, np.clip(raw, 0.0, self.lidar_max_range) / self.lidar_max_range)
         return normalized.astype(np.float32)
+
+    def get_lidar_obstacle_hits(self, ground_z: float = 0.0, margin: float = 0.08) -> list:
+        """Navigation-layer utility, independent of use_lidar (which only controls whether the
+        9-ray fan is fed into the POLICY's own observation) -- interprets the same rays as
+        obstacle-vs-flat-ground hits, for an outer navigation loop that wants perception-based
+        obstacle estimates instead of privileged ground-truth positions (see navigate.py).
+
+        For each ray, the EXPECTED reading if it only ever hit flat ground at world height
+        ground_z is computed analytically from the ray's current (bobbing/pitching-during-gait)
+        world position and direction -- not a fixed baseline, so normal walking motion doesn't
+        cause false positives. A ray reading meaningfully SHORTER than that (by more than margin,
+        metres) is treated as hitting an obstacle instead of the ground, and its 3D hit point
+        (ray origin + reading * direction) is returned as an estimated (x, y) world-frame position.
+        Returns a list of (x, y) tuples -- near-surface points, not obstacle centres, so feed them
+        to compute_nav_command with radius=0. Requires the loaded robot XML to define the
+        lidar_t*_y* sensors, same requirement (and error) as use_lidar=True."""
+        if self._lidar_site_ids is None:
+            sensor_ids = [mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_SENSOR, n) for n in LIDAR_SENSORS]
+            missing = [n for n, i in zip(LIDAR_SENSORS, sensor_ids) if i < 0]
+            if missing:
+                raise ValueError(f"get_lidar_obstacle_hits() needs this robot XML to define the "
+                                  f"lidar_t*_y* sensors: {missing} (only assets/go2_mesh_lidar.xml "
+                                  f"defines them so far -- pass --robot-xml assets/go2_mesh_lidar.xml)")
+            self._lidar_sensor_adr_nav = np.array([self.model.sensor_adr[i] for i in sensor_ids])
+            self._lidar_site_ids = [mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_SITE, n) for n in LIDAR_SENSORS]
+        hits = []
+        for sid, adr in zip(self._lidar_site_ids, self._lidar_sensor_adr_nav):
+            o = self.data.site_xpos[sid]
+            d = self.data.site_xmat[sid].reshape(3, 3)[:, 2]
+            reading = self.data.sensordata[adr]
+            t_ground = (ground_z - o[2]) / d[2]
+            if t_ground < 0 or t_ground > self.lidar_max_range:
+                t_ground = self.lidar_max_range
+            if reading < 0:
+                continue
+            if reading < t_ground - margin:
+                hit = o + reading * d
+                hits.append((float(hit[0]), float(hit[1])))
+        return hits
 
     def _camera_obs(self) -> np.ndarray:
         """Flattened camera_resolution x camera_resolution depth image from the onboard, forward-

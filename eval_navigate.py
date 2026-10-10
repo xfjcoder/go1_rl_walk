@@ -52,7 +52,7 @@ def make_env(seed, env_kwargs):
 
 def evaluate(model_path, vecnorm_path, env_kwargs, episodes, seconds, kp, tolerance,
              goal_dist_range, speed_lo, speed_hi, lat_lo, lat_hi,
-             obstacle_gain=1.5, obstacle_influence=0.8, seed0=20_000):
+             obstacle_gain=1.5, obstacle_influence=0.8, seed0=20_000, lidar_nav=False):
     # command_speed_range/lateral_speed_range must already be None and target_speed/
     # target_lateral_speed already 0.0 in env_kwargs (set by main(), mirroring navigate.py) --
     # otherwise reset()'s own random resample would bake a stale command into the very first
@@ -115,6 +115,14 @@ def evaluate(model_path, vecnorm_path, env_kwargs, episodes, seconds, kp, tolera
         if moving_obstacles:
             obstacles_per_ep = [[(ox, oy, obstacle_radius[i]) for ox, oy in pos]
                                  for i, pos in enumerate(env.get_attr("obstacle_positions"))]
+        # closest_clearance (the real safety metric) always tracks GROUND TRUTH, regardless of
+        # lidar_nav -- only the steering decision itself switches to the sensed estimate, same
+        # split as navigate.py's own ground_truth_obstacles/steering_obstacles.
+        if lidar_nav:
+            steering_obstacles_per_ep = [[(hx, hy, 0.0) for hx, hy in hits]
+                                          for hits in env.env_method("get_lidar_obstacle_hits")]
+        else:
+            steering_obstacles_per_ep = obstacles_per_ep
         dist = np.hypot(goal_x - x, goal_y - y)
         reached_now = dist <= tolerance
         for i in range(episodes):
@@ -124,7 +132,7 @@ def evaluate(model_path, vecnorm_path, env_kwargs, episodes, seconds, kp, tolera
                 fwd_cmd, lat_cmd = 0.0, 0.0
             else:
                 fwd_cmd, lat_cmd = compute_nav_command(
-                    x[i], y[i], yaw[i], goal_x[i], goal_y[i], obstacles_per_ep[i], kp,
+                    x[i], y[i], yaw[i], goal_x[i], goal_y[i], steering_obstacles_per_ep[i], kp,
                     speed_lo, speed_hi, lat_lo, lat_hi, obstacle_gain, obstacle_influence)
             env.env_method("set_command", fwd_cmd, lat_cmd, indices=[i])
 
@@ -198,6 +206,12 @@ def main():
                          "bouncing off the course boundary. 0.0 (default) = static.")
     ap.add_argument("--obstacle-avoid-gain", type=float, default=1.5)
     ap.add_argument("--obstacle-influence-radius", type=float, default=0.8)
+    ap.add_argument("--lidar-nav", action="store_true",
+                    help="Steer using the onboard 9-ray lidar fan's own obstacle estimates "
+                         "(Go1FlatEnv.get_lidar_obstacle_hits) instead of privileged ground-truth "
+                         "obstacle_positions. Automatically swaps in assets/go2_mesh_lidar.xml. "
+                         "closest_clearance/collision_rate still measure GROUND TRUTH (the real "
+                         "safety outcome) regardless -- only the steering decision changes.")
     args = ap.parse_args()
 
     ckpt_dir = os.path.join(args.run_dir, "checkpoints")
@@ -223,9 +237,11 @@ def main():
                   obstacle_height_range=None, obstacle_height=None,
                   nav_obstacles=args.nav_obstacles, nav_obstacle_radius=args.nav_obstacle_radius,
                   nav_obstacle_height=args.nav_obstacle_height, nav_obstacle_speed=args.nav_obstacle_speed)
+        if args.lidar_nav:
+            kw["xml_path"] = "assets/go2_mesh_lidar.xml"
         e = evaluate(model_path, vec, kw, args.episodes, args.seconds, args.kp, args.tolerance,
                      args.goal_distance_range, speed_lo, speed_hi, lat_lo, lat_hi,
-                     args.obstacle_avoid_gain, args.obstacle_influence_radius)
+                     args.obstacle_avoid_gain, args.obstacle_influence_radius, lidar_nav=args.lidar_nav)
         terr = "flat" if amp is None else f"terrain {amp * 100:.0f} cm"
         line = (f"{terr:>13s}: success_rate={e['success_rate']:.2f}  fall_rate={e['fall_rate']:.2f}  "
                 f"time_to_goal={e['time_to_goal_mean']:5.1f}s  path_efficiency={e['path_efficiency_mean']:.2f}")

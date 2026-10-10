@@ -110,7 +110,17 @@ failure and fix, in [HISTORY.md](HISTORY.md)):
     (`--nav-obstacle-speed`), which surfaced a real, measured limitation:
     collision rate rises from 0% to 16% once an obstacle can wander into a
     route that started clear, even though success rate and fall rate stay
-    unchanged. Real turning capability was then
+    unchanged. Finally extended with perception-based obstacle detection
+    (`--lidar-nav`), repurposing an onboard 9-ray rangefinder fan built in
+    an earlier stage for the walking policy's own observation, now reused
+    by the navigation layer instead of privileged ground-truth positions.
+    A short-range, forward-cone-only sensor, as measured directly (~1m,
+    dropping off to the sides) — yet randomized trials found it matched
+    or slightly *beat* ground-truth avoidance overall, because the
+    existing potential-field steering law's own weakness (confused by
+    several simultaneous obstacles) hurt more than the sensor's limited
+    range did, a more nuanced result than expected going in. Real turning
+    capability was then
     attempted (training the policy itself, not just the outer loop) and
     found a genuine, repeatable limit: four structurally different
     training approaches all converged on the same failure — the robot

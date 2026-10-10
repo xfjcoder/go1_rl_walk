@@ -109,6 +109,14 @@ def main():
     parser.add_argument("--obstacle-influence-radius", type=float, default=0.8,
                          help="Distance (m, from an obstacle's surface) at which its repulsion "
                               "starts being felt at all; only matters with --nav-obstacles > 0.")
+    parser.add_argument("--lidar-nav", action="store_true",
+                         help="Steer using the onboard 9-ray lidar fan's own obstacle estimates "
+                              "(Go1FlatEnv.get_lidar_obstacle_hits) instead of privileged ground-"
+                              "truth obstacle_positions. Automatically swaps in "
+                              "assets/go2_mesh_lidar.xml (use_lidar stays False -- the POLICY's own "
+                              "observation is unchanged, only this outer loop reads the sensor). "
+                              "Short range (~1m) and forward-facing only, by the sensor's own "
+                              "construction -- a real, honest limitation vs. the omniscient default.")
     parser.add_argument("--record", type=str, default=None, help="Save an offscreen-rendered GIF.")
     parser.add_argument("--slowmo", type=float, default=1.0)
     parser.add_argument("--frame-stride", type=int, default=2)
@@ -157,6 +165,8 @@ def main():
     env_kwargs["nav_obstacle_radius"] = args.nav_obstacle_radius
     env_kwargs["nav_obstacle_height"] = args.nav_obstacle_height
     env_kwargs["nav_obstacle_speed"] = args.nav_obstacle_speed
+    if args.lidar_nav:
+        env_kwargs["xml_path"] = "assets/go2_mesh_lidar.xml"
 
     def make_env():
         return Go1FlatEnv(render_mode=render_mode, domain_randomize=False, camera=args.camera, **env_kwargs)
@@ -175,9 +185,12 @@ def main():
     if args.seed is not None:
         env.seed(args.seed)
     obs = env.reset()
-    obstacles = [(ox, oy, raw_env.nav_obstacle_radius) for ox, oy in raw_env.obstacle_positions]
-    if obstacles:
-        print(f"obstacles (ground truth): {[(round(o[0], 2), round(o[1], 2)) for o in obstacles]}")
+    ground_truth_obstacles = [(ox, oy, raw_env.nav_obstacle_radius) for ox, oy in raw_env.obstacle_positions]
+    if ground_truth_obstacles:
+        print(f"obstacles (ground truth): "
+              f"{[(round(o[0], 2), round(o[1], 2)) for o in ground_truth_obstacles]}")
+        if args.lidar_nav:
+            print("(steering uses lidar estimates below, not this ground truth -- shown for reference only)")
 
     max_steps = int(args.seconds * 50)
     n_wp = len(route)
@@ -194,8 +207,14 @@ def main():
     for step in range(1, max_steps + 1):
         # Re-query every step (not just once after reset) -- a no-op for static obstacles (the
         # default, --nav-obstacle-speed=0), but required for moving ones, whose positions the env's
-        # own step() updates each control step.
-        obstacles = [(ox, oy, raw_env.nav_obstacle_radius) for ox, oy in raw_env.obstacle_positions]
+        # own step() updates each control step. Ground truth is ALWAYS tracked (it's the real safety
+        # metric, closest_clearance below) regardless of --lidar-nav; only the STEERING decision
+        # switches to the sensed estimate.
+        ground_truth_obstacles = [(ox, oy, raw_env.nav_obstacle_radius) for ox, oy in raw_env.obstacle_positions]
+        if args.lidar_nav:
+            steering_obstacles = [(hx, hy, 0.0) for hx, hy in raw_env.get_lidar_obstacle_hits()]
+        else:
+            steering_obstacles = ground_truth_obstacles
         dist = float(np.hypot(goal[0] - x, goal[1] - y))
         # n_wp==1 always "stops" regardless of --loop (nothing else to cycle to -- reduces this whole
         # block to the exact single-goal behavior byte-for-byte when no --waypoint was given at all).
@@ -216,15 +235,15 @@ def main():
             raw_env.set_command(0.0, 0.0)
         else:
             fwd_cmd, lat_cmd = compute_nav_command(
-                x, y, yaw, goal[0], goal[1], obstacles, args.kp, speed_lo, speed_hi, lat_lo, lat_hi,
-                args.obstacle_avoid_gain, args.obstacle_influence_radius)
+                x, y, yaw, goal[0], goal[1], steering_obstacles, args.kp, speed_lo, speed_hi,
+                lat_lo, lat_hi, args.obstacle_avoid_gain, args.obstacle_influence_radius)
             raw_env.set_command(fwd_cmd, lat_cmd)
 
         action, _ = model.predict(obs, deterministic=True)
         obs, _, done, info = env.step(action)
         x, y = float(info[0]["base_pos"][0]), float(info[0]["base_pos"][1])
         yaw = float(info[0]["yaw"])
-        for ox, oy, r in obstacles:
+        for ox, oy, r in ground_truth_obstacles:
             closest_clearance = min(closest_clearance, float(np.hypot(x - ox, y - oy)) - r)
 
         if args.record:
@@ -266,7 +285,7 @@ def main():
         else:
             print(f"Did NOT complete the route within {args.seconds:.0f}s "
                   f"(currently targeting waypoint {current_idx}, {final_dist:.2f} m away).")
-    if obstacles:
+    if ground_truth_obstacles:
         print(f"Closest approach to any obstacle's surface: {closest_clearance:.2f} m "
               f"({'collision' if closest_clearance < 0 else 'clear'}).")
 

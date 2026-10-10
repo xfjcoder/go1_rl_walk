@@ -1888,6 +1888,81 @@ left parked at the LAST frame once the list comprehension finishes; indexing int
 or to seek manually (`im.seek(i); im.convert('RGB')`) one frame at a time. Re-verified every
 previously-"failing" GIF in this project with the corrected method -- all were fine all along.
 
+### Extension: perception-based (lidar) obstacle detection
+
+The third and last of the "extend navigation further" follow-ups: replace the privileged ground-
+truth `obstacle_positions` feeding `compute_nav_command`'s avoidance term with an estimate from the
+robot's own onboard sensor -- the 9-ray downward lidar fan built in an earlier stage (`use_lidar`,
+`assets/go2_mesh_lidar.xml`) but, until now, only ever wired into the WALKING POLICY's own
+observation, never used by the navigation layer.
+
+First verified the XML swap itself changes nothing physically: `go2_latback`'s own saved
+`env_kwargs.json`, loaded against `assets/go2_mesh_lidar.xml` instead of the plain mesh, produces
+byte-identical trajectories across 3 seeds with nonzero actions (the lidar XML only adds sensor
+sites, same bodies/geoms/masses otherwise).
+
+Then measured the sensor's own real detection envelope empirically rather than assuming it from the
+tilt angles in the XML comment -- placed a known obstacle at a fine grid of positions from a genuine
+standing pose (not the model's raw reset pose, which turned out to be an airborne drop-test height
+of ~3.5m that would have made every ray read "no hit" and silently invalidated the whole test).
+Finding: detection only starts working out to about 0.9-1.0m directly ahead (the shallowest, 25
+degree tilt ray), falling to under 0.4m for rays angled further to the side or down -- short-range
+and forward-cone-only, a real and expected consequence of a sensor built for near-field terrain/step
+awareness, not long-range mapping.
+
+Added `Go1FlatEnv.get_lidar_obstacle_hits()`: for each ray, computes the EXPECTED flat-ground hit
+distance analytically from that ray's *current* world position/direction (so normal gait bobbing and
+pitching don't cause false positives -- this is recomputed fresh every call, not a fixed baseline),
+and treats any reading meaningfully shorter than that as hitting an obstacle rather than the ground,
+returning the estimated world-frame hit point. A navigation-layer-only method, independent of
+`use_lidar` (which still only controls whether the fan feeds the POLICY's own observation) -- no
+retraining, `go2_latback` used exactly as before. `navigate.py`/`eval_navigate.py` gained
+`--lidar-nav`, which swaps in the lidar XML and switches the STEERING decision to these estimates;
+`closest_clearance`/`collision_rate` still measure ground truth throughout (the real safety outcome,
+not a perception-accuracy proxy).
+
+<p align="center">
+  <img src="media/go2_navigate_lidar_perception.gif" width="480" alt="Go2 navigating toward a goal using only its own lidar rays (visible as yellow lines) to detect an obstacle, not privileged ground truth">
+</p>
+
+*Same wide overhead camera as the other Stage 10 demos, zoomed in -- MuJoCo renders the rangefinder
+sensor's own rays (yellow), making the perception-based mechanism directly visible: the robot reacts
+only once an obstacle enters this narrow forward cone, not the instant it exists anywhere in the
+course.*
+
+**Results were more nuanced than expected.** A controlled single-obstacle case (placed directly on
+the path, 1m ahead -- deliberately adversarial, since random placement rarely lands an obstacle
+inside lidar's short range at all) showed the expected direction of degradation: ground truth stayed
+clear (closest_clearance +0.09m) while lidar-nav grazed it (-0.02m, a graze not a hard fall) -- less
+reaction time from a shorter effective detection range, exactly as the sensor's own measured envelope
+would predict.
+
+But the randomized 32-episode comparison (`eval_navigate.py`, same seeds both runs, Stage 10b's own
+standard `--nav-obstacles 5` / default goal-distance-range) told a different story:
+
+| mode | success_rate | collision_rate | closest_clearance | "on-path" subset success_rate |
+|---|---|---|---|---|
+| ground truth | 0.91 | 0.00 | 0.87m | 0.67 (6/32 on-path) |
+| lidar-nav | 1.00 | 0.00 | 0.83m | 1.00 (6/32 on-path) |
+
+Lidar-nav matched or slightly *exceeded* ground truth here, and a denser-clutter setting
+(`--nav-obstacles 15`, closer goals) made the gap much larger in lidar-nav's favor (1.00 vs. 0.81
+success; the ground-truth "on-path" subset specifically dropped to 0.00). The likely cause: the
+EXISTING linear potential-field steering law reacts to every obstacle within its influence radius
+simultaneously, including several at once when obstacles are dense or a goal sits in a cluttered
+area -- a known weakness of simple potential fields (competing/conflicting repulsion vectors can
+stall progress or create a local minimum). Lidar-nav's narrow forward cone and short range
+incidentally filters most of that clutter out, reacting only to whatever is actually close and ahead,
+which turned out to help more than the shorter range hurt, at least against this steering law and
+these obstacle densities.
+
+**DECISION: adopted.** `get_lidar_obstacle_hits()` (env) and `--lidar-nav` (`navigate.py`/
+`eval_navigate.py`) committed; zero impact on existing checkpoints or scripts (new method isn't
+called unless invoked; `--lidar-nav` is opt-in). Not claiming lidar-nav is unconditionally better --
+the controlled adversarial case shows the raw sensing disadvantage is real -- but the net effect
+across representative randomized trials was a wash or a win, which was not the expected outcome
+going in and is reported as found rather than adjusted to match the original hypothesis.
+
 ## Stage 10c: real turning capability (Go2) — tried, stopped, NOT adopted
 
 Nothing in 10a/10b's numbers indicated this was needed (0% collisions even where an obstacle sat
