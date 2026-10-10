@@ -2057,6 +2057,63 @@ revisited:**
   cleanly say whether `use_gait_reference` itself is unviable, whether `yaw_rate_swing_gain` is
   wrong, or whether it's the combination; a cleaner follow-up would validate each in isolation first.
 
+### Addendum: testing the compute-scale hypothesis directly -- a CPU-only MJX benchmark
+
+The research context above raised a specific, testable hypothesis: that this project's compute
+scale (16 CPU-parallel environments, tens of millions of steps) rather than anything about RL/PPO
+itself is what's capping sustained-turning discovery, compared to the literature's thousands of
+GPU-parallel environments and ~billion-step budgets. Before accepting that as an untested
+assumption, it was checked directly: could MuJoCo's JAX-based reimplementation (MJX), which is what
+makes that massive parallelism possible in the literature, give a real throughput improvement on
+THIS machine -- which has no NVIDIA GPU at all (confirmed via `lspci`, `nvidia-smi` not installed,
+`torch.cuda.is_available()` False -- only an AMD integrated GPU), only CPU?
+
+Installed `mujoco-mjx`/`jax` (CPU-only build) into the project venv -- this upgraded the base
+`mujoco` package 3.11.0->3.15.0 as a dependency, so backward compatibility was re-verified
+immediately (byte-identical `gait_stats.py` output on `pretrained/go2_gaitclock` before/after,
+same stash/compare-adjacent discipline as every other change in this project) before trusting
+anything built on top of it.
+
+Benchmarked MJX's batched physics stepping (`jax.vmap(mjx.step)`, JIT-compiled) on
+`assets/go2_mesh.xml` at increasing batch sizes, measuring pure aggregate steps/sec (no RL overhead
+on either side -- no policy forward pass, no reward/observation construction, just physics), against
+a fresh same-machine, same-model `SubprocVecEnv` benchmark for a fair comparison (not relying on
+remembered numbers from actual training runs, which include substantial additional overhead beyond
+raw physics stepping):
+
+| Approach | Steps/sec (aggregate) |
+|---|---|
+| SubprocVecEnv, 16 processes | 4,343 |
+| MJX (CPU), batch=1 | 1,487 |
+| MJX (CPU), batch=16 | 2,111 |
+| MJX (CPU), batch=64 | 2,918 |
+| MJX (CPU), batch=256 | 4,162 |
+| **MJX (CPU), batch=512** | **5,435 (peak)** |
+| MJX (CPU), batch=1024 | 3,396 (declining) |
+| MJX (CPU), batch=2048 | 2,664 (declining further) |
+
+**Result: MJX-on-CPU peaks at roughly 1.25x the existing approach's throughput (batch=512), then
+actually gets WORSE at larger batch sizes** (plausibly cache/memory-bandwidth pressure that a GPU's
+memory architecture would absorb but a CPU can't) -- a real but modest win, nowhere near the
+orders-of-magnitude difference that would actually matter for the turning problem (which would need
+on the order of 100-1000x more total environment experience to approach the literature's own
+budgets, not 25% more). The poor scaling from batch=1 to batch=16 (only ~1.4x, where 16 genuinely
+separate OS processes would use 16 real cores) also confirms `vmap` on a CPU backend isn't giving
+true multi-core parallelism the way `SubprocVecEnv`'s separate processes already do -- it's mostly
+vectorized/SIMD math within a more efficient compiled kernel, not a way around the same 16-core
+ceiling.
+
+**DECISION: this specific path (CPU-only MJX) is not worth pursuing further.** A ~1.25x speedup
+doesn't justify fully rewriting `envs/go1_env.py`'s reward/observation/termination/terrain-generation
+logic in JAX (hundreds of lines of NumPy+MuJoCo Python that don't exist in any JAX-compatible form
+today) -- and even a successful rewrite would still leave training nowhere near the scale the
+literature actually uses. This conclusively narrows the compute-scale hypothesis to needing REAL
+GPU-parallel simulation (a cloud GPU instance running Isaac Gym/Isaac Lab or MJX-on-GPU) to properly
+test -- a materially bigger undertaking (new cloud infrastructure, real cost, outside this local
+sandbox) than anything attempted in this project so far, not undertaken here. `jax`/`mujoco-mjx`
+were left installed in the venv (harmless, `mujoco` itself stays pinned to the newer 3.15.0 that
+came along as a dependency, confirmed backward-compatible) in case this benchmark is revisited.
+
 ## Next stages
 
 Terrain-aware observation and a non-trot gait mode were both tried already
