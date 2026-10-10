@@ -2334,11 +2334,28 @@ walking phases (<0.01 rad/s). This is exactly the simultaneous translation-and-r
 that four different from-scratch RL training attempts in Stage 10c could never sustain past "a small
 bounded heading wobble."
 
+**Step 3 (define the RL-residual interface) is also done.** `mpc/mpc_residual_env.py` wraps the
+MPC/leg-controller pipeline (unmodified) in a Gymnasium `Env`: RL outputs a small per-joint torque
+residual added to the MPC's nominal torque before actuator-limit clipping -- MPC still does all the
+locomotion planning. Observation, reward, and domain-randomization conventions mirror
+`envs/go1_env.py`'s own (Gaussian tracking rewards, friction/mass randomization at reset), scoping
+the residual's job the same way every RL stage in this project has been scoped: handle what the base
+controller's simplified model doesn't plan for, not replace what it already does well.
+
+Verified with the residual held at exactly zero: stable for the full episode, tracking the same
+2.0 rad/s in-place rotation command at 1.83-1.84 rad/s (consistent across the whole run, not a
+transient) -- close to but not an exact match for the standalone script's own 1.91 rad/s. Checked and
+ruled out two specific hypotheses for that ~4% gap (a measurement-convention mismatch, and a
+pre-loop trajectory-generator initialization difference) rather than assuming either explained it;
+neither did. Reported as an open, honestly-unexplained small gap, not claimed fixed -- it doesn't
+change the actual correctness bar for this step (stable, correctly-directioned, closely-tracking
+behavior with zero intervention), but is worth keeping in mind if step 4's training results look
+systematically different from the standalone verification numbers.
+
 **Not yet decided: adopt or not.** This is real, repeatable, verified evidence that MPC solves the
 turning problem RL couldn't, on this project's own hardware model -- but nothing has been merged to
-`main`, and the RL-residual integration (steps 3-5 of the staged plan: define the interface, train,
-evaluate, decide) hasn't started. See `mpc/README.md` for the reproducible setup and
-`go1-staged-plan.md` (memory) for current status.
+`main`, and training the residual policy itself (steps 4-5: train, evaluate, decide) hasn't started.
+See `mpc/README.md` for the reproducible setup and `go1-staged-plan.md` (memory) for current status.
 
 ## Next stages
 

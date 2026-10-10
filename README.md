@@ -141,9 +141,12 @@ failure and fix, in [HISTORY.md](HISTORY.md)):
     genuine, repeatable turning (1.91/1.93 rad/s against a 2.0 rad/s
     command) verified against `assets/go2_mesh.xml` itself, after finding
     and fixing a real integration bug (positional, not name-based, joint
-    remapping between the controller and this project's model). **Not yet
-    decided whether to adopt** — the RL-residual integration hasn't
-    started. See `mpc/README.md`.
+    remapping between the controller and this project's model). The
+    RL-residual interface is also defined and verified (a Gymnasium env
+    adding a small RL torque correction on top of the MPC's own output,
+    reusing this project's reward/domain-randomization conventions). **Not
+    yet decided whether to adopt** — the residual policy hasn't been
+    trained yet. See `mpc/README.md`.
 
 ## Repository layout
 

@@ -4,3 +4,4 @@ matplotlib>=3.7,<3.9
 mujoco
 casadi
 pin
+gymnasium

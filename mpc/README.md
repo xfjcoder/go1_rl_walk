@@ -90,4 +90,55 @@ python3 mpc/verify_turning.py
 
 See `media/mpc_turning_demo.gif` and `media/mpc_turning_summary.png`.
 
-## Status: step 2 of the staged plan done (verified against our own model). Not yet started: step 3 (defining the RL-residual interface) onward.
+## Step 3: the RL-residual interface
+
+`mpc_residual_env.py` wraps `CentroidalMPC` + `LegController` (unmodified, imported
+straight from the submodule) in a Gymnasium `Env`. Each control tick, MPC computes its
+usual nominal 12-dim joint torque command exactly as in `verify_turning.py`; an RL
+action (`Box(-1,1,shape=(12,))`, scaled by `residual_scale` N·m) is added to it before
+clipping to the actuator limits. MPC still does 100% of the locomotion planning
+(footstep timing, swing trajectories, stance force allocation, turning) -- nothing
+about its own logic is touched; RL is a pure bolt-on correction.
+
+- **Observation** (47-dim): body-frame linear velocity (3), body-frame angular velocity
+  (3), roll/pitch (2), joint positions (12), joint velocities (12), the MPC's own
+  nominal torque for that tick (12, giving the policy context on what the base
+  controller already decided), and the current command -- target forward/lateral
+  speed and yaw rate (3).
+- **Reward**: survival (+1/tick) + Gaussian tracking reward on forward speed, lateral
+  speed, and yaw rate (`exp(-(error/sigma)^2)`, same functional form `envs/go1_env.py`
+  already uses) + a penalty on residual magnitude (`-residual_effort_weight * sum(residual^2)`,
+  encouraging the policy to intervene minimally rather than override the base
+  controller). Terminates on a fall (base height or tilt threshold).
+- **Domain randomization**: floor friction and base mass scale sampled each reset,
+  optional random push perturbations -- mirrors `envs/go1_env.py`'s own conventions, so
+  the residual's job is explicitly "handle what the MPC's rigid-body model doesn't
+  plan for," matching how every other RL stage in this project has been scoped.
+
+**Verification** (`verify_residual_interface.py`): with the residual held at exactly
+zero every step (command forced to the same 2.0 rad/s in-place rotation
+`verify_turning.py`'s own test used), the env ran stably for the full episode (no
+falls) and tracked the command in the right direction and approximately the right
+magnitude: **1.83-1.84 rad/s achieved**, consistently across the whole run (checked in
+0.5s windows -- not a transient that converges toward the reference value over time).
+
+This is close to but not an exact match for the standalone script's own **1.91 rad/s**
+result for the same command. I checked two specific hypotheses for the gap and ruled
+both out directly rather than assuming:
+1. *Measurement convention* -- `verify_turning.py` reports Pinocchio's centroidal
+   angular velocity, this env's observation uses MuJoCo's raw base-body angular
+   velocity (`qvel[3:6]`). Compared both directly in the same run: 1.8349 vs 1.8325
+   rad/s -- effectively identical, not the cause.
+2. *Pre-loop trajectory-generator initialization* -- the standalone script's very
+   first (pre-loop) `traj.generate_traj()` call always uses a zero command, this env's
+   `reset()` used the actual target command for that same call. Patched the env to
+   match the original's zero-command initialization exactly: no change (1.838 rad/s).
+
+Neither hypothesis explains it; the remaining likely candidates are OSQP's own
+warm-start/numerical sensitivity across separate process runs, or some other
+initialization-order detail not yet isolated. Reported honestly rather than claimed
+fixed -- this is a ~4% gap, not evidence the residual mechanism itself is broken (the
+interface reproduces stable, correctly-directioned, closely-tracking-magnitude
+behavior with zero intervention, which is the actual correctness bar for this step).
+
+## Status: steps 1-3 of the staged plan done. Not yet started: step 4 (train the residual policy, same randomized multi-seed evaluation discipline as every other RL stage in this project) and step 5 (decide: adopt or document as a negative result, same as Stage 10c).
