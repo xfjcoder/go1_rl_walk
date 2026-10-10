@@ -569,6 +569,19 @@ class Go1FlatEnv(gym.Env):
         nav_obstacle_min_dist: float = 0.8,    # metres: obstacles are resampled away from the origin
                                                # (the robot's own spawn point) by at least this much,
                                                # so one never spawns on top of the robot at reset
+        nav_obstacle_speed: float = 0.0,       # m/s: each obstacle moves in a random (uniform angle,
+                                               # sampled once per episode) constant-velocity straight
+                                               # line, bouncing (velocity component reflected) off the
+                                               # same +-4m placement box used for initial positioning,
+                                               # instead of staying fixed all episode. Positions are
+                                               # updated kinematically each control step (direct
+                                               # model.geom_pos write, same mechanism reset() already
+                                               # uses -- these are static-body scenery obstacles, not
+                                               # simulated with real mass/collision dynamics, same as
+                                               # the stationary case). 0.0 (default) = static,
+                                               # unchanged behavior (also a no-op whenever
+                                               # nav_obstacles=0, same as every other nav_obstacle_*
+                                               # param).
         kp: float = 40.0,                      # PD position gain, N*m/rad. A standalone scripted-
                                                # walking test confirmed 40.0 gives poor OPEN-LOOP
                                                # tracking under load (~20 degree error) and 80.0
@@ -703,6 +716,8 @@ class Go1FlatEnv(gym.Env):
         self.nav_obstacle_radius = nav_obstacle_radius
         self.nav_obstacle_height = nav_obstacle_height
         self.nav_obstacle_min_dist = nav_obstacle_min_dist
+        self.nav_obstacle_speed = nav_obstacle_speed
+        self._nav_obstacle_vel = np.zeros((nav_obstacles, 2))  # resampled each reset() if moving
         self.obstacle_positions: list[tuple[float, float]] = []  # ground truth for an external
                                                                   # navigation controller; empty
                                                                   # unless nav_obstacles > 0
@@ -993,7 +1008,7 @@ class Go1FlatEnv(gym.Env):
 
         if self.nav_obstacles_enabled:
             self.obstacle_positions = []
-            for gid in self._nav_obstacle_geom_ids:
+            for i, gid in enumerate(self._nav_obstacle_geom_ids):
                 while True:
                     ox = float(self._rng.uniform(-4.0, 4.0))
                     oy = float(self._rng.uniform(-4.0, 4.0))
@@ -1003,6 +1018,11 @@ class Go1FlatEnv(gym.Env):
                 self.model.geom_pos[gid, 1] = oy
                 self.model.geom_pos[gid, 2] = self._terrain_height(ox, oy) + self.nav_obstacle_height / 2
                 self.obstacle_positions.append((ox, oy))
+                if self.nav_obstacle_speed > 1e-9:   # gated so a static (speed=0) course draws
+                    angle = float(self._rng.uniform(0.0, 2 * np.pi))  # exactly as many random
+                    self._nav_obstacle_vel[i] = self.nav_obstacle_speed * np.array(   # numbers as
+                        [np.cos(angle), np.sin(angle)])                              # before this
+                                                                                       # flag existed
 
         mujoco.mj_forward(self.model, self.data)
         if self.terrain_enabled:
@@ -1047,6 +1067,21 @@ class Go1FlatEnv(gym.Env):
         if self._step_count == self._next_push_step:
             self.data.qvel[0:2] += self._rng.uniform(-self.push_velocity, self.push_velocity, 2)
             self._next_push_step += int(self._rng.integers(150, 300))
+        if self.nav_obstacles_enabled and self.nav_obstacle_speed > 1e-9:
+            # Kinematic (scripted) motion, same as the initial placement -- these are static-body
+            # scenery obstacles, not simulated with real mass/collision dynamics. Bounces (reflects
+            # the relevant velocity component) off the same +-4m box used for initial placement,
+            # so a moving obstacle stays perpetually relevant for the rest of the episode instead of
+            # wandering off and leaving the course empty.
+            dt = 1.0 / self.control_hz
+            for i, gid in enumerate(self._nav_obstacle_geom_ids):
+                pos = self.model.geom_pos[gid, 0:2] + self._nav_obstacle_vel[i] * dt
+                for axis in range(2):
+                    if pos[axis] > 4.0 or pos[axis] < -4.0:
+                        self._nav_obstacle_vel[i, axis] *= -1
+                        pos[axis] = np.clip(pos[axis], -4.0, 4.0)
+                self.model.geom_pos[gid, 0:2] = pos
+                self.obstacle_positions[i] = (float(pos[0]), float(pos[1]))
         if self.action_latency_range is not None:
             self._action_buffer.append(action.copy())
             applied_action = self._action_buffer[-1 - self._episode_action_latency]

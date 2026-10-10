@@ -70,9 +70,12 @@ def evaluate(model_path, vecnorm_path, env_kwargs, episodes, seconds, kp, tolera
 
     obs = env.reset()
     # Each sub-env independently randomized its own obstacle_positions inside this reset() call
-    # (if nav_obstacles > 0) -- query them once now (static for the whole episode), one get_attr
-    # per attribute name, each returning a list with one value PER sub-env (unlike set_attr, which
-    # broadcasts the SAME value to every targeted index -- get_attr collects, it doesn't broadcast).
+    # (if nav_obstacles > 0) -- query them once now, one get_attr per attribute name, each returning
+    # a list with one value PER sub-env (unlike set_attr, which broadcasts the SAME value to every
+    # targeted index -- get_attr collects, it doesn't broadcast). Static for the whole episode UNLESS
+    # nav_obstacle_speed > 0, in which case the main loop below re-queries every step instead of
+    # reusing this one-time snapshot.
+    moving_obstacles = env_kwargs.get("nav_obstacle_speed", 0.0) > 1e-9
     obstacle_radius = env.get_attr("nav_obstacle_radius")
     obstacles_per_ep = [[(ox, oy, obstacle_radius[i]) for ox, oy in pos]
                          for i, pos in enumerate(env.get_attr("obstacle_positions"))]
@@ -109,6 +112,9 @@ def evaluate(model_path, vecnorm_path, env_kwargs, episodes, seconds, kp, tolera
     done_ep = np.zeros(episodes, dtype=bool)
     res = [None] * episodes
     for step in range(2, max_steps + 1):
+        if moving_obstacles:
+            obstacles_per_ep = [[(ox, oy, obstacle_radius[i]) for ox, oy in pos]
+                                 for i, pos in enumerate(env.get_attr("obstacle_positions"))]
         dist = np.hypot(goal_x - x, goal_y - y)
         reached_now = dist <= tolerance
         for i in range(episodes):
@@ -187,6 +193,9 @@ def main():
                          "(Stage 10b) and steer around them. 0 (default) = none.")
     ap.add_argument("--nav-obstacle-radius", type=float, default=0.15)
     ap.add_argument("--nav-obstacle-height", type=float, default=0.5)
+    ap.add_argument("--nav-obstacle-speed", type=float, default=0.0,
+                    help="m/s: each obstacle moves in a random constant-velocity straight line, "
+                         "bouncing off the course boundary. 0.0 (default) = static.")
     ap.add_argument("--obstacle-avoid-gain", type=float, default=1.5)
     ap.add_argument("--obstacle-influence-radius", type=float, default=0.8)
     args = ap.parse_args()
@@ -213,7 +222,7 @@ def main():
                   slope_range=None, slope_deg=None, stair_height_range=None, stair_height=None,
                   obstacle_height_range=None, obstacle_height=None,
                   nav_obstacles=args.nav_obstacles, nav_obstacle_radius=args.nav_obstacle_radius,
-                  nav_obstacle_height=args.nav_obstacle_height)
+                  nav_obstacle_height=args.nav_obstacle_height, nav_obstacle_speed=args.nav_obstacle_speed)
         e = evaluate(model_path, vec, kw, args.episodes, args.seconds, args.kp, args.tolerance,
                      args.goal_distance_range, speed_lo, speed_hi, lat_lo, lat_hi,
                      args.obstacle_avoid_gain, args.obstacle_influence_radius)

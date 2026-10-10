@@ -106,7 +106,11 @@ failure and fix, in [HISTORY.md](HISTORY.md)):
     well-understood (not chased further) convergence weak spot when a goal
     happens to land near an obstacle. Further extended with multi-waypoint
     patrol routes (`--waypoint`/`--loop`), reusing the same steering and
-    avoidance logic unchanged. Real turning capability was then
+    avoidance logic unchanged, and with dynamic (moving) obstacles
+    (`--nav-obstacle-speed`), which surfaced a real, measured limitation:
+    collision rate rises from 0% to 16% once an obstacle can wander into a
+    route that started clear, even though success rate and fall rate stay
+    unchanged. Real turning capability was then
     attempted (training the policy itself, not just the outer loop) and
     found a genuine, repeatable limit: four structurally different
     training approaches all converged on the same failure — the robot

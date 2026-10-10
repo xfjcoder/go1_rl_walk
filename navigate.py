@@ -101,6 +101,9 @@ def main():
                               "course (Stage 10b) and steer around them. 0 (default) = none.")
     parser.add_argument("--nav-obstacle-radius", type=float, default=0.15)
     parser.add_argument("--nav-obstacle-height", type=float, default=0.5)
+    parser.add_argument("--nav-obstacle-speed", type=float, default=0.0,
+                         help="m/s: each obstacle moves in a random constant-velocity straight "
+                              "line, bouncing off the course boundary. 0.0 (default) = static.")
     parser.add_argument("--obstacle-avoid-gain", type=float, default=1.5,
                          help="Repulsive-field strength; only matters with --nav-obstacles > 0.")
     parser.add_argument("--obstacle-influence-radius", type=float, default=0.8,
@@ -153,6 +156,7 @@ def main():
     env_kwargs["nav_obstacles"] = args.nav_obstacles
     env_kwargs["nav_obstacle_radius"] = args.nav_obstacle_radius
     env_kwargs["nav_obstacle_height"] = args.nav_obstacle_height
+    env_kwargs["nav_obstacle_speed"] = args.nav_obstacle_speed
 
     def make_env():
         return Go1FlatEnv(render_mode=render_mode, domain_randomize=False, camera=args.camera, **env_kwargs)
@@ -188,6 +192,10 @@ def main():
     just_arrived_idx = None   # guards against re-logging the same arrival every step while lingering
 
     for step in range(1, max_steps + 1):
+        # Re-query every step (not just once after reset) -- a no-op for static obstacles (the
+        # default, --nav-obstacle-speed=0), but required for moving ones, whose positions the env's
+        # own step() updates each control step.
+        obstacles = [(ox, oy, raw_env.nav_obstacle_radius) for ox, oy in raw_env.obstacle_positions]
         dist = float(np.hypot(goal[0] - x, goal[1] - y))
         # n_wp==1 always "stops" regardless of --loop (nothing else to cycle to -- reduces this whole
         # block to the exact single-goal behavior byte-for-byte when no --waypoint was given at all).

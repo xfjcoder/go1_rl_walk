@@ -1834,6 +1834,60 @@ to.
 unchanged (it's a randomized-statistics harness for single goals, not a demo tool -- a "patrol
 route success rate" metric would be a different kind of measurement, not attempted here).
 
+### Extension: dynamic (moving) obstacles
+
+The second of the three "extend navigation further" follow-ups. A new `nav_obstacle_speed` env
+param (m/s, default 0.0 = static, unchanged behavior) gives each obstacle a random constant-velocity
+straight-line motion, sampled once per episode, bouncing (reflecting the relevant velocity
+component) off the same +-4m placement box used for initial positioning -- kept perpetually
+relevant for the whole episode instead of wandering off-course. Purely kinematic (a direct
+`model.geom_pos` write each control step, exactly how the static case already worked -- these are
+scenery obstacles, not simulated with real mass/collision dynamics either way), so it needed no new
+physics and no retraining.
+
+The part that actually needed care: both `navigate.py` and `eval_navigate.py` previously queried
+`obstacle_positions` ONCE right after `reset()` and reused that snapshot for the whole episode --
+correct for static obstacles, stale the moment one can move. Both now re-query every control step
+(`eval_navigate.py` only re-queries when `nav_obstacle_speed > 0`, since each query is a real
+`get_attr` round trip per parallel env and the static case's byte-for-byte reproducibility is worth
+protecting). Verified with the zero-speed default byte-identical to Stage 10b's own original numbers
+("success_rate=0.75 ... collision_rate=0.00 closest_clearance=0.89m", `--nav-obstacles 10`,
+8 episodes).
+
+<p align="center">
+  <img src="media/go2_navigate_dynamic_obstacles.gif" width="480" alt="Go2 navigating to a goal while two obstacles move across its path">
+</p>
+
+*Wide overhead camera, two obstacles (red cylinders) each moving in their own straight line and
+bouncing off the course boundary -- the robot reacts to wherever they currently are, not just where
+they started.*
+
+A randomized 32-episode check (`--nav-obstacles 5 --nav-obstacle-speed 0.5`, same goal-sampling as
+every other Stage 10 eval) found a real, honest limitation: success_rate stayed high (0.97) and
+fall_rate stayed 0 (same as the static case), but collision_rate rose from 0.00 (static) to 0.16.
+Critically, collision_rate was still 0.00 among the 3/32 episodes where an obstacle sat on the
+robot's *initial* straight-line path -- the collisions happened in episodes that started clear and
+had an obstacle wander into the route later, which the existing reactive (potential-field) avoidance
+law, tuned against static obstacles, doesn't always react to in time at these speeds. Left as a
+known, measured limitation rather than retuned further (`--obstacle-avoid-gain`/
+`--obstacle-influence-radius` are already exposed as CLI flags for anyone who wants to chase it).
+
+**DECISION: adopted**, with the above caveat documented rather than hidden. `nav_obstacle_speed`
+(env), `--nav-obstacle-speed` (`navigate.py`/`eval_navigate.py`) committed; no existing
+checkpoint/script behavior changed (`nav_obstacle_speed=0.0` default, gated so even the per-obstacle
+RNG draw count during `reset()` is unaffected when unused -- verified byte-identical, not just
+"shouldn't matter").
+
+**Reusable tooling note**: hit a real analysis-methodology trap mid-investigation here, worth
+recording since it nearly caused a false "committed GIFs are broken" finding. `list(ImageSequence.Iterator(im))`
+does NOT give independent frame snapshots -- Pillow's iterator advances the SAME underlying `Image`
+object via `.seek()`, so every element of the materialized list is the identical object reference,
+left parked at the LAST frame once the list comprehension finishes; indexing into it afterward (e.g.
+`frames[0]` vs `frames[100]`) silently compares the last frame against itself. The fix is either to
+`.convert('RGB')` (or otherwise materialize) each frame *during* iteration, before advancing further,
+or to seek manually (`im.seek(i); im.convert('RGB')`) one frame at a time. Re-verified every
+previously-"failing" GIF in this project with the corrected method -- all were fine all along.
+
 ## Stage 10c: real turning capability (Go2) — tried, stopped, NOT adopted
 
 Nothing in 10a/10b's numbers indicated this was needed (0% collisions even where an obstacle sat
