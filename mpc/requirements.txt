@@ -5,3 +5,7 @@ mujoco
 casadi
 pin
 gymnasium
+stable-baselines3
+tensorboard
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch

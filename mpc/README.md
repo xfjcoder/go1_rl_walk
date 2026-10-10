@@ -158,4 +158,58 @@ rate for more standard PPO credit-assignment horizons. Fall thresholds (base hei
 0.15m, tilt 0.9rad) are reasonable guesses, not yet empirically validated against this
 specific robot/controller's actual failure modes.
 
-## Status: steps 1-3 of the staged plan done (interface defined, reviewed, two real bugs found and fixed, re-verified). Not yet started: step 4 (train the residual policy, same randomized multi-seed evaluation discipline as every other RL stage in this project) and step 5 (decide: adopt or document as a negative result, same as Stage 10c).
+## Step 4: training, and a third real bug
+
+`train_residual.py` trains the residual with PPO (`stable-baselines3`), mirroring
+`train.py`'s own hyperparameters and conventions where they transfer directly (linear LR
+decay, `VecNormalize`, `CheckpointCallback`, `RewardComponentLoggingCallback` reused
+unmodified, per-run `args.json`/`env_kwargs.json`). `SubprocVecEnv` uses
+`start_method="spawn"`, not Linux's default `fork` -- CasADi/Pinocchio/OSQP are native
+libraries not guaranteed fork-safe.
+
+**A third real bug, found the first time training actually ran for more than one
+iteration.** The very first launch (8 parallel envs) completed its first iteration
+cleanly, then died with the same `EOFError` symptom as before -- but this time the
+underlying cause turned out to be completely different from the first two bugs, and far
+more consequential: building a retry wrapper (`run_resilient.sh`, auto-resume from the
+latest checkpoint on crash) to work around what looked like intermittent flakiness
+instead **made the problem reproduce 100% of the time** -- all 30 retry attempts
+crashed, always right after resuming, always within one iteration. That consistency was
+the actual clue: resuming from the exact same checkpoint with the exact same seed
+produces the exact same action sequence, so if a crash is deterministic given that
+sequence, retrying with identical inputs just hits it again. "Add retries" was treating
+a symptom; the actual bug needed isolating.
+
+Reproduced directly (`SubprocVecEnv` + `VecNormalize.load` + `PPO.load`, bypassing the
+wrapper script entirely) and got the real error for the first time:
+```
+RuntimeError: Error in Function::call for 'S' [OsqpInterface] ...
+conic process failed. Set 'error_on_fail' option to false to ignore this error.
+```
+OSQP (the QP solver underneath `CentroidalMPC`) sometimes can't find a feasible solution
+given the robot's current state. That's a genuine, catchable Python exception -- but
+nothing in this env or the submodule catches it, so it propagates up through
+`SubprocVecEnv` and kills the worker process outright (the `EOFError` was always just
+the symptom one layer up: the parent's pipe read failing because the process on the
+other end had already died).
+
+Fixed by catching `RuntimeError` around the `solve_QP` call in
+`mpc_residual_env.py::step()`: on failure, keep the last successful solution for that
+one tick (a reasonable one-tick-stale fallback) and terminate the episode immediately
+with a fixed `-5.0` reward -- the same treatment as a fall, since a state the base
+controller itself can't solve for is at least as bad as falling over, and the policy
+should learn to avoid causing either one. Re-ran the exact scenario that crashed 30/30
+times before the fix: 5 clean iterations, zero crashes. Bonus confirmation the fix
+targets the right thing: `ep_len_mean` started at 57 (frequent early QP-failure
+terminations) and grew to ~1700-1800 within those same 5 iterations -- the `-5.0`
+penalty is already visibly teaching the policy to avoid whatever state triggers it.
+
+`train_residual.py` also gained `--auto-resume` (correctly computing `remaining =
+target - checkpoint's own num_timesteps` each time, to avoid the LR-schedule dilution
+bug documented in Stage 10c) and checkpoints save every iteration instead of every
+200,000 steps, so a crash -- this kind or any other -- now loses at most one iteration's
+progress. `run_resilient.sh` wraps it with automatic retry. Both remain in place even
+though the actual crash is fixed now: cheap insurance, not a workaround for something
+unresolved.
+
+## Status: steps 1-4 of the staged plan done (interface defined and reviewed; training launched, hit and fixed a third real bug: uncaught QP-solver-failure exceptions crashing worker processes). Not yet complete: step 4's actual training run (in progress) and step 5 (decide: adopt or document as a negative result, same as Stage 10c).

@@ -2362,10 +2362,31 @@ After both fixes: zero-residual achieves **1.955 rad/s** against the 2.0 rad/s c
 with (even marginally exceeding) the standalone script's 1.91 rad/s -- the gap is gone, as the first
 bug predicted it would be once fixed.
 
+**Step 4 (train the residual) found a third real bug, more consequential than the first two.**
+Training launched (`train_residual.py`, PPO via `stable-baselines3`, mirroring `train.py`'s own
+hyperparameters/conventions) completed one iteration cleanly, then died with the same `EOFError`
+symptom seen during Stage 11's earlier debugging. A retry wrapper (`run_resilient.sh`, auto-resume
+from the latest checkpoint) was built to work around what looked like intermittent flakiness --
+instead it made the problem reproduce **100% of the time**: all 30 retries crashed, always right
+after resuming. That consistency was the actual clue (resuming with an identical seed replays an
+identical action sequence, so a deterministic crash just gets hit again on retry) -- "add retries"
+was treating a symptom, not the bug. Reproduced directly, bypassing the wrapper, and got the real
+error for the first time: `RuntimeError: ... conic process failed` -- OSQP (the QP solver under
+`CentroidalMPC`) sometimes can't find a feasible solution given the robot's current state. A genuine,
+catchable Python exception that nothing caught, so it propagated up through `SubprocVecEnv` and
+killed the worker process outright (the `EOFError` was always just that one layer up). Fixed by
+catching it in `mpc_residual_env.py::step()`: keep the last successful solution for one tick and
+terminate the episode with a fixed -5.0 reward, the same treatment as a fall. Re-ran the exact
+scenario that crashed 30/30 times before the fix: 5 clean iterations, zero crashes, and
+`ep_len_mean` grew from 57 to ~1700-1800 within those same 5 iterations -- visible early evidence the
+penalty is teaching the policy to avoid whatever triggers it, confirming the fix targets the right
+thing, not just papering over the symptom.
+
 **Not yet decided: adopt or not.** This is real, repeatable, verified evidence that MPC solves the
 turning problem RL couldn't, on this project's own hardware model -- but nothing has been merged to
-`main`, and training the residual policy itself (steps 4-5: train, evaluate, decide) hasn't started.
-See `mpc/README.md` for the reproducible setup and `go1-staged-plan.md` (memory) for current status.
+`main`, training is in progress toward a first 1M-timestep checkpoint, and step 5 (evaluate, decide)
+hasn't started. See `mpc/README.md` for the reproducible setup and `go1-staged-plan.md` (memory) for
+current status.
 
 ## Next stages
 

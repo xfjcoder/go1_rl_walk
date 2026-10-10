@@ -197,14 +197,27 @@ class MPCResidualEnv(gym.Env):
         time_now_s = float(self.mujoco_go2.data.time)
         self.mujoco_go2.update_pin_with_mujoco(self.go2)
 
+        qp_failed = False
         if (self._ctrl_i % STEPS_PER_MPC) == 0:
             self.traj.generate_traj(self.go2, self.gait, time_now_s, self.target_speed,
                                      self.target_lateral, STAND_HEIGHT, self.target_yaw_rate,
                                      time_step=MPC_DT)
-            sol = self.mpc.solve_QP(self.go2, self.traj, False)
-            N = self.traj.N
-            w_opt = sol["x"].full().flatten()
-            self._U_opt = w_opt[12 * N:].reshape((12, N), order="F")
+            try:
+                sol = self.mpc.solve_QP(self.go2, self.traj, False)
+                N = self.traj.N
+                w_opt = sol["x"].full().flatten()
+                self._U_opt = w_opt[12 * N:].reshape((12, N), order="F")
+            except RuntimeError:
+                # CasADi/OSQP raise a plain RuntimeError ("conic process failed") when the QP is
+                # infeasible or numerically ill-conditioned given the robot's current state --
+                # genuinely a Python exception, but one this env must catch itself: confirmed by
+                # direct reproduction that letting it propagate up through SubprocVecEnv kills the
+                # whole worker process (EOFError on the parent's recv -- not a segfault, just an
+                # uncaught exception inside the worker's own step-handling loop). Keep the last
+                # successful solution for this one tick (a reasonable one-tick-stale fallback) and
+                # end the episode -- a state the MPC itself can't solve for is exactly the kind of
+                # thing this episode shouldn't continue from.
+                qp_failed = True
 
         mpc_force_world_0 = self._U_opt[:, 0]
         tau_raw = np.zeros(12)
@@ -237,15 +250,22 @@ class MPCResidualEnv(gym.Env):
         r_lateral = np.exp(-((v_body[1] - self.target_lateral) / self.speed_tracking_sigma) ** 2)
         r_yaw_rate = np.exp(-((w_body[2] - self.target_yaw_rate) / self.yaw_rate_tracking_sigma) ** 2)
         r_effort = -self.residual_effort_weight * float(np.sum(residual ** 2))
-        reward = 1.0 + r_speed + r_lateral + r_yaw_rate + r_effort
+        # A QP solver failure gets the same penalty as a fall (not a separate, milder case) --
+        # a state the base controller itself can't find a feasible solution for is at least as
+        # bad as falling over, and the policy should learn to avoid causing either one.
+        reward = -5.0 if qp_failed else (1.0 + r_speed + r_lateral + r_yaw_rate + r_effort)
 
         fell = base_height < FALL_HEIGHT or abs(roll) > FALL_TILT or abs(pitch) > FALL_TILT
-        terminated = bool(fell)
+        terminated = bool(fell or qp_failed)
         truncated = bool(self._ctrl_i >= self.ctrl_steps)
 
         info = {
-            "base_height": base_height, "roll": roll, "pitch": pitch,
+            "base_height": base_height, "roll": roll, "pitch": pitch, "qp_failed": qp_failed,
             "v_body": v_body.copy(), "w_body": w_body.copy(),
-            "r_speed": r_speed, "r_lateral": r_lateral, "r_yaw_rate": r_yaw_rate, "r_effort": r_effort,
+            # Same key ("reward_components") and flat-dict-of-floats shape train.py's own
+            # RewardComponentLoggingCallback already expects, so it's reusable unmodified here.
+            "reward_components": {
+                "speed": r_speed, "lateral": r_lateral, "yaw_rate": r_yaw_rate, "effort": r_effort,
+            },
         }
         return obs, float(reward), terminated, truncated, info
