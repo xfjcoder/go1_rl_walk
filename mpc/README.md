@@ -212,4 +212,45 @@ progress. `run_resilient.sh` wraps it with automatic retry. Both remain in place
 though the actual crash is fixed now: cheap insurance, not a workaround for something
 unresolved.
 
-## Status: steps 1-4 of the staged plan done (interface defined and reviewed; training launched, hit and fixed a third real bug: uncaught QP-solver-failure exceptions crashing worker processes). Not yet complete: step 4's actual training run (in progress) and step 5 (decide: adopt or document as a negative result, same as Stage 10c).
+Training completed cleanly after the fix: 1,003,520 timesteps, 245 iterations, ~100 fps
+throughout, zero crashes, zero retries needed. Final training stats look like genuine
+convergence (`explained_variance` 0.968, `approx_kl` ~1.5e-8, learning rate decayed to
+~0 as designed).
+
+<p align="center">
+  <img src="../media/mpc_residual_trained_demo.gif" width="480" alt="Trained residual policy driving the MPC-controlled Go2 through the same in-place rotation command">
+</p>
+
+*Same tracking camera and command (2.0 rad/s in-place rotation) as the pure-MPC demo
+above, now with the trained residual active.*
+
+## Step 5: evaluation -- a genuine, repeatable improvement
+
+`eval_residual.py` runs the same randomized multi-seed comparison this project's other
+stages are judged by (see memory: go1-eval-method) -- each episode samples a random
+command (speed/lateral/yaw-rate) and random domain parameters (friction/mass scale) from
+the training ranges, with the *same* seed used for both arms (trained vs. zero-residual)
+so the comparison is paired, not two independently-noisy samples.
+
+32 episodes:
+
+| | success rate | fall rate | QP-failure rate | speed / lateral / yaw-rate tracking | effort |
+|---|---|---|---|---|---|
+| zero-residual (pure MPC) | 0.94 | 0.06 | 0.06 | 0.980 / 0.960 / 0.964 | 0 |
+| **trained residual** | **1.00** | **0.00** | **0.00** | **0.988 / 0.984 / 0.982** | -0.114 |
+
+The trained residual eliminated every fall *and* every QP-solver failure across all 32
+randomized trials, while also modestly improving tracking accuracy on all three commanded
+dimensions -- using a fairly small residual (effort -0.114, not an aggressive override of
+the base controller). A first, smaller 4-episode smoke test showed a much larger gap
+(0.75 vs. 1.00 success) -- the 32-episode run moderated that, as expected from a bigger
+sample, but the direction and the "zero QP failures" result held up.
+
+Notably, the residual didn't just improve *tracking* (its explicit, rewarded objective)
+-- it also reduced the rate of QP-solver infeasibility, something it was never directly
+rewarded for avoiding (the -5.0 penalty only fires when a failure actually happens, it
+isn't a predictive signal). This is consistent with the intended design: the residual
+learning to keep the robot in states the MPC's simplified rigid-body model handles well,
+rather than fighting the base controller's own decisions.
+
+## Status: steps 1-5 of the staged plan done. Interface defined and reviewed; training completed (after finding and fixing a real QP-solver-failure crash); evaluated with a randomized 32-episode comparison showing a genuine, repeatable improvement over the unmodified MPC baseline. Decision on whether to adopt this track further is open -- see HISTORY.md.

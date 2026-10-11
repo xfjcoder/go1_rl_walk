@@ -2382,11 +2382,32 @@ scenario that crashed 30/30 times before the fix: 5 clean iterations, zero crash
 penalty is teaching the policy to avoid whatever triggers it, confirming the fix targets the right
 thing, not just papering over the symptom.
 
+Training then completed cleanly: 1,003,520 timesteps, 245 iterations, ~100 fps throughout, zero
+crashes, zero retries needed -- final stats look like genuine convergence (`explained_variance`
+0.968, `approx_kl` ~1.5e-8, learning rate decayed to ~0 as designed).
+
+**Step 5 (evaluate): a genuine, repeatable improvement.** Randomized 32-episode comparison (same
+discipline as every other stage -- see memory: go1-eval-method), trained residual vs. zero-residual
+(pure MPC), paired per-episode seeds (same random command + domain randomization for both arms):
+
+| | success rate | fall rate | QP-failure rate | speed/lateral/yaw-rate tracking | effort |
+|---|---|---|---|---|---|
+| zero-residual (pure MPC) | 0.94 | 0.06 | 0.06 | 0.980 / 0.960 / 0.964 | 0 |
+| **trained residual** | **1.00** | **0.00** | **0.00** | **0.988 / 0.984 / 0.982** | -0.114 |
+
+The trained residual eliminated every fall *and* every QP-solver failure across all 32 trials, while
+modestly improving tracking on all three commanded dimensions, using a fairly small residual (not an
+aggressive override). Notably, it reduced QP-solver infeasibility -- something it was never directly
+rewarded for avoiding (the -5.0 penalty only fires after a failure happens) -- consistent with the
+intended design: the residual learning to keep the robot in states the MPC's simplified rigid-body
+model handles well, rather than fighting the base controller's own decisions.
+
 **Not yet decided: adopt or not.** This is real, repeatable, verified evidence that MPC solves the
-turning problem RL couldn't, on this project's own hardware model -- but nothing has been merged to
-`main`, training is in progress toward a first 1M-timestep checkpoint, and step 5 (evaluate, decide)
-hasn't started. See `mpc/README.md` for the reproducible setup and `go1-staged-plan.md` (memory) for
-current status.
+turning problem RL couldn't, AND that a residual RL layer on top measurably improves robustness and
+tracking versus the unmodified MPC baseline -- on this project's own hardware model, with proper
+randomized-trial evidence, not a single demo. Nothing has been merged to `main` yet. See
+`mpc/README.md` for the reproducible setup, demo GIFs, and full results; `go1-staged-plan.md`
+(memory) for current status.
 
 ## Next stages
 
