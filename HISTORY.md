@@ -2402,12 +2402,20 @@ rewarded for avoiding (the -5.0 penalty only fires after a failure happens) -- c
 intended design: the residual learning to keep the robot in states the MPC's simplified rigid-body
 model handles well, rather than fighting the base controller's own decisions.
 
-**Not yet decided: adopt or not.** This is real, repeatable, verified evidence that MPC solves the
-turning problem RL couldn't, AND that a residual RL layer on top measurably improves robustness and
-tracking versus the unmodified MPC baseline -- on this project's own hardware model, with proper
-randomized-trial evidence, not a single demo. Nothing has been merged to `main` yet. See
-`mpc/README.md` for the reproducible setup, demo GIFs, and full results; `go1-staged-plan.md`
-(memory) for current status.
+This is real, repeatable, verified evidence that MPC solves the turning problem RL couldn't, AND
+that a residual RL layer on top measurably improves robustness and tracking versus the unmodified
+MPC baseline -- on this project's own hardware model, with proper randomized-trial evidence, not a
+single demo. **Decision: adopted, merged to `main`.**
+
+**Extended further: rough terrain, slopes, and stairs.** Ported `envs/go1_env.py`'s own heightfield
+terrain generator (bumps + slope + stairs, same `HF_*` constants reused directly) into
+`MPCResidualEnv` -- all disabled by default (flat ground, byte-identical to every behavior above,
+re-verified after the change). Verified each terrain type individually, visually as well as
+numerically: random bumps, a 15-degree slope, and 4cm-riser stairs each render and behave physically
+correctly. The pure-MPC (zero-residual) baseline falls on a 15-degree slope it has no explicit
+awareness of -- exactly the kind of real, concrete gap this track's residual-RL approach is meant to
+close. A new training run (`terrain_v1`, amplitude up to 8cm / slope up to 12deg / stairs up to 5cm)
+is in progress; results to follow. See `mpc/README.md` for the reproducible setup and demo GIFs.
 
 ## Next stages
 

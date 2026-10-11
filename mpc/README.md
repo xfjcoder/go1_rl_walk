@@ -253,4 +253,39 @@ isn't a predictive signal). This is consistent with the intended design: the res
 learning to keep the robot in states the MPC's simplified rigid-body model handles well,
 rather than fighting the base controller's own decisions.
 
-## Status: steps 1-5 of the staged plan done. Interface defined and reviewed; training completed (after finding and fixing a real QP-solver-failure crash); evaluated with a randomized 32-episode comparison showing a genuine, repeatable improvement over the unmodified MPC baseline. Decision on whether to adopt this track further is open -- see HISTORY.md.
+All 5 staged-plan steps done, decision made (see HISTORY.md): merged to `main`. Extended
+further below.
+
+## Extension: rough terrain, slopes, and stairs
+
+Ports `envs/go1_env.py`'s own heightfield terrain generator (bumps + slope + stairs, all
+additive, same `HF_*` constants imported directly rather than re-derived) into
+`MPCResidualEnv` -- `terrain_amplitude_range`/`slope_deg_range`/`stair_height_range`
+(all `None` by default = flat ground, byte-identical to every pre-existing behavior,
+confirmed by re-running `verify_residual_interface.py` after this change). When at least
+one range is given, a terrain-injected copy of `go2_mesh_for_mpc.xml` is built once (in
+`__init__`, not per-reset -- same "expensive objects built once" discipline as the rest of
+this file) and written to a temp file with its `meshdir` rewritten absolute; each `reset()`
+then only mutates `model.hfield_data` in place (no rebuild), matching
+`envs/go1_env.py`'s own established pattern for cheap per-episode terrain randomization.
+
+Verified each terrain type individually, visually as well as numerically (reward curves
+alone have proven insufficient before in this project -- see Stage 10c): random bumps,
+a 15-degree slope, and 4cm-riser stairs each render and behave physically correctly (robot
+genuinely contacts the uneven surface, doesn't float or clip through it).
+
+<p align="center">
+  <img src="../media/mpc_terrain_slope_zeroresidual_fall.gif" width="480" alt="Pure MPC (zero residual) falling on a 15-degree slope it wasn't trained for">
+</p>
+
+*Zero-residual (pure MPC, no RL correction) walking into a 15-degree slope -- falls
+shortly after the grade starts. This is exactly the kind of challenge the residual is
+meant to help with: the base controller's simplified rigid-body model has no explicit
+terrain awareness, so slopes/stairs beyond what it can implicitly absorb are a real
+failure mode, not a hypothetical one.*
+
+A new training run (`terrain_v1`: 1.5M timesteps, amplitude up to 8cm, slope up to 12
+degrees, stair risers up to 5cm, otherwise identical hyperparameters to `v1`) is
+in progress to test whether a residual trained specifically on this terrain distribution
+can close that gap, the same way `v1`'s residual measurably improved robustness on flat
+ground. Results to follow once training and evaluation complete.

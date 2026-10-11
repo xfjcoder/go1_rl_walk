@@ -101,6 +101,9 @@ def main():
     ap.add_argument("--friction-range", type=float, nargs=2, default=[0.6, 1.1])
     ap.add_argument("--mass-scale-range", type=float, nargs=2, default=[0.8, 1.2])
     ap.add_argument("--push-velocity", type=float, default=0.0)
+    ap.add_argument("--terrain-amplitude-range", type=float, nargs=2, default=None)
+    ap.add_argument("--slope-deg-range", type=float, nargs=2, default=None)
+    ap.add_argument("--stair-height-range", type=float, nargs=2, default=None)
     args = ap.parse_args()
 
     run_dir = Path(__file__).resolve().parent / args.run_dir
@@ -115,6 +118,9 @@ def main():
         friction_range=tuple(args.friction_range),
         mass_scale_range=tuple(args.mass_scale_range),
         push_velocity=args.push_velocity,
+        terrain_amplitude_range=tuple(args.terrain_amplitude_range) if args.terrain_amplitude_range else None,
+        slope_deg_range=tuple(args.slope_deg_range) if args.slope_deg_range else None,
+        stair_height_range=tuple(args.stair_height_range) if args.stair_height_range else None,
     )
     max_steps = int(args.episode_seconds * 200)
 

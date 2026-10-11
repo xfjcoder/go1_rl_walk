@@ -83,6 +83,13 @@ def main():
     ap.add_argument("--friction-range", type=float, nargs=2, default=[0.6, 1.1])
     ap.add_argument("--mass-scale-range", type=float, nargs=2, default=[0.8, 1.2])
     ap.add_argument("--push-velocity", type=float, default=0.0)
+    ap.add_argument("--terrain-amplitude-range", type=float, nargs=2, default=None,
+                     help="(lo, hi) m peak-to-peak random bumps, sampled each reset. "
+                          "Omit (default) for flat ground.")
+    ap.add_argument("--slope-deg-range", type=float, nargs=2, default=None,
+                     help="(lo, hi) degrees, sampled each reset; uphill/downhill 50/50.")
+    ap.add_argument("--stair-height-range", type=float, nargs=2, default=None,
+                     help="(lo, hi) m per riser, sampled each reset; ascending/descending 50/50.")
     ap.add_argument("--auto-resume", action="store_true",
                      help="If mpc/runs/<name>/checkpoints already has a checkpoint, resume from "
                           "the latest one instead of starting fresh -- --timesteps is interpreted "
@@ -115,6 +122,9 @@ def main():
         mass_scale_range=tuple(args.mass_scale_range),
         push_velocity=args.push_velocity,
         episode_seconds=args.episode_seconds,
+        terrain_amplitude_range=tuple(args.terrain_amplitude_range) if args.terrain_amplitude_range else None,
+        slope_deg_range=tuple(args.slope_deg_range) if args.slope_deg_range else None,
+        stair_height_range=tuple(args.stair_height_range) if args.stair_height_range else None,
     )
     with open(run_dir / "env_kwargs.json", "w") as f:
         json.dump(env_kwargs, f, indent=2)
