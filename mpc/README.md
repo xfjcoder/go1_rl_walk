@@ -289,3 +289,87 @@ degrees, stair risers up to 5cm, otherwise identical hyperparameters to `v1`) is
 in progress to test whether a residual trained specifically on this terrain distribution
 can close that gap, the same way `v1`'s residual measurably improved robustness on flat
 ground. Results to follow once training and evaluation complete.
+
+## Terrain extension: genuine but partial improvement, then a ceiling (4 negative results)
+
+`terrain_v1` (1.5M steps, amplitude up to 8cm / slope up to 12deg / stairs up to 5cm):
+a real but modest improvement over zero-residual, nowhere close to flat ground's
+near-complete fix:
+
+| | success rate | fall rate | QP-failure rate | ep_len_mean | speed track |
+|---|---|---|---|---|---|
+| zero-residual (pure MPC) | 0.50 | 0.50 | 0.47 | 1244/2000 | 0.610 |
+| **trained (v1)** | **0.56** | **0.44** | **0.38** | 1327/2000 | 0.616 |
+
+Three follow-up experiments then each targeted a specific hypothesis for why the gap
+to flat ground's result is so much smaller here. **All four variants were evaluated with
+the exact same paired-seed harness (`eval_residual.py`, 32 episodes, seeds 60000-60031),
+so these numbers are directly comparable:**
+
+| variant | hypothesis tested | success | fall | qp_failed | ep_len | speed track |
+|---|---|---|---|---|---|---|
+| zero-residual (baseline) | -- | 0.50 | 0.50 | 0.47 | 1244 | 0.610 |
+| `terrain_v1` | (first attempt) | 0.56 | 0.44 | 0.38 | 1327 | 0.616 |
+| `terrain_v2` (curriculum + hard-mining) | undertrained / bad schedule | 0.56 | 0.44 | 0.44 | 1340 | 0.611 |
+| `terrain_v3` (`residual_scale` 5.0 -> 15.0) | not enough torque authority | 0.53 | 0.47 | 0.44 | 1249 | 0.613 |
+| `terrain_v4` (+ 9-dim terrain heightmap) | policy is terrain-blind (pure proprioception) | **0.44** | **0.56** | **0.53** | 1171 | 0.585 |
+
+- **`terrain_v2`**: mirrored this project's own successful RL pattern exactly -- a
+  curriculum ramping `terrain_amp_max_current`/`slope_deg_max_current`/
+  `stair_height_max_current` from a start value up to the full range over training (same
+  `RampCallback` used by `train.py`, reused unmodified), followed by a hard-mining
+  fine-tune pass narrowed to the hardest sub-range only (same two-phase recipe that fixed
+  Go1's own 12cm/0.8m/s corner, see memory: go1-staged-plan). 2.25M steps total. Result:
+  **no improvement over the uncurriculated `v1`** (success/fall identical; qp_failed_rate
+  slightly worse, 0.38 -> 0.44). Both the curriculum machinery and the hard-mining resume
+  logic were unit-tested directly before trusting this result (clamped sampling bounds
+  confirmed correct, `--auto-resume`/`--resume` precedence fixed so a crash-retry
+  continues the run's own progress rather than restarting from the seed checkpoint).
+- **`terrain_v3`**: tripled `residual_scale` (the hard cap on the residual's additive
+  torque, 5.0 -> 15.0 N*m) in case the original cap was too tight to correct the large
+  torque errors MPC makes on steep terrain. Result: **slightly worse** across every
+  metric. Ruled out "not enough torque authority" as the bottleneck.
+- **`terrain_v4`**: added a 9-dim terrain-heightmap observation (`--use-terrain-heightmap`,
+  a 3x3 grid of terrain height ahead of the trunk in its own yaw-rotated frame, ported
+  verbatim from `envs/go1_env.py`'s own `_local_heightmap` -- the same mechanism that
+  measurably helped the pure-RL stairs policy, see memory: go1-staged-plan section 3d).
+  The leading hypothesis after ruling out the first two: the residual policy is purely
+  proprioceptive (joint angles/velocities/trunk orientation/last torque), with no
+  explicit signal that terrain is coming, so it can only react after contact, never
+  anticipate. Result: **the worst variant tested, including underperforming the
+  untrained zero-residual baseline on every metric** -- success rate actually dropped
+  below doing nothing (0.44 vs. 0.50), and tracking degraded across all three commanded
+  axes too (not just the terrain-related failure metrics), suggesting the extra 9
+  observation dimensions made the learning problem harder on the same 1.5M-step budget
+  rather than giving the policy useful new signal to exploit. Training itself converged
+  cleanly by its own internal metrics (`approx_kl`~0, `clip_fraction` 0, `std`=0.814) --
+  this isn't a crashed or diverged run, it's a policy that converged to something worse.
+
+**Four structurally different interventions -- uncurriculated baseline, curriculum +
+hard-mining, 3x torque authority, and terrain-sensing observation -- and none improved on
+`terrain_v1`'s original 0.56 success rate; the last one actively regressed it below the
+untrained baseline.** This is a materially different (and weaker) outcome than the
+analogous pattern on the pure-RL track, where curriculum/hard-mining and terrain-aware
+observations both measurably helped (see memory: go1-staged-plan, Stage 2's hard-mining
+fix and Stage 3d's heightmap). The likely reason is a structural capacity difference, not
+a tuning gap: the pure-RL stairs/heightmap experiments modified the full action space of
+a policy that already owned locomotion end-to-end, trained over tens of millions of
+curriculum-staged steps; here the residual is a small additive torque correction applied
+*after* an MPC solve that has already fully committed to footsteps and body trajectory
+based on its own simplified rigid-body contact model -- on a slope or stair riser, that
+model's assumptions are often just wrong (not merely infeasible), and a bounded residual
+correction downstream of a wrong plan has much less room to fix the outcome than letting
+RL own the whole decision from scratch.
+
+**Decision: closed, not adopted for terrain.** MPC+residual's demonstrated, real value
+stays scoped to flat-ground robustness and turning (see the Step 5 evaluation above:
+100% success, 0% QP failures, verified over 32 randomized trials) -- genuinely good
+results that 4 from-scratch RL attempts in Stage 10c couldn't produce (see `HISTORY.md`).
+Rough terrain/slopes/stairs is documented here as a tested, partial, capped extension
+(best case ~56% success at this difficulty range) rather than a solved capability. The
+project's terrain story continues to rest on the mature pure-RL pipeline
+(`pretrained/p_stairs` / `pretrained/x_mesh_finetune`, see memory: go1-staged-plan),
+which handles this terrain distribution with close to 0% falls. All four experimental
+variants (`terrain_v2`/`v3`/`v4` plus their training/eval logs) are kept as `runs/`
+artifacts for reference; none is promoted or merged further.
+ground. Results to follow once training and evaluation complete.

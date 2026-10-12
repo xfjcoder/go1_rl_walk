@@ -104,6 +104,7 @@ def main():
     ap.add_argument("--terrain-amplitude-range", type=float, nargs=2, default=None)
     ap.add_argument("--slope-deg-range", type=float, nargs=2, default=None)
     ap.add_argument("--stair-height-range", type=float, nargs=2, default=None)
+    ap.add_argument("--use-terrain-heightmap", action="store_true")
     args = ap.parse_args()
 
     run_dir = Path(__file__).resolve().parent / args.run_dir
@@ -121,6 +122,7 @@ def main():
         terrain_amplitude_range=tuple(args.terrain_amplitude_range) if args.terrain_amplitude_range else None,
         slope_deg_range=tuple(args.slope_deg_range) if args.slope_deg_range else None,
         stair_height_range=tuple(args.stair_height_range) if args.stair_height_range else None,
+        use_terrain_heightmap=args.use_terrain_heightmap,
     )
     max_steps = int(args.episode_seconds * 200)
 

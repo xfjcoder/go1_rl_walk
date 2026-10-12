@@ -2415,7 +2415,28 @@ numerically: random bumps, a 15-degree slope, and 4cm-riser stairs each render a
 correctly. The pure-MPC (zero-residual) baseline falls on a 15-degree slope it has no explicit
 awareness of -- exactly the kind of real, concrete gap this track's residual-RL approach is meant to
 close. A new training run (`terrain_v1`, amplitude up to 8cm / slope up to 12deg / stairs up to 5cm)
-is in progress; results to follow. See `mpc/README.md` for the reproducible setup and demo GIFs.
+showed a real but modest improvement over zero-residual (success 0.50->0.56, fall 0.50->0.44,
+QP-failure 0.47->0.38 over 32 paired randomized trials) -- nowhere close to flat ground's
+near-complete fix. Three follow-up experiments each targeted a specific hypothesis for that gap,
+and none improved on it: `terrain_v2` (curriculum ramp + hard-mining fine-tune, mirroring the
+exact two-phase recipe that fixed the pure-RL track's 12cm/0.8m/s corner) was statistically
+identical to `v1`; `terrain_v3` (tripled `residual_scale`, testing "not enough torque authority")
+was slightly worse; `terrain_v4` (added a 9-dim terrain-heightmap observation, the same mechanism
+that measurably helped the pure-RL stairs policy) was the worst of all four, actually
+underperforming the untrained zero-residual baseline on every metric (success 0.44, fall 0.56,
+speed/lateral/yaw tracking all down too) despite training converging cleanly by its own metrics.
+
+**Decision: closed, not adopted for terrain.** Four structurally different interventions found
+no way past `v1`'s ~56% success ceiling at this difficulty range. Most likely explanation: a
+structural capacity difference, not a tuning gap -- the residual is a small additive torque
+correction applied *after* MPC's QP has already fully committed to footsteps/body trajectory
+from its own simplified rigid-body contact model, which is often outright wrong (not merely
+infeasible) on a slope or stair riser; a bounded downstream correction has far less room to fix
+that than RL owning the whole decision from scratch, which is what the mature pure-RL pipeline
+already does well (`pretrained/p_stairs` / `pretrained/x_mesh_finetune`, near-0% falls on this
+same terrain distribution). MPC+residual's real, demonstrated value stays scoped to flat-ground
+robustness and turning (the Step 5 evaluation above). See `mpc/README.md` for the full
+experiment table, reproducible setup, and demo GIFs.
 
 ## Next stages
 

@@ -120,6 +120,11 @@ class MPCResidualEnv(gym.Env):
                                                # downhill chosen with equal probability.
         stair_height_range: tuple | None = None,  # (lo, hi) m per riser, sampled each reset;
                                                # ascending/descending chosen with equal probability.
+        use_terrain_heightmap: bool = False,  # add a 3x3 local heightmap (9 dims) to the
+                                               # observation -- mirrors envs/go1_env.py's own
+                                               # --use-terrain-heightmap exactly (a privileged
+                                               # analytic lookup, zero on flat ground / terrain
+                                               # disabled). Default False keeps obs_dim == 47.
         ramp_length: float = DEFAULT_RAMP_LENGTH,
         stair_depth: float = 0.25,
         num_stairs: int = 8,
@@ -142,6 +147,17 @@ class MPCResidualEnv(gym.Env):
         self.stair_height_range = stair_height_range
         self.terrain_enabled = any(r is not None for r in
                                     (terrain_amplitude_range, slope_deg_range, stair_height_range))
+        # Curriculum ramp targets (mirrors envs/go1_env.py's own terrain_amp_max_current /
+        # slope_deg_max_current / stair_height_max_current convention): each reset samples
+        # U(range_lo, current_max) instead of the static range_hi. A RampCallback in
+        # train_residual.py raises *_max_current from a curriculum-start value up to
+        # range_hi over training; left untouched (== range_hi from construction) this is
+        # byte-identical to uniform sampling across the full range, so omitting curriculum
+        # flags reproduces terrain_v1's exact prior behavior.
+        self.terrain_amp_max_current = terrain_amplitude_range[1] if terrain_amplitude_range else None
+        self.slope_deg_max_current = slope_deg_range[1] if slope_deg_range else None
+        self.stair_height_max_current = stair_height_range[1] if stair_height_range else None
+        self.use_terrain_heightmap = use_terrain_heightmap
         self.ramp_length = ramp_length
         self.stair_depth = stair_depth
         self.num_stairs = num_stairs
@@ -150,7 +166,8 @@ class MPCResidualEnv(gym.Env):
         self._rng = np.random.default_rng(seed)
 
         # obs = [v_body(3), w_body(3), roll, pitch, qpos(12), qvel(12), mpc_tau(12), cmd(3)] = 47
-        obs_dim = 3 + 3 + 2 + 12 + 12 + 12 + 3
+        # [+ heightmap(9) if use_terrain_heightmap]
+        obs_dim = 3 + 3 + 2 + 12 + 12 + 12 + 3 + (9 if use_terrain_heightmap else 0)
         self.observation_space = spaces.Box(-np.inf, np.inf, shape=(obs_dim,), dtype=np.float32)
         self.action_space = spaces.Box(-1.0, 1.0, shape=(12,), dtype=np.float32)
 
@@ -236,15 +253,18 @@ class MPCResidualEnv(gym.Env):
         self.mujoco_go2.model.body_mass[self._base_id] = self._nominal_base_mass * scale
 
         if self.terrain_enabled:
-            amp = (float(self._rng.uniform(*self.terrain_amplitude_range))
+            amp = (float(self._rng.uniform(self.terrain_amplitude_range[0],
+                                            max(self.terrain_amp_max_current, self.terrain_amplitude_range[0])))
                    if self.terrain_amplitude_range is not None else 0.0)
             if self.slope_deg_range is not None:
-                slope_deg = float(self._rng.uniform(*self.slope_deg_range))
+                slope_deg = float(self._rng.uniform(self.slope_deg_range[0],
+                                                     max(self.slope_deg_max_current, self.slope_deg_range[0])))
                 uphill = bool(self._rng.uniform() < 0.5)
             else:
                 slope_deg, uphill = 0.0, True
             if self.stair_height_range is not None:
-                stair_h = float(self._rng.uniform(*self.stair_height_range))
+                stair_h = float(self._rng.uniform(self.stair_height_range[0],
+                                                   max(self.stair_height_max_current, self.stair_height_range[0])))
                 ascending = bool(self._rng.uniform() < 0.5)
             else:
                 stair_h, ascending = 0.0, True
@@ -314,6 +334,37 @@ class MPCResidualEnv(gym.Env):
         self._terrain_h = h
         self.mujoco_go2.model.hfield_data[self._hf_adr:self._hf_adr + nrow * ncol] = (h / HF_ELEV).ravel()
 
+    def _terrain_height(self, x, y):
+        """Ported verbatim from envs/go1_env.py's own _terrain_height: bilinear-interpolated
+        terrain surface height (m) at world (x, y); scalars or arrays. Zero on flat ground /
+        terrain disabled (checked FIRST, before touching self._hf_x0 etc., which only exist
+        when self.terrain_enabled -- safe to call even if use_terrain_heightmap=True without
+        terrain_enabled, same as the reference implementation)."""
+        if self._terrain_h is None:
+            return np.zeros(np.shape(x)) if np.ndim(x) else 0.0
+        fx = np.clip((np.asarray(x) - self._hf_x0) / HF_CELL, 0.0, self._hf_ncol - 1 - 1e-9)
+        fy = np.clip((np.asarray(y) - self._hf_y0) / HF_CELL, 0.0, self._hf_nrow - 1 - 1e-9)
+        c0, r0 = np.floor(fx).astype(int), np.floor(fy).astype(int)
+        wx, wy = fx - c0, fy - r0
+        h = self._terrain_h
+        return (h[r0, c0] * (1 - wx) * (1 - wy) + h[r0, c0 + 1] * wx * (1 - wy)
+                + h[r0 + 1, c0] * (1 - wx) * wy + h[r0 + 1, c0 + 1] * wx * wy)
+
+    def _local_heightmap(self, qpos) -> np.ndarray:
+        """Ported verbatim from envs/go1_env.py's own _local_heightmap: terrain height (m) at a
+        3x3 grid of points ahead of the trunk, in the trunk's OWN forward/lateral frame (rotated
+        by current yaw), relative to the height directly under the trunk."""
+        x0, y0 = qpos[0], qpos[1]
+        qw, qx, qy, qz = qpos[3:7]
+        yaw = np.arctan2(2 * (qw * qz + qx * qy), 1 - 2 * (qy ** 2 + qz ** 2))
+        c, s = np.cos(yaw), np.sin(yaw)
+        fwd, lat = np.array([0.15, 0.35, 0.55]), np.array([-0.15, 0.0, 0.15])
+        F, L = np.meshgrid(fwd, lat, indexing="ij")
+        wx = x0 + F * c - L * s
+        wy = y0 + F * s + L * c
+        h = self._terrain_height(wx.ravel(), wy.ravel()) - self._terrain_height(x0, y0)
+        return h.astype(np.float32)
+
     def _get_obs(self):
         data = self.mujoco_go2.data
         qw, qx, qy, qz = data.qpos[3:7]
@@ -327,7 +378,10 @@ class MPCResidualEnv(gym.Env):
         qpos12 = data.qpos[7:19] - 0.0  # raw joint angles (no nominal offset subtracted -- kept simple)
         qvel12 = data.qvel[6:18]
         cmd = np.array([self.target_speed, self.target_lateral, self.target_yaw_rate])
-        obs = np.concatenate([v_body, w_body, [roll, pitch], qpos12, qvel12, self._last_tau_cmd, cmd])
+        parts = [v_body, w_body, [roll, pitch], qpos12, qvel12, self._last_tau_cmd, cmd]
+        if self.use_terrain_heightmap:
+            parts.append(self._local_heightmap(data.qpos))
+        obs = np.concatenate(parts)
         return obs.astype(np.float32)
 
     def step(self, action):
