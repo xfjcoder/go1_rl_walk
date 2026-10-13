@@ -2505,6 +2505,26 @@ controllers pair the schedule with a dedicated pitch-oscillation reference -- th
 trajectory shaping is the natural next step if bound is wanted, not attempted here. See
 `mpc/README.md` for the full table and mechanism writeup.
 
+**Bound-gait pitch fix, chased directly (user: "fix the bound gait pitch reference") -- a real
+but partial fix, two complementary cost-side levers.** Lever 1: soften the pitch-tracking cost
+weight (`COST_MATRIX_Q` index 4, via `CostOverrideMixin`). Swept 20(orig)/5/2/1/0.5/0.1/0 ->
+success 0.06/0.15/0.17/**0.21**/0.17/0.17/0.12 -- a genuine unimodal peak at weight=1, not
+"softer is always better." Found and fixed a real bug mid-sweep: `COST_MATRIX_Q` is int-dtype,
+so assigning a non-integer weight silently truncated to 0 -- that's why 0.5 and 0.1 first
+measured bit-for-bit identical (both became exactly 0); fixed with `.astype(float)`. Lever 2: a
+genuine phase-synced pitch reference (`BoundAwareComTraj`, patches the QP's cost reference only
+-- the predicted-dynamics model built inside `generate_traj` still assumes flat pitch, a real
+accepted scope limit). Swept amplitude 0/+-0.05/+-0.15/+-0.3 rad on top of weight=1: negative is
+unambiguously the wrong sign (catastrophic as magnitude grows, falls almost immediately at
+-0.3); positive is safe and clearly helps episode length (783->1069 steps) but only marginally
+improves full-episode success (0.21->**0.23**, not clearly beyond noise at n=48). **Adopted:
+weight=1, amplitude=+0.3 -- a real, verified improvement (6%->23% success, 94%->75% qp_failed)
+but still far from trot/pace/walk's 90-96%.** The likely remaining cause: the dynamics model is
+internally inconsistent with the nonzero pitch the cost now targets; a full fix needs either a
+pitch-consistent dynamics rederivation or a genuine flight-phase/vertical-bounce reference (MIT
+Cheetah 3's approach) -- both materially bigger than either lever tried. `gait_style="bound"` is
+noticeably better than before but not production-ready like the other three styles.
+
 ## Next stages
 
 Terrain-aware observation and a non-trot gait mode were both tried already

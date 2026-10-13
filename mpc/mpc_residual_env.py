@@ -34,7 +34,7 @@ SUBMODULE_SRC = REPO_ROOT / "third_party" / "go2-convex-mpc" / "src"
 sys.path.insert(0, str(SUBMODULE_SRC))
 sys.path.insert(0, str(REPO_ROOT))
 
-from convex_mpc.centroidal_mpc import CentroidalMPC, MU, NU, NX
+from convex_mpc.centroidal_mpc import CentroidalMPC, COST_MATRIX_Q, MU, NU, NX
 from convex_mpc.com_trajectory import ComTraj
 from convex_mpc.gait import Gait, HEIGHT_SWING
 from convex_mpc.go2_robot_data import PinGo2Model
@@ -147,6 +147,50 @@ class StyledTerrainAwareGait(GaitStyleMixin, TerrainAwareGait):
     def __init__(self, frequency_hz, duty, phase_offset, terrain_height_fn):
         self._phase_offset = np.asarray(phase_offset, dtype=float)
         super().__init__(frequency_hz, duty, terrain_height_fn)
+
+
+class BoundAwareComTraj(ComTraj):
+    """Gives the bound gait a genuine, phase-synced PITCH reference instead of
+    ComTraj.generate_traj's own hardcoded flat (zero) reference used for every style.
+    Follow-up to GAIT_STYLE_PITCH_WEIGHT's cost-softening fix below, which alone only
+    got bound to 21% success (vs. trot's 94%) -- softening the weight gives the QP room
+    to deviate from zero pitch, but gives it no target to deviate TOWARD, leaving the
+    deviation underdetermined. This adds a sinusoidal target tied to the SAME phase used
+    for the contact schedule (`phase_offset` -- the front leg pair's own offset, since
+    bound's front/rear pairs are exactly out of phase): nose dips one way while the
+    front pair is in stance, the other way while the rear pair is.
+
+    Scope, by design: only the QP's COST reference (self.rpy_traj_world /
+    self.omega_traj_world, what compute_x_ref_vec feeds into the linear cost term) is
+    patched, AFTER calling the unmodified parent generate_traj -- the parent's own
+    internal predicted-foot-lever-arm loop (which builds the Ad/Bd dynamics matrices)
+    already ran with a flat-pitch reference by the time this patch applies, so the
+    dynamics model still assumes zero pitch throughout the horizon. Re-deriving that
+    loop to use a consistent nonzero pitch would mean duplicating generate_traj
+    wholesale rather than patching it (the same vendored-submodule discipline as every
+    other fix in this file) -- accepted as a real, bounded simplification: this still
+    gives the QP's own objective a genuine, correctly-signed incentive to let the body
+    pitch with the gait instead of fighting it, just not a fully pitch-consistent
+    dynamics model to match.
+    """
+
+    def __init__(self, go2, pitch_amplitude, pitch_phase_offset):
+        super().__init__(go2)
+        self._pitch_amplitude = pitch_amplitude
+        self._pitch_phase_offset = pitch_phase_offset
+
+    def generate_traj(self, go2, gait, time_now, x_vel_des_body, y_vel_des_body,
+                       z_pos_des_body, yaw_rate_des_body, time_step):
+        super().generate_traj(go2, gait, time_now, x_vel_des_body, y_vel_des_body,
+                               z_pos_des_body, yaw_rate_des_body, time_step)
+        if self._pitch_amplitude != 0.0:
+            period = gait.gait_period
+            t_abs = time_now + self.time
+            two_pi = 2.0 * np.pi
+            phase = np.mod(self._pitch_phase_offset + t_abs / period, 1.0)
+            self.rpy_traj_world[1, :] = self._pitch_amplitude * np.sin(two_pi * phase)
+            self.omega_traj_world[1, :] = (self._pitch_amplitude * (two_pi / period)
+                                            * np.cos(two_pi * phase))
 
 
 # Reuse this project's own heightfield constants/conventions exactly (not re-derived) --
@@ -274,6 +318,78 @@ class TerrainAwareCentroidalMPC(CentroidalMPC):
         A_eq = ca.horzcat(self.I_block + term_Ad, big_minus_Bd)
         A_ineq = self._precompute_friction_matrix(None)
         return ca.vertcat(A_eq, A_ineq)
+
+
+# Bound-gait pitch fix, two complementary cost-side levers. ComTraj.generate_traj
+# hardcodes a FLAT (zero) roll/pitch reference over the whole MPC horizon regardless of
+# gait style (see com_trajectory.py: rpy_traj_world[0,:] = rpy_traj_world[1,:] = 0.0).
+# Trot/pace never conflict with this -- both always keep some left-right- or
+# diagonally-balanced support, so there's no systematic pitching moment to fight. Bound
+# alternates "both front feet down, both rear up" and back, which creates a real
+# pitching moment every half-cycle; demanding the QP hold a rigid zero-pitch reference
+# against that moment using only 2 legs' worth of stance force is why bound measured
+# 94% qp_failed (see mpc/README.md).
+#
+# Lever 1 (below): soften the state-cost weight on pitch tracking (COST_MATRIX_Q's
+# index 4) so the QP has room to let the body pitch along with the physics rather than
+# fighting it. Swept empirically (20/5/2/1/0.5/0.1/0 -> success 0.06/0.15/0.17/0.21/
+# 0.17/0.17/0.12): a real, unimodal peak at weight=1.0, not "softer is always better"
+# (too little pitch-tracking pull lets pitch drift uncontrolled instead). On its own
+# this got bound from 6% to 21% success -- real, but far from trot's 94%, since
+# softening gives the QP room to deviate from zero pitch but no target to deviate
+# TOWARD, leaving the deviation underdetermined.
+#
+# Lever 2 (BoundAwareComTraj above): gives the QP that missing target -- a genuine,
+# phase-synced sinusoidal pitch reference, swept together with lever 1 in
+# GAIT_STYLE_PITCH_AMPLITUDE below. Both levers left at None/0.0 (original
+# COST_MATRIX_Q / no reference) for every style except bound, keeping every non-bound
+# result exactly reproducible.
+GAIT_STYLE_PITCH_WEIGHT = {
+    "trot": None,
+    "pace": None,
+    "bound": 1.0,   # empirically the best of 20/5/2/1/0.5/0.1/0 swept against
+                     # COST_MATRIX_Q's original 20 (see sweep above).
+    "walk": None,
+}
+
+GAIT_STYLE_PITCH_AMPLITUDE = {
+    "trot": 0.0,
+    "pace": 0.0,
+    "bound": 0.3,   # best of 0/+-0.05/+-0.15/+-0.3 rad swept against weight=1.0 (above):
+                     # success 0.21/0.15/0.02/0.19/0.00/0.23/0.00 -- sign matters a lot
+                     # (negative is unambiguously wrong, gets catastrophic as |amplitude|
+                     # grows), positive is safe and helps episode length (783->1069
+                     # steps) but only marginally improves full-episode success rate
+                     # (0.21->0.23, not clearly beyond noise at n=48). See mpc/README.md.
+    "walk": 0.0,
+}
+
+
+class CostOverrideMixin:
+    """Rebuilds the QP's Hessian/solver with a different state-cost weight matrix than
+    the submodule's own COST_MATRIX_Q. Mix in ahead of CentroidalMPC (or a CentroidalMPC
+    subclass) in the MRO. The base __init__ already builds H/the solver once from
+    COST_MATRIX_Q (no constructor seam to supply a different Q before that happens, and
+    the vendored submodule isn't edited in place) -- so this calls the unmodified parent
+    __init__ first, then overwrites self.Q and calls the still-unmodified
+    _build_sparse_matrix again to rebuild H/the solver from the new Q. Safe to call
+    twice: _build_sparse_matrix recomputes everything from current self.Q/self.N/
+    self._assemble_A_matrix with no stale-state accumulation, and Q is fixed for the
+    rest of the episode (never changed per-solve), so the final sparsity this produces
+    is the one every subsequent solve_QP call will actually match."""
+
+    def __init__(self, go2, traj, cost_q, *args, **kwargs):
+        super().__init__(go2, traj, *args, **kwargs)
+        self.Q = np.asarray(cost_q, dtype=float)
+        self._build_sparse_matrix(traj, verbose=False)
+
+
+class CostOverrideCentroidalMPC(CostOverrideMixin, CentroidalMPC):
+    pass
+
+
+class CostOverrideTerrainAwareCentroidalMPC(CostOverrideMixin, TerrainAwareCentroidalMPC):
+    pass
 
 
 GAIT_T = 1.0 / GAIT_HZ
@@ -437,7 +553,9 @@ class MPCResidualEnv(gym.Env):
         # Same late-binding safety as self._terrain_height above -- self._terrain_normal is
         # a bound method, only ever called from solve_QP() well after _generate_terrain has run.
         self.terrain_friction_cone = terrain_friction_cone and self.terrain_enabled
-        self.traj = ComTraj(self.go2)
+        pitch_amplitude = GAIT_STYLE_PITCH_AMPLITUDE[self.gait_style]
+        self.traj = (BoundAwareComTraj(self.go2, pitch_amplitude, float(phase_offset[0]))
+                     if pitch_amplitude != 0.0 else ComTraj(self.go2))
         self.mujoco_go2.model.opt.timestep = 1.0 / SIM_HZ
         self._q_init = self.go2.current_config.get_q().copy()
         self._floor_geom_id = mj.mj_name2id(self.mujoco_go2.model, mj.mjtObj.mjOBJ_GEOM, "floor")
@@ -518,8 +636,23 @@ class MPCResidualEnv(gym.Env):
         # CentroidalMPC() itself is cheap (~6ms, confirmed by direct timing) -- rebuilt
         # fresh each reset anyway, to avoid any question of stale OSQP warm-start state
         # leaking across episodes.
-        self.mpc = (TerrainAwareCentroidalMPC(self.go2, self.traj, self._terrain_normal)
-                    if self.terrain_friction_cone else CentroidalMPC(self.go2, self.traj))
+        pitch_weight = GAIT_STYLE_PITCH_WEIGHT[self.gait_style]
+        if pitch_weight is not None:
+            # COST_MATRIX_Q is int-dtype (np.diag of an all-int list) -- .copy() alone
+            # preserves that dtype, silently truncating a non-integer pitch_weight to 0
+            # on assignment (confirmed directly: 0.5 and 0.1 both became exactly 0.0,
+            # producing bit-identical, wrong results). astype(float) first avoids this.
+            cost_q = COST_MATRIX_Q.astype(float)
+            cost_q[4, 4] = pitch_weight
+            if self.terrain_friction_cone:
+                self.mpc = CostOverrideTerrainAwareCentroidalMPC(
+                    self.go2, self.traj, cost_q, self._terrain_normal)
+            else:
+                self.mpc = CostOverrideCentroidalMPC(self.go2, self.traj, cost_q)
+        elif self.terrain_friction_cone:
+            self.mpc = TerrainAwareCentroidalMPC(self.go2, self.traj, self._terrain_normal)
+        else:
+            self.mpc = CentroidalMPC(self.go2, self.traj)
         self._U_opt = np.zeros((12, self.traj.N), dtype=float)
 
         self._ctrl_i = 0

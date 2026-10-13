@@ -566,10 +566,76 @@ natural next step if bound is wanted, not attempted here.
 </p>
 <p align="center">
   <img src="../media/mpc_gait_walk.gif" width="320" alt="Walk (sequential single-leg-swing) gait, zero residual, forward walking">
-  <img src="../media/mpc_gait_bound.gif" width="320" alt="Bound gait, zero residual, forward walking, falls partway through">
+  <img src="../media/mpc_gait_bound.gif" width="320" alt="Bound gait with the pitch fix below applied, zero residual, forward walking, this particular seed survives">
 </p>
 
 *Top: trot (baseline) and pace, both stable. Bottom: walk (statically stable,
-single-leg-swing) and bound, which falls partway through this very seed -- visual
-confirmation of the QP-failure/pitching-instability finding above, not a cherry-picked
-clean run.*
+single-leg-swing) and bound -- regenerated after the pitch fix below; this particular
+seed now survives the full episode, though the aggregate success rate (see table below)
+is still only 23%, so this one clean GIF should NOT be read as "bound is fixed."*
+
+### Bound-gait pitch fix: two complementary cost-side levers, a real but partial fix
+
+Chased directly (user: "fix the bound gait pitch reference"). `ComTraj.generate_traj`
+hardcodes a FLAT (zero) roll/pitch reference over the whole MPC horizon regardless of
+gait style. Trot/pace/walk never conflict with this (always some balanced support, no
+systematic pitching moment); bound alternates "both front feet down, both rear up" and
+back, creating a real pitching moment every half-cycle that a rigid zero-pitch reference
+fights using only 2 legs' worth of stance force -- the root cause of the 94% qp_failed
+measured above.
+
+**Lever 1: soften the pitch-tracking cost weight** (`COST_MATRIX_Q` index 4, `CostOverrideMixin`
+in `mpc_residual_env.py`, rebuilds the QP's Hessian/solver with a modified Q after the
+unmodified parent `__init__` already built them once -- no constructor seam exists to
+supply a different Q before that happens without editing the vendored submodule). Swept
+empirically (original COST_MATRIX_Q value 20, then 5/2/1/0.5/0.1/0):
+
+| pitch weight | 20 (orig) | 5 | 2 | 1 | 0.5 | 0.1 | 0 |
+|---|---|---|---|---|---|---|---|
+| success | 0.06 | 0.15 | 0.17 | **0.21** | 0.17 | 0.17 | 0.12 |
+
+A genuine, unimodal peak at weight=1 -- not "softer is always better" (too little
+pitch-tracking pull lets the body pitch drift uncontrolled instead, success drops again
+toward weight=0). **Found and fixed a real bug while investigating an initially
+suspicious result**: weight=0.5 and weight=0.1 first measured bit-for-bit IDENTICAL
+results across all 48 episodes -- `COST_MATRIX_Q` is int-dtype (`np.diag` of an all-int
+list), so `cost_q[4,4] = pitch_weight` silently truncated any non-integer weight to
+exactly 0 on assignment. Fixed with `.astype(float)`; the whole-number weights tested
+(5/2/1) were coincidentally unaffected and didn't need re-measuring.
+
+**Lever 2: a genuine phase-synced pitch reference** (`BoundAwareComTraj` in
+`mpc_residual_env.py`, calls the unmodified parent `generate_traj` then patches
+`rpy_traj_world[1,:]`/`omega_traj_world[1,:]` with a sinusoid tied to the SAME phase used
+for bound's own contact schedule). Scope, by design: only the QP's COST reference is
+patched -- the parent's own internal predicted-foot-lever-arm loop (which builds the
+Ad/Bd dynamics matrices) already ran with a flat-pitch assumption by the time this patch
+applies, so the dynamics model itself still doesn't know about the nonzero pitch.
+Re-deriving that loop for consistency would mean duplicating `generate_traj` wholesale,
+not patching it -- not attempted. Swept (on top of weight=1): amplitude 0, +-0.05,
++-0.15, +-0.3 rad:
+
+| amplitude (rad) | 0 | +0.05 | -0.05 | +0.15 | -0.15 | **+0.3** | -0.3 |
+|---|---|---|---|---|---|---|---|
+| success | 0.21 | 0.15 | 0.02 | 0.19 | 0.00 | **0.23** | 0.00 |
+| ep_len_mean | 783 | 986 | 372 | 1027 | 164 | 1069 | 27 |
+
+Two clear findings: **sign matters a lot** -- negative amplitude is unambiguously the
+wrong direction, getting monotonically catastrophic as magnitude grows (falls almost
+immediately at -0.3, ep_len 27/2000) -- strong confirmation the mechanism is real and
+causally connected, not placebo. Positive amplitude is safe and genuinely helps
+secondary metrics (episode length climbs steadily, 783->1069 steps, speed tracking
+improves too), but its effect on full-episode SUCCESS is marginal and not clearly beyond
+noise at this sample size (0.21->0.23, a 1-episode difference out of 48).
+
+**Adopted: weight=1, amplitude=+0.3** (both best-found values) as `gait_style="bound"`'s
+default -- a real, verified, non-placebo improvement over the original broken bound
+(6%->23% success, 94%->75% qp_failed), but **bound remains far from viable** compared to
+trot/pace/walk's 90-96%. The likely reason cost-side levers alone cap out here: the
+predicted-dynamics model (Ad/Bd, built from foot lever arms computed assuming flat
+pitch) is still internally inconsistent with the nonzero pitch the cost now asks for --
+fixing that would mean re-deriving `generate_traj`'s internal loop for a
+pitch-consistent prediction, or giving bound a genuine vertical-bounce/flight-phase
+reference the way MIT Cheetah 3 does, both materially bigger undertakings than either
+lever tried here. Not attempted further; `gait_style="bound"` is usable (noticeably
+better than before) but should not be treated as production-ready the way trot/pace/walk
+are.
