@@ -556,3 +556,20 @@ bounding controllers (MIT Cheetah 3) pair the bound contact schedule with a dedi
 body pitch-oscillation (and often vertical bounce / flight-phase) reference trajectory,
 not just a contact-schedule swap -- that per-style CoM/pitch trajectory shaping is the
 natural next step if bound is wanted, not attempted here.
+
+`demo_gait_styles.py` generates one GIF per style (zero residual, flat ground, fixed
+0.5 m/s forward command, seed 0) for visual inspection:
+
+<p align="center">
+  <img src="../media/mpc_gait_trot.gif" width="320" alt="Trot gait, zero residual, forward walking">
+  <img src="../media/mpc_gait_pace.gif" width="320" alt="Pace gait, zero residual, forward walking">
+</p>
+<p align="center">
+  <img src="../media/mpc_gait_walk.gif" width="320" alt="Walk (sequential single-leg-swing) gait, zero residual, forward walking">
+  <img src="../media/mpc_gait_bound.gif" width="320" alt="Bound gait, zero residual, forward walking, falls partway through">
+</p>
+
+*Top: trot (baseline) and pace, both stable. Bottom: walk (statically stable,
+single-leg-swing) and bound, which falls partway through this very seed -- visual
+confirmation of the QP-failure/pitching-instability finding above, not a cherry-picked
+clean run.*
