@@ -431,21 +431,66 @@ controller itself plans. Once the plan itself is correct, the residual's margina
 contribution reverts to the same kind of small tracking/robustness polish it already
 provided on flat ground (Step 5 above), not a primary terrain-handling mechanism.
 
-**Current status: a genuine, real improvement (best terrain result in this track, by a
-clear margin over every residual-only attempt), but not a full fix** -- QP-failure rate
-is still 41%, and overall success (0.59) remains well below flat ground's near-complete
-result and far below the pure-RL pipeline's near-0% falls on the same terrain
-distribution (`pretrained/p_stairs` / `pretrained/x_mesh_finetune`, see memory:
-go1-staged-plan). The remaining gap is likely a further instance of the same family of
-issue: the QP's friction-cone constraints are still built in world axes (assuming the
-ground normal is always world-up), which is wrong on a steep slope even with the
-touchdown height now correct, and the swing-leg clearance height is still a fixed
-constant (`HEIGHT_SWING = 0.1`) regardless of stair riser size -- the same "fixed
-clearance target" bug the pure-RL track found and only partially fixed in its own
-stairs saga (see memory: go1-staged-plan, Stage 3b). Not yet attempted here.
+**Friction-cone orientation fix: implemented, verified, tested -- a clean negative
+result.** The QP's friction-cone constraints (`centroidal_mpc.py`'s
+`_precompute_friction_matrix`) are built purely in world axes (`|fx| <= mu*fz`, `|fy| <=
+mu*fz`), always assuming the ground normal is world-up -- wrong on a slope even with the
+touchdown height now correct, and the realized stance-leg torque comes straight from the
+QP's solved force (`leg_controller.py`: `tau = J^T @ -contact_force`), so a misoriented
+cone has real physical consequences, not just a planning artifact. Fixed the same way as
+the footstep planner, by subclassing rather than editing the vendored submodule:
+`TerrainAwareCentroidalMPC(CentroidalMPC)` overrides `solve_QP` (reads the real local
+terrain normal via a new finite-difference `_terrain_normal(x, y)` gradient of the
+existing terrain-height lookup), `_precompute_friction_matrix` (rebuilds each pyramid
+face as `sign*t - MU*n` for an orthonormal tangent basis `t1, t2` of the real normal `n`,
+reducing exactly to the original world-aligned formula when `n = [0,0,1]`), and
+`_assemble_A_matrix` (recomputes the friction block fresh every solve instead of reusing
+the base class's stale once-per-episode cache -- required since OSQP/CasADi's solver
+object is built once with a fixed sparsity pattern, so every explicit zero must stay
+explicit). Gated by a new `terrain_friction_cone` flag (`--terrain-friction-cone`),
+independent of and combinable with `terrain_footstep_planning`. Verified before trusting
+it: flat normal reproduces the original friction matrix bit-for-bit; a tilted normal's
+face coefficients match the closed-form formula exactly, with a pure-normal synthetic
+force sitting inside the cone and a force built exactly on the cone boundary giving zero
+margin; a 400-step rollout on a forced 15-degree slope ran clean with no exceptions and
+no QP failures; `verify_residual_interface.py` (flag off) still reproduces the
+already-adopted 1.955 rad/s turning result exactly.
 
-All five experimental variants (`terrain_v2`/`v3`/`v4`/`v5_footplan` plus training/eval
-logs) are kept as `runs/` artifacts; `terrain_v5_footplan` is the new best terrain
-checkpoint in this track, though still not promoted past `runs/` given the remaining gap
-to the pure-RL baseline.
-ground. Results to follow once training and evaluation complete.
+Tested zero-residual (no training needed to see whether it moves the needle, same
+pattern as the footstep-planner check above), stacked on top of the already-adopted
+footstep-planning fix, 64 paired seeds:
+
+| variant | success | fall | qp_failed |
+|---|---|---|---|
+| flat-plan, world-z cone (original baseline) | 0.48 | 0.52 | 0.47 |
+| terrain-aware-plan, world-z cone (adopted) | 0.59 | 0.41 | 0.36 |
+| terrain-aware-plan, terrain-aware cone (new) | 0.58 | 0.42 | 0.39 |
+
+A 1-episode swing out of 64 either way -- not a real effect. The fix is confirmed to be
+*firing* (constraint-matrix nonzero count rises from 5168 to 5424 on sloped segments,
+confirming non-degenerate per-row coefficients, not a silent no-op), it just doesn't move
+survival or QP-failure rate at the slope angles tested (0-12 degrees: cos(12 deg) ~=
+0.978, a ~2% geometric effect, evidently too small relative to whatever else is causing
+the remaining failures). Closed as tested-but-not-adopted; code kept (default off,
+`terrain_friction_cone=False`) since it's correct and harmless, matching this project's
+practice of keeping verified-but-unhelpful variants rather than deleting them.
+
+**Current status: the footstep-planning fix remains the one genuine, real improvement in
+this track** (best terrain result so far, by a clear margin over every residual-only
+attempt), but it is not a full fix -- QP-failure rate is still ~36-41%, and overall
+success (0.59) remains well below flat ground's near-complete result and far below the
+pure-RL pipeline's near-0% falls on the same terrain distribution
+(`pretrained/p_stairs` / `pretrained/x_mesh_finetune`, see memory: go1-staged-plan). With
+friction-cone orientation now ruled out, the most likely remaining causes are: the
+swing-leg clearance height, still a fixed constant (`HEIGHT_SWING = 0.1`) regardless of
+stair riser size -- the same "fixed clearance target" bug the pure-RL track found and
+only partially fixed in its own stairs saga (see memory: go1-staged-plan, Stage 3b); or
+the `fz_min = 10` stance-force lower bound, which is a box bound on the raw world-z force
+component rather than the true-normal-aligned component (a ~2% effect at these angles,
+same order as the friction-cone fix, so plausibly also too small to matter alone). Not
+yet attempted here.
+
+All six experimental variants (`terrain_v2`/`v3`/`v4`/`v5_footplan` plus the
+friction-cone check, plus training/eval logs) are kept as `runs/` artifacts;
+`terrain_v5_footplan` remains the best terrain checkpoint in this track, still not
+promoted past `runs/` given the remaining gap to the pure-RL baseline.

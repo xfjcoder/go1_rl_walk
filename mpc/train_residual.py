@@ -113,6 +113,12 @@ def main():
                           "aware thing (that's --use-terrain-heightmap, a separate flag). Fixes "
                           "MPC's own touchdown-height computation, hardcoded flat in the vendored "
                           "submodule.")
+    ap.add_argument("--terrain-friction-cone", action="store_true",
+                     help="Orient the MPC's QP friction-cone constraints around the real local "
+                          "terrain normal instead of always assuming world-up (TerrainAware"
+                          "CentroidalMPC in mpc_residual_env.py). Independent of "
+                          "--terrain-footstep-planning (that fixes where feet land; this fixes "
+                          "what forces are assumed achievable once planted).")
     ap.add_argument("--terrain-curriculum-start", type=float, default=None,
                      help="If given (needs --terrain-amplitude-range), ramp the sampled upper "
                           "bound from this value up to --terrain-amplitude-range's own hi over "
@@ -175,6 +181,7 @@ def main():
         stair_height_range=tuple(args.stair_height_range) if args.stair_height_range else None,
         use_terrain_heightmap=args.use_terrain_heightmap,
         terrain_footstep_planning=args.terrain_footstep_planning,
+        terrain_friction_cone=args.terrain_friction_cone,
     )
     with open(run_dir / "env_kwargs.json", "w") as f:
         json.dump(env_kwargs, f, indent=2)

@@ -2453,16 +2453,32 @@ improvement (identical success/fall/QP-failure rates, only marginal tracking pol
 the earlier diagnosis was right that the residual has limited leverage, but wrong about where the
 fix needed to go: the base controller's own plan, not the residual's inputs or torque budget.
 
-**Current status: a genuine, real improvement and the best terrain result in this track so far,
-but not a full fix** -- QP-failure rate is still 41%, and overall success (0.59) remains well
-below flat ground's near-complete result and far below the mature pure-RL pipeline's near-0% falls
-on this same terrain distribution (`pretrained/p_stairs` / `pretrained/x_mesh_finetune`). Likely
-remaining gap, not yet attempted: the QP's friction-cone constraints are still built in world axes
-(assuming the ground normal is always world-up, wrong on a steep slope even with touchdown height
-now correct), and swing-leg clearance height is still a fixed constant regardless of stair riser
-size -- the same "fixed clearance target" issue the pure-RL track's own stairs saga found and only
-partially fixed. See `mpc/README.md` for the full experiment table, reproducible setup, and demo
-GIFs.
+Followed up by chasing the next likely cause: the QP's friction-cone constraints
+(`centroidal_mpc.py`) are built purely in world axes, always assuming the ground normal is
+world-up -- wrong on a slope, and the solved force is realized directly as stance-leg torque, so a
+misoriented cone has real physical consequences. Fixed the same way, by subclassing rather than
+editing the vendored submodule: `TerrainAwareCentroidalMPC` recomputes the friction pyramid each
+solve around the real local terrain normal (finite-difference gradient of the terrain-height
+lookup), gated by a new `--terrain-friction-cone` flag, combinable with the footstep-planning fix.
+Verified correct before trusting it (bit-for-bit flat reproduction, closed-form tilted
+coefficients, clean slope rollout, no regression to the adopted turning result) -- but tested
+zero-residual, stacked on the footstep-planning fix, it's a clean negative: 64 paired trials give
+0.59/0.41/0.36 (footstep-planning fix alone) vs. 0.58/0.42/0.39 (plus friction-cone fix) --
+a 1-episode swing out of 64, not a real effect, confirmed firing (nonzero count rises on sloped
+segments, not a silent no-op) but too small a geometric effect at the tested 0-12 degree slopes to
+matter. Closed as tested-but-not-adopted; code kept (default off) since it's correct and harmless.
+
+**Current status: the footstep-planning fix remains the one genuine, real improvement and the
+best terrain result in this track so far, but not a full fix** -- QP-failure rate is still
+~36-41%, and overall success (0.59) remains well below flat ground's near-complete result and far
+below the mature pure-RL pipeline's near-0% falls on this same terrain distribution
+(`pretrained/p_stairs` / `pretrained/x_mesh_finetune`). With friction-cone orientation now ruled
+out, the likely remaining gap, not yet attempted: swing-leg clearance height is still a fixed
+constant regardless of stair riser size -- the same "fixed clearance target" issue the pure-RL
+track's own stairs saga found and only partially fixed -- or the `fz_min` stance-force lower bound,
+a box bound on raw world-z force rather than the true-normal-aligned component (same small
+geometric order as the friction-cone fix). See `mpc/README.md` for the full experiment table,
+reproducible setup, and demo GIFs.
 
 ## Next stages
 

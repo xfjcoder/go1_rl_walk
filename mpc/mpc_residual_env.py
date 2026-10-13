@@ -22,9 +22,11 @@ import sys
 import tempfile
 from pathlib import Path
 
+import casadi as ca
 import gymnasium as gym
 import mujoco as mj
 import numpy as np
+import scipy.sparse as sp
 from gymnasium import spaces
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -32,7 +34,7 @@ SUBMODULE_SRC = REPO_ROOT / "third_party" / "go2-convex-mpc" / "src"
 sys.path.insert(0, str(SUBMODULE_SRC))
 sys.path.insert(0, str(REPO_ROOT))
 
-from convex_mpc.centroidal_mpc import CentroidalMPC
+from convex_mpc.centroidal_mpc import CentroidalMPC, MU, NU, NX
 from convex_mpc.com_trajectory import ComTraj
 from convex_mpc.gait import Gait, HEIGHT_SWING
 from convex_mpc.go2_robot_data import PinGo2Model
@@ -127,6 +129,96 @@ def _fix_meshdir_absolute(xml: str, xml_dir: Path) -> str:
         xml,
     )
 
+class TerrainAwareCentroidalMPC(CentroidalMPC):
+    """Patches the submodule's own CentroidalMPC (subclassed, not edited in place -- same
+    discipline as TerrainAwareGait above) so the QP's friction-cone constraints are
+    oriented around the REAL local terrain surface normal instead of always assuming the
+    ground normal is world-up.
+
+    Root cause this fixes: `CentroidalMPC._precompute_friction_matrix` builds the
+    friction pyramid purely from world-frame force components (`|fx| <= mu*fz`,
+    `|fy| <= mu*fz`), i.e. it always treats world Z as the contact normal direction and
+    world X/Y as the tangent plane. That's only correct on flat ground. On a slope, the
+    real friction cone is tilted with the terrain: commanding a world-frame force that
+    satisfies the (wrong) flat-ground cone can still violate the REAL cone (risking an
+    actual slip when the commanded torque is realized in MuJoCo's own contact physics,
+    not just a theoretical QP-feasibility issue) -- or can needlessly exclude force
+    combinations the real terrain would have supported, falsely narrowing the QP's own
+    feasible region (a likely contributor to TerrainAwareGait's still-41% qp_failed_rate,
+    see mpc/README.md). This is exactly the kind of terrain-geometry fact real quadruped
+    controllers fold into their contact model, not just footstep placement.
+
+    `_precompute_friction_matrix` is overridden to build each face from a signed tangent
+    direction and the local normal (`sign*(t . F) - MU*(n . F) <= 0`) instead of hardcoded
+    world axes -- on flat ground (n=[0,0,1], t1=[1,0,0], t2=[0,1,0]) this reduces to
+    EXACTLY the original formula (verified below). Every row explicitly stores all three
+    (fx, fy, fz) columns even when a coefficient is exactly 0.0 (e.g. the flat-ground
+    case), so the constraint matrix's SPARSITY stays fixed across different normals --
+    required because the OSQP solver object is only ever constructed once per episode
+    (`_build_sparse_matrix`, called from `CentroidalMPC.__init__`) and expects the same
+    nonzero pattern on every subsequent solve.
+
+    The terrain normal is recomputed every `solve_QP` call (not just once per episode)
+    from the robot's CURRENT position via a finite-difference gradient of the actual
+    terrain heightfield (`terrain_normal_fn`, see `MPCResidualEnv._terrain_normal`) --
+    needed because the terrain's local slope genuinely changes as the robot walks from
+    the flat start pad onto a ramp/stairs, not just once at episode start.
+
+    Known remaining approximation, not fixed here: the `fz_min` stance-force lower bound
+    in `_compute_bounds` still bounds the raw WORLD-z force component, not the force
+    along the (now correctly oriented) local normal -- left as a box constraint since
+    reformulating it as a general inequality would need the same per-row sparsity
+    surgery as the friction pyramid, for a much smaller physical effect at the slope
+    angles tested here (world-z and true-normal force differ by a factor of cos(slope),
+    e.g. 2% at 12deg) than getting the dominant friction-cone orientation right.
+    """
+
+    def __init__(self, go2, traj, terrain_normal_fn):
+        self._terrain_normal_fn = terrain_normal_fn
+        self._current_normal = np.array([0.0, 0.0, 1.0])  # flat default for __init__'s own build
+        super().__init__(go2, traj)
+
+    def solve_QP(self, go2, traj, verbose: bool = False):
+        pos = go2.current_config.base_pos
+        n = np.asarray(self._terrain_normal_fn(float(pos[0]), float(pos[1])), dtype=float)
+        self._current_normal = n / np.linalg.norm(n)
+        return super().solve_QP(go2, traj, verbose)
+
+    def _precompute_friction_matrix(self, traj):
+        n = self._current_normal
+        world_x = np.array([1.0, 0.0, 0.0])
+        ref = np.array([0.0, 1.0, 0.0]) if abs(np.dot(n, world_x)) > 0.9 else world_x
+        t1 = ref - np.dot(ref, n) * n
+        t1 = t1 / np.linalg.norm(t1)
+        t2 = np.cross(n, t1)
+
+        rows, cols, vals = [], [], []
+        baseU = self.N * NX
+        r0 = 0
+        for k in range(self.N):
+            uk0 = baseU + k * NU
+            for leg in range(4):
+                fx, fy, fz = 3 * leg, 3 * leg + 1, 3 * leg + 2
+                for sign, t in ((1.0, t1), (-1.0, t1), (1.0, t2), (-1.0, t2)):
+                    coeffs = sign * t - MU * n
+                    rows.extend([r0, r0, r0])
+                    cols.extend([uk0 + fx, uk0 + fy, uk0 + fz])
+                    vals.extend([float(coeffs[0]), float(coeffs[1]), float(coeffs[2])])
+                    r0 += 1
+
+        A_sp = sp.csc_matrix((vals, (rows, cols)), shape=(r0, self.nvars))
+        return self._scipy_to_casadi(A_sp)
+
+    def _assemble_A_matrix(self, Ad, Bd):
+        # Base class reads the STALE self.A_ineq_static (computed once). Recompute fresh
+        # every call instead, using whatever self._current_normal solve_QP just set.
+        big_minus_Ad, big_minus_Bd = self.dyn_builder(Ad, Bd)
+        term_Ad = self.S_block @ big_minus_Ad
+        A_eq = ca.horzcat(self.I_block + term_Ad, big_minus_Bd)
+        A_ineq = self._precompute_friction_matrix(None)
+        return ca.vertcat(A_eq, A_ineq)
+
+
 GAIT_HZ = 3
 GAIT_DUTY = 0.6
 GAIT_T = 1.0 / GAIT_HZ
@@ -182,6 +274,14 @@ class MPCResidualEnv(gym.Env):
                                                # observation; this is the base controller's own
                                                # planning). Default False reproduces terrain_v1-
                                                # v4's exact prior (flat-footstep-plan) behavior.
+        terrain_friction_cone: bool = False,  # orient the MPC's QP friction-cone constraints
+                                               # around the REAL local terrain normal instead of
+                                               # always assuming world-up -- see
+                                               # TerrainAwareCentroidalMPC above. Independent of
+                                               # terrain_footstep_planning (that fixes WHERE feet
+                                               # land; this fixes what forces are assumed
+                                               # achievable once planted). Default False
+                                               # reproduces every prior variant's exact behavior.
         ramp_length: float = DEFAULT_RAMP_LENGTH,
         stair_depth: float = 0.25,
         num_stairs: int = 8,
@@ -268,6 +368,9 @@ class MPCResidualEnv(gym.Env):
         self.terrain_footstep_planning = terrain_footstep_planning and self.terrain_enabled
         self.gait = (TerrainAwareGait(GAIT_HZ, GAIT_DUTY, self._terrain_height)
                      if self.terrain_footstep_planning else Gait(GAIT_HZ, GAIT_DUTY))
+        # Same late-binding safety as self._terrain_height above -- self._terrain_normal is
+        # a bound method, only ever called from solve_QP() well after _generate_terrain has run.
+        self.terrain_friction_cone = terrain_friction_cone and self.terrain_enabled
         self.traj = ComTraj(self.go2)
         self.mujoco_go2.model.opt.timestep = 1.0 / SIM_HZ
         self._q_init = self.go2.current_config.get_q().copy()
@@ -349,7 +452,8 @@ class MPCResidualEnv(gym.Env):
         # CentroidalMPC() itself is cheap (~6ms, confirmed by direct timing) -- rebuilt
         # fresh each reset anyway, to avoid any question of stale OSQP warm-start state
         # leaking across episodes.
-        self.mpc = CentroidalMPC(self.go2, self.traj)
+        self.mpc = (TerrainAwareCentroidalMPC(self.go2, self.traj, self._terrain_normal)
+                    if self.terrain_friction_cone else CentroidalMPC(self.go2, self.traj))
         self._U_opt = np.zeros((12, self.traj.N), dtype=float)
 
         self._ctrl_i = 0
@@ -416,6 +520,18 @@ class MPCResidualEnv(gym.Env):
         h = self._terrain_h
         return (h[r0, c0] * (1 - wx) * (1 - wy) + h[r0, c0 + 1] * wx * (1 - wy)
                 + h[r0 + 1, c0] * (1 - wx) * wy + h[r0 + 1, c0 + 1] * wx * wy)
+
+    def _terrain_normal(self, x: float, y: float) -> np.ndarray:
+        """Local terrain surface unit normal (world frame) at (x, y), via a central-difference
+        gradient of _terrain_height. [0, 0, 1] on flat ground / terrain disabled, matching
+        _terrain_height's own flat-ground return. Feeds TerrainAwareCentroidalMPC's friction-cone
+        orientation -- recomputed every MPC solve (not cached), since the real local slope
+        changes as the robot walks from the flat start pad onto a ramp/stairs."""
+        eps = 0.03
+        dzdx = (self._terrain_height(x + eps, y) - self._terrain_height(x - eps, y)) / (2 * eps)
+        dzdy = (self._terrain_height(x, y + eps) - self._terrain_height(x, y - eps)) / (2 * eps)
+        n = np.array([-dzdx, -dzdy, 1.0])
+        return n / np.linalg.norm(n)
 
     def _local_heightmap(self, qpos) -> np.ndarray:
         """Ported verbatim from envs/go1_env.py's own _local_heightmap: terrain height (m) at a
