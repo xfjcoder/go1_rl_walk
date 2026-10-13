@@ -2480,6 +2480,12 @@ a box bound on raw world-z force rather than the true-normal-aligned component (
 geometric order as the friction-cone fix). See `mpc/README.md` for the full experiment table,
 reproducible setup, and demo GIFs.
 
+**Decision: pivot Stage 11 to MPC-only, deprioritize the RL residual.** Every real gain in this
+track came from fixing the classical MPC controller (footstep planner); the RL residual's own
+contribution never exceeded marginal polish and vanished once the base plan was correct. Further
+Stage 11 work extends the MPC controller directly -- gait-style switching, then foothold
+optimization for terrain -- rather than more residual-RL variants.
+
 ## Next stages
 
 Terrain-aware observation and a non-trot gait mode were both tried already

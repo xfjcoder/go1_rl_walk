@@ -494,3 +494,18 @@ All six experimental variants (`terrain_v2`/`v3`/`v4`/`v5_footplan` plus the
 friction-cone check, plus training/eval logs) are kept as `runs/` artifacts;
 `terrain_v5_footplan` remains the best terrain checkpoint in this track, still not
 promoted past `runs/` given the remaining gap to the pure-RL baseline.
+
+**Decision, 2026-10-12: pivot this track to MPC-only, deprioritize the RL residual.**
+Across every terrain variant tried (`v1` through `v5_footplan`, footstep-planning fix,
+friction-cone fix), the RL residual's own contribution to survival never exceeded
+marginal tracking/effort polish, and vanished to exactly zero once the base MPC's plan
+was corrected. Every real, measurable improvement in this track so far came from fixing
+the classical MPC controller itself (footstep planner), not from the learned residual.
+Going forward, Stage 11 work extends the MPC controller directly -- gait-style switching
+(trot/pace/bound/walk via contact-schedule parametrization, the same mechanism real
+model-based quadruped controllers use, no learning involved), then foothold optimization
+for terrain (searching candidate touchdown points near the nominal one instead of only
+sampling height at a single fixed point, matching the perceptive-locomotion approach
+cited earlier in this file) -- rather than further residual-RL variants. The residual
+interface (`--terrain-footstep-planning`/`--terrain-friction-cone`/base residual) stays
+in the codebase, default-compatible, in case it's revisited later.
