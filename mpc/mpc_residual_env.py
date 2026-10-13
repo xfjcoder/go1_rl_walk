@@ -92,6 +92,63 @@ class TerrainAwareGait(Gait):
                                            self.swing_time, h_sw=HEIGHT_SWING)
         return traj, pos_touchdown_world
 
+
+# Stage 11 MPC-only pivot: gait-style switching. gait.py's PHASE_OFFSET (leg order
+# FL, FR, RL, RR -- see leg_controller.py's LEG_INDEX) is a module-level constant
+# hardcoding a trot (diagonal pairs [FL,RR] and [FR,RL] share a phase). Real
+# model-based quadruped controllers (MIT Cheetah 3, ANYmal) select a gait style by
+# swapping this contact-schedule parametrization, not by learning -- no RL needed.
+# Each entry below is (phase_offset, duty); duty is bundled per-style because
+# "walk" genuinely needs a different duty (0.75, not GAIT_DUTY) to keep its
+# single-leg-swing guarantee: with 4 legs' swing windows evenly spaced 0.25 apart
+# in phase, a window wider than 0.25 (duty < 0.75) would make two legs swing at
+# once, breaking the always-3-feet-down static-stability property that's the only
+# reason to pick "walk" over a trot. "walk"'s phase_offset is chosen to reproduce
+# this project's own Stage 0 scripted crawl's leg order (FL -> RR -> FR -> RL,
+# see scripted_gait.py's LEGS/crawl_targets), not picked arbitrarily.
+GAIT_HZ = 3
+GAIT_DUTY = 0.6
+
+GAIT_STYLE_PRESETS = {
+    "trot":  (np.array([0.5, 0.0, 0.0, 0.5]), GAIT_DUTY),   # diagonal pairs (matches
+                                                             # gait.py's own PHASE_OFFSET
+                                                             # and current GAIT_DUTY
+                                                             # exactly -- the default,
+                                                             # bit-identical to every
+                                                             # prior result).
+    "pace":  (np.array([0.0, 0.5, 0.0, 0.5]), GAIT_DUTY),   # same-side pairs (FL&RL, FR&RR)
+    "bound": (np.array([0.0, 0.0, 0.5, 0.5]), GAIT_DUTY),   # front/rear pairs (FL&FR, RL&RR)
+    "walk":  (np.array([0.75, 0.25, 0.0, 0.5]), 0.75),      # sequential single-leg swing
+}
+
+
+class GaitStyleMixin:
+    """Overrides Gait's compute_contact_table to read an instance-level phase offset
+    (self._phase_offset, set by the subclass __init__ below) instead of gait.py's
+    hardcoded module-level PHASE_OFFSET -- otherwise byte-identical to the parent
+    formula. Mix in ahead of Gait (or a Gait subclass) so this override wins the MRO;
+    compute_current_mask (unmodified, inherited) already calls self.compute_contact_table
+    polymorphically, so overriding only this one method is sufficient for every caller
+    (com_trajectory.py, leg_controller.py) to pick up the new schedule."""
+
+    def compute_contact_table(self, t0: float, dt: float, N: int) -> np.ndarray:
+        t = t0 + np.arange(N) * dt + dt / 2
+        phases = np.mod(self._phase_offset[:, None] + t[None, :] / self.gait_period, 1.0)
+        return (phases < self.gait_duty).astype(np.int32)
+
+
+class StyledGait(GaitStyleMixin, Gait):
+    def __init__(self, frequency_hz, duty, phase_offset):
+        self._phase_offset = np.asarray(phase_offset, dtype=float)
+        super().__init__(frequency_hz, duty)
+
+
+class StyledTerrainAwareGait(GaitStyleMixin, TerrainAwareGait):
+    def __init__(self, frequency_hz, duty, phase_offset, terrain_height_fn):
+        self._phase_offset = np.asarray(phase_offset, dtype=float)
+        super().__init__(frequency_hz, duty, terrain_height_fn)
+
+
 # Reuse this project's own heightfield constants/conventions exactly (not re-derived) --
 # see envs/go1_env.py for the full rationale of each.
 from envs.go1_env import HF_CELL, HF_CX, HF_HALF_X, HF_HALF_Y, HF_ELEV, HF_PAD_START, HF_PAD_END
@@ -219,8 +276,6 @@ class TerrainAwareCentroidalMPC(CentroidalMPC):
         return ca.vertcat(A_eq, A_ineq)
 
 
-GAIT_HZ = 3
-GAIT_DUTY = 0.6
 GAIT_T = 1.0 / GAIT_HZ
 
 SIM_HZ = 1000
@@ -282,6 +337,12 @@ class MPCResidualEnv(gym.Env):
                                                # land; this fixes what forces are assumed
                                                # achievable once planted). Default False
                                                # reproduces every prior variant's exact behavior.
+        gait_style: str = "trot",             # one of GAIT_STYLE_PRESETS -- selects the
+                                               # contact-schedule parametrization (trot/pace/
+                                               # bound/walk), a classical, non-learned choice.
+                                               # Default "trot" uses the exact original
+                                               # phase_offset/duty, reproducing every prior
+                                               # result exactly (verified bit-for-bit).
         ramp_length: float = DEFAULT_RAMP_LENGTH,
         stair_depth: float = 0.25,
         num_stairs: int = 8,
@@ -315,6 +376,9 @@ class MPCResidualEnv(gym.Env):
         self.slope_deg_max_current = slope_deg_range[1] if slope_deg_range else None
         self.stair_height_max_current = stair_height_range[1] if stair_height_range else None
         self.use_terrain_heightmap = use_terrain_heightmap
+        if gait_style not in GAIT_STYLE_PRESETS:
+            raise ValueError(f"gait_style must be one of {list(GAIT_STYLE_PRESETS)}, got {gait_style!r}")
+        self.gait_style = gait_style
         self.ramp_length = ramp_length
         self.stair_depth = stair_depth
         self.num_stairs = num_stairs
@@ -366,8 +430,10 @@ class MPCResidualEnv(gym.Env):
         # present, but MPC's own footstep planner still flat-ground-blind) stays
         # reproducible without this fix.
         self.terrain_footstep_planning = terrain_footstep_planning and self.terrain_enabled
-        self.gait = (TerrainAwareGait(GAIT_HZ, GAIT_DUTY, self._terrain_height)
-                     if self.terrain_footstep_planning else Gait(GAIT_HZ, GAIT_DUTY))
+        phase_offset, gait_duty = GAIT_STYLE_PRESETS[self.gait_style]
+        self.gait = (StyledTerrainAwareGait(GAIT_HZ, gait_duty, phase_offset, self._terrain_height)
+                     if self.terrain_footstep_planning else
+                     StyledGait(GAIT_HZ, gait_duty, phase_offset))
         # Same late-binding safety as self._terrain_height above -- self._terrain_normal is
         # a bound method, only ever called from solve_QP() well after _generate_terrain has run.
         self.terrain_friction_cone = terrain_friction_cone and self.terrain_enabled

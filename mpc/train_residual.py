@@ -119,6 +119,12 @@ def main():
                           "CentroidalMPC in mpc_residual_env.py). Independent of "
                           "--terrain-footstep-planning (that fixes where feet land; this fixes "
                           "what forces are assumed achievable once planted).")
+    ap.add_argument("--gait-style", type=str, default="trot",
+                     choices=["trot", "pace", "bound", "walk"],
+                     help="Contact-schedule parametrization MPC's Gait uses (GAIT_STYLE_PRESETS "
+                          "in mpc_residual_env.py) -- a classical, non-learned choice, not "
+                          "something the residual controls. 'trot' (default) reproduces every "
+                          "prior result exactly.")
     ap.add_argument("--terrain-curriculum-start", type=float, default=None,
                      help="If given (needs --terrain-amplitude-range), ramp the sampled upper "
                           "bound from this value up to --terrain-amplitude-range's own hi over "
@@ -182,6 +188,7 @@ def main():
         use_terrain_heightmap=args.use_terrain_heightmap,
         terrain_footstep_planning=args.terrain_footstep_planning,
         terrain_friction_cone=args.terrain_friction_cone,
+        gait_style=args.gait_style,
     )
     with open(run_dir / "env_kwargs.json", "w") as f:
         json.dump(env_kwargs, f, indent=2)

@@ -509,3 +509,50 @@ sampling height at a single fixed point, matching the perceptive-locomotion appr
 cited earlier in this file) -- rather than further residual-RL variants. The residual
 interface (`--terrain-footstep-planning`/`--terrain-friction-cone`/base residual) stays
 in the codebase, default-compatible, in case it's revisited later.
+
+### Gait-style switching (MPC-only, no RL)
+
+`gait.py`'s `PHASE_OFFSET` is a module-level constant hardcoding a trot (diagonal legs
+[FL,RR] and [FR,RL] share a phase). Real model-based quadruped controllers (MIT Cheetah
+3, ANYmal) select a gait style by swapping this contact-schedule parametrization, not by
+learning -- so this is pursued as a classical fix, no RL involved, same as the footstep-
+planner fix above.
+
+Added `GAIT_STYLE_PRESETS` (`mpc_residual_env.py`): `trot`/`pace`/`bound`/`walk`, each a
+`(phase_offset, duty)` pair. `walk`'s offsets and duty (0.75) are chosen to reproduce
+this project's own Stage 0 scripted crawl's leg order (FL -> RR -> FR -> RL, see
+`scripted_gait.py`), not picked arbitrarily -- at duty 0.75 the four legs' swing windows
+exactly tile the cycle with zero overlap, guaranteeing exactly one leg swings at a time.
+`GaitStyleMixin` + `StyledGait`/`StyledTerrainAwareGait` override `compute_contact_table`
+to read this instance-level offset instead of the hardcoded module constant (composable
+with the already-adopted `TerrainAwareGait` terrain-awareness fix via a shared mixin).
+New `--gait-style` flag, default `"trot"` reproducing every prior result exactly (verified
+bit-for-bit). Verified before trusting it: trot matches vanilla `Gait`'s contact table
+exactly; pace/bound produce the right leg-pairing; walk guarantees exactly one leg
+swinging at every instant in the right order; `StyledTerrainAwareGait` combines gait-style
+and terrain-awareness correctly; `verify_residual_interface.py` unchanged (1.955 rad/s).
+
+**Tested zero-residual on flat ground (no terrain), 48 paired seeds per style, to see
+whether the QP/dynamics pipeline -- only ever exercised with a trot -- actually produces
+viable locomotion under the others:**
+
+| style | success | fall | qp_failed | speed track |
+|---|---|---|---|---|
+| trot (baseline) | 0.94 | 0.06 | 0.06 | 0.980 |
+| pace | 0.90 | 0.10 | 0.10 | 0.986 |
+| bound | 0.06 | 0.94 | 0.94 | 0.852 |
+| walk | 0.96 | 0.04 | 0.04 | 0.983 |
+
+**pace and walk are both genuinely viable alternate gaits, achieved with zero RL** --
+walk is even marginally better than trot's own baseline. **bound is essentially broken**
+(94% QP failures, not exceptions -- confirmed no crashes in the log, these are real
+infeasible/fallen outcomes). This has a plausible classical explanation, not yet fixed:
+`ComTraj` builds one shared body height/pitch reference trajectory regardless of gait
+style, which is fine for trot/pace (both keep two feet down in a left-right- or
+diagonally-balanced way, no net pitching moment) but wrong for bound -- alternating
+"both front feet down, both rear up" and vice versa inherently creates a large pitching
+moment every half-cycle that a flat/constant-pitch reference can't accommodate. Real
+bounding controllers (MIT Cheetah 3) pair the bound contact schedule with a dedicated
+body pitch-oscillation (and often vertical bounce / flight-phase) reference trajectory,
+not just a contact-schedule swap -- that per-style CoM/pitch trajectory shaping is the
+natural next step if bound is wanted, not attempted here.

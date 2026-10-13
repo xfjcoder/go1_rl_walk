@@ -2486,6 +2486,25 @@ contribution never exceeded marginal polish and vanished once the base plan was 
 Stage 11 work extends the MPC controller directly -- gait-style switching, then foothold
 optimization for terrain -- rather than more residual-RL variants.
 
+**Gait-style switching, MPC-only, no RL: pace and walk work, bound doesn't.** `gait.py`'s
+contact-schedule (`PHASE_OFFSET`) hardcoded a trot; generalized it to a selectable
+`(phase_offset, duty)` preset (`trot`/`pace`/`bound`/`walk`, new `--gait-style` flag) via the same
+subclass-the-submodule pattern as the footstep-planner/friction-cone fixes -- a classical,
+non-learned parametrization change, matching how MIT Cheetah 3/ANYmal select gaits. `walk`'s
+schedule reproduces this project's own Stage 0 scripted crawl's leg order (FL -> RR -> FR -> RL)
+at duty 0.75, guaranteeing exactly one leg swings at a time. Verified correct before trusting it
+(bit-for-bit trot reproduction, right leg-pairing for pace/bound, right single-leg-swing order for
+walk, no regression to the adopted turning result). Tested zero-residual on flat ground, 48 paired
+seeds per style: trot 0.94 success (baseline), pace 0.90, **walk 0.96 (better than trot)** -- two
+genuinely viable alternate gaits achieved with zero RL. **bound is essentially broken (0.06
+success, 94% QP failures)** -- plausible classical cause, not yet fixed: `ComTraj` builds one
+shared body pitch/height reference regardless of gait style, fine for trot/pace (always
+balanced support) but wrong for bound, which alternates "both front down, both rear up" and back,
+creating a pitching moment every half-cycle a flat-pitch reference can't absorb. Real bounding
+controllers pair the schedule with a dedicated pitch-oscillation reference -- that per-style CoM
+trajectory shaping is the natural next step if bound is wanted, not attempted here. See
+`mpc/README.md` for the full table and mechanism writeup.
+
 ## Next stages
 
 Terrain-aware observation and a non-trot gait mode were both tried already

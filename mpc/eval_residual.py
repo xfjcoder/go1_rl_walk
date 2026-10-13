@@ -107,6 +107,8 @@ def main():
     ap.add_argument("--use-terrain-heightmap", action="store_true")
     ap.add_argument("--terrain-footstep-planning", action="store_true")
     ap.add_argument("--terrain-friction-cone", action="store_true")
+    ap.add_argument("--gait-style", type=str, default="trot",
+                     choices=["trot", "pace", "bound", "walk"])
     args = ap.parse_args()
 
     run_dir = Path(__file__).resolve().parent / args.run_dir
@@ -127,6 +129,7 @@ def main():
         use_terrain_heightmap=args.use_terrain_heightmap,
         terrain_footstep_planning=args.terrain_footstep_planning,
         terrain_friction_cone=args.terrain_friction_cone,
+        gait_style=args.gait_style,
     )
     max_steps = int(args.episode_seconds * 200)
 
