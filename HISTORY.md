@@ -2532,11 +2532,32 @@ lever reachable through the same code path: tying the hardcoded touchdown *heigh
 phase (`TouchdownHeightMixin`), swept amplitude 0/+-0.02/+-0.05 m on top of weight=1/
 amplitude=+0.3 -> success 0.19/0.15/0.17/0.19/0.21, all within noise of baseline. Not
 adopted (kept at 0.0). Cost-side and footstep-height levers are now exhausted; the real
-remaining gap is architectural -- the QP has no vertical-bounce/flight-phase model at all,
-and fixing that for real needs a genuine flight-phase reference trajectory (MIT Cheetah
-3's approach), a materially bigger undertaking than any lever tried so far.
-`gait_style="bound"` is noticeably better than before but not production-ready like the
-other three styles. See `mpc/README.md` for the full writeup.
+remaining gap is architectural -- the QP has no vertical-bounce/flight-phase model at all.
+
+**Attempted the flight-phase model itself, 3 additive pieces, all closed (user: "let's try
+2-3 additive pieces first before move on to foothold optimization").** Important context:
+this submodule's linear convex MPC is modeled on Di Carlo et al. 2018's MIT Cheetah 3
+paper -- the SAME paper that demonstrated bounding on this exact QP formulation, just with
+a different schedule/reference per gait, so the plan was to ADD the missing pieces, not
+replace the MPC. Piece 1: a genuine flight-gap schedule (bound's duty, currently 0.6 =
+front/rear pairs OVERLAP in stance, never truly airborne). Swept duty 0.6(baseline)/0.5/
+0.45/0.4/0.35/0.3 -> success 0.19/0.06/0.06/0.02/0.00/0.00, qp_failed 0.73/0.90/0.94/0.98/
+1.00/1.00 -- decisive and monotonic: less overlap is strictly worse, collapsing almost
+entirely into QP INFEASIBILITY (not falls) as the gap widens. A hard-constraint failure
+(force bounds/friction cone can't produce enough stance impulse in a shorter window), not
+a soft-cost problem. Piece 2 (vertical-bounce height reference, derived directly from the
+gait's own schedule rather than a guessed sinusoid, verified correct in isolation) and
+Piece 3 (swing-leg retiming) were therefore not worth sweeping -- Piece 1 proved the QP
+has no feasible solution to find 90-100% of the time at any real flight-gap duty, and a
+cost-reference change (Piece 2) can't rescue an infeasible solver; Piece 3 was confirmed
+to need no new code at all (`make_swing_trajectory` already parametrizes by normalized
+swing phase, adapts to any duty automatically). **Closed for further investigation absent
+a specific new idea** -- the real remaining gap is this controller's force/friction-cone
+limits, as currently configured, structurally can't support a flight phase; loosening them
+is a bigger, differently-coupled tuning problem (affects every gait) with no guarantee.
+`gait_style="bound"` stays at its weight=1/pitch-amplitude=+0.3 default (23% success) --
+noticeably better than before but not production-ready like the other three styles.
+See `mpc/README.md` for the full writeup.
 
 ## Next stages
 

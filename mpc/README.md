@@ -682,7 +682,69 @@ they're just not directly comparable to each other episode-for-episode.)
 them touch the actual missing piece, which is that the QP is a purely instantaneous
 force-balance controller being asked to run a 2-legs-only support gait with no
 vertical-bounce/flight-phase model at all. A real fix needs either a genuine
-flight-phase reference trajectory the way MIT Cheetah 3 does (materially bigger
-undertaking, not attempted), or accepting bound stays experimental.
-`gait_style="bound"` is usable (noticeably better than the original broken version) but
-should not be treated as production-ready the way trot/pace/walk are.
+flight-phase reference trajectory the way MIT Cheetah 3 does, or accepting bound stays
+experimental.
+
+### Attempting the flight-phase/vertical-bounce model -- 3 additive pieces, all closed
+
+Chased directly (user: "let's try 2-3 additive pieces first before move on to foothold
+optimization"). Important context first: the linear convex centroidal MPC this submodule
+implements is itself modeled on Di Carlo et al. 2018 ("Dynamic Locomotion in the MIT
+Cheetah 3 Through Convex Model-Predictive Control") -- the SAME paper that demonstrated
+bounding, pacing, trotting, and galloping on one shared QP formulation, just with
+different contact schedules and reference trajectories per gait. So the plan was NOT to
+replace the MPC, only to add the 2-3 missing per-gait pieces, the same subclass-the-
+submodule pattern as every fix in this file.
+
+**Piece 1: a genuine flight-gap contact schedule.** Bound's duty (0.6, shared with
+trot/pace) means front/rear pairs OVERLAP in stance -- the "2-legs-only" support above is
+actually double-support overlap, never a real 0-legs-down flight phase. duty < 0.5 opens
+a real gap. Swept bound's own duty on top of the adopted weight=1/pitch-amplitude=+0.3:
+
+| duty | 0.6 (baseline) | 0.5 | 0.45 | 0.4 | 0.35 | 0.3 |
+|---|---|---|---|---|---|---|
+| success | 0.19 | 0.06 | 0.06 | 0.02 | 0.00 | 0.00 |
+| fall | 0.08 | 0.04 | 0.00 | 0.00 | 0.00 | 0.00 |
+| qp_failed | 0.73 | 0.90 | 0.94 | 0.98 | 1.00 | 1.00 |
+| ep_len_mean | 996 | 464 | 390 | 297 | 180 | 44 |
+
+Decisive and monotonic: less overlap is strictly worse, collapsing almost entirely into
+QP infeasibility (not falls) as the gap widens. This is a **hard-constraint** failure
+(force bounds / friction cone can't produce enough stance impulse in the shorter window
+each leg pair gets), not a soft-cost problem -- the shorter the stance window, the higher
+the peak force needed to do the same job, and the solver runs out of room entirely.
+
+**Piece 2: a vertical-bounce height reference.** Implemented anyway (`BoundAwareComTraj`
+extended with a `height_amplitude` param): derives the bump directly from the gait's own
+schedule (no sinusoid-phase guessing) -- with front/rear pair offsets exactly 0.5 apart,
+simple interval arithmetic gives exactly two "both pairs swinging" windows per period, at
+phase `[duty, 0.5)` and `[0.5+duty, 1.0)`, each of width `(0.5 - duty)`. Places the same
+smooth zero-endpoint-derivative bump shape `leg_controller.py`'s own swing-apex-height
+code already uses (`64*s**3*(1-s)**3`) inside each window, scaled by amplitude. Verified
+directly before using it: bump is exactly zero outside the predicted flight windows,
+fires only inside them, capped at the set amplitude; `duty >= 0.5` (no flight gap exists)
+correctly raises rather than silently no-op'ing.
+
+**Not swept, and this isn't a shortcut** -- it's a direct logical consequence of Piece 1's
+result. The height reference only patches the QP's COST target; Piece 1 showed the QP is
+hard-infeasible 90-100% of the time at any duty with a real flight gap. A cost-reference
+change cannot rescue a solver that has no feasible solution to find regardless of what
+it's asked to track -- there is no duty value where testing this would be informative.
+
+**Piece 3: swing-leg retiming for post-flight touchdown.** Checked, not implemented:
+`gait.py`'s `make_swing_trajectory` already parametrizes the swing-leg trajectory by
+normalized phase `s = t/swing_time`, not absolute duration -- `self.swing_time` already
+recomputes automatically from whatever duty is set (`Gait.__init__`). This piece was
+never a missing capability, just unverified; moot for the same reason as Piece 2.
+
+**Closing this investigation.** Between this session's two rounds (cost-weight/pitch-
+reference/dynamics-consistency/touchdown-height, then flight-gap duty/height-bounce/
+swing-retiming), essentially every lever reachable without a genuinely different
+force/torque authority has now been tried. The remaining gap isn't a missing reference
+trajectory or a missing cost term -- it's that this controller's force bounds and
+friction-cone limits, as currently configured, cannot support a real flight phase at all,
+and loosening them is a much bigger, differently-coupled tuning problem (affects every
+gait, not just bound) with no guarantee of success. `gait_style="bound"` stays at its
+weight=1/pitch-amplitude=+0.3 default (23% success) -- usable, noticeably better than the
+original broken version, but not production-ready the way trot/pace/walk are, and closed
+for further investigation absent a specific new idea.

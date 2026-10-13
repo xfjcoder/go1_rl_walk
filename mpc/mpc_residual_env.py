@@ -189,47 +189,89 @@ class StyledTerrainAwareGait(TouchdownHeightMixin, GaitStyleMixin, TerrainAwareG
 
 
 class BoundAwareComTraj(ComTraj):
-    """Gives the bound gait a genuine, phase-synced PITCH reference instead of
-    ComTraj.generate_traj's own hardcoded flat (zero) reference used for every style.
-    Follow-up to GAIT_STYLE_PITCH_WEIGHT's cost-softening fix below, which alone only
-    got bound to 21% success (vs. trot's 94%) -- softening the weight gives the QP room
-    to deviate from zero pitch, but gives it no target to deviate TOWARD, leaving the
-    deviation underdetermined. This adds a sinusoidal target tied to the SAME phase used
-    for the contact schedule (`phase_offset` -- the front leg pair's own offset, since
-    bound's front/rear pairs are exactly out of phase): nose dips one way while the
-    front pair is in stance, the other way while the rear pair is.
+    """Gives the bound gait two genuine, phase-synced references instead of
+    ComTraj.generate_traj's own hardcoded flat (zero pitch, constant height) reference
+    used for every style:
 
-    Scope, by design: only the QP's COST reference (self.rpy_traj_world /
-    self.omega_traj_world, what compute_x_ref_vec feeds into the linear cost term) is
-    patched, AFTER calling the unmodified parent generate_traj -- the parent's own
-    internal predicted-foot-lever-arm loop (which builds the Ad/Bd dynamics matrices)
-    already ran with a flat-pitch reference by the time this patch applies, so the
-    dynamics model still assumes zero pitch throughout the horizon. Re-deriving that
-    loop to use a consistent nonzero pitch would mean duplicating generate_traj
-    wholesale rather than patching it (the same vendored-submodule discipline as every
-    other fix in this file) -- accepted as a real, bounded simplification: this still
-    gives the QP's own objective a genuine, correctly-signed incentive to let the body
-    pitch with the gait instead of fighting it, just not a fully pitch-consistent
-    dynamics model to match.
+    PITCH -- tied to the SAME phase used for the contact schedule (`phase_offset` --
+    the front leg pair's own offset, since bound's front/rear pairs are exactly out of
+    phase): nose dips one way while the front pair is in stance, the other way while
+    the rear pair is. Follow-up to GAIT_STYLE_PITCH_WEIGHT's cost-softening fix below,
+    which alone only got bound to 21% success -- softening the weight gives the QP room
+    to deviate from zero pitch, but gives it no target to deviate TOWARD. Got bound to
+    23% (see mpc/README.md).
+
+    HEIGHT -- a genuine flight-phase vertical bounce, active only once GAIT_STYLE_PRESETS
+    gives bound a real flight gap (duty < 0.5; see the duty sweep in mpc/README.md).
+    Rather than guess a sinusoid's phase/sign the way the pitch reference above does,
+    this derives the bump directly from the gait's own schedule: with front-pair offset
+    0 and rear-pair offset 0.5 (bound's design), simple interval arithmetic gives exactly
+    two "both pairs swinging" (flight) windows per period, each of width (0.5 - duty), at
+    phase in [duty, 0.5) and [0.5+duty, 1.0). Within each window this places the same
+    smooth bump-with-zero-endpoint-derivative shape leg_controller.py's own
+    `make_swing_trajectory` already uses for swing-leg apex height (`64*s**3*(1-s)**3`),
+    scaled by `height_amplitude` -- so the body is asked to rise during an actual flight
+    window and nowhere else, not during either stance phase.
+
+    Scope, by design, for BOTH references: only the QP's COST reference
+    (rpy/pos/vel/omega_traj_world, what compute_x_ref_vec feeds the linear cost term) is
+    patched, AFTER calling the unmodified parent generate_traj. Verified this doesn't
+    matter for Ad/Bd (the predicted dynamics): `gait.py`'s own touchdown-prediction
+    ignores body pitch (rotates the hip offset with a yaw-ONLY `R_z`) and body height
+    (hardcodes `body_pos`'s z-component to 0, and the touchdown z itself to a flat
+    constant) -- so neither reference ever reaches the foot-lever-arm/Bd computation
+    regardless of patch ordering (confirmed directly; see mpc/README.md's
+    "dynamics-model inconsistency" investigation). Patching after the parent call is
+    therefore not a simplification, it's equivalent to patching before.
     """
 
-    def __init__(self, go2, pitch_amplitude, pitch_phase_offset):
+    def __init__(self, go2, pitch_amplitude, pitch_phase_offset, gait_duty, height_amplitude=0.0):
         super().__init__(go2)
         self._pitch_amplitude = pitch_amplitude
         self._pitch_phase_offset = pitch_phase_offset
+        self._gait_duty = gait_duty
+        self._height_amplitude = height_amplitude
 
     def generate_traj(self, go2, gait, time_now, x_vel_des_body, y_vel_des_body,
                        z_pos_des_body, yaw_rate_des_body, time_step):
         super().generate_traj(go2, gait, time_now, x_vel_des_body, y_vel_des_body,
                                z_pos_des_body, yaw_rate_des_body, time_step)
+        period = gait.gait_period
+        t_abs = time_now + self.time
+        two_pi = 2.0 * np.pi
+        # Front-pair phase (bound's phase_offset[0] -- rear is always exactly 0.5 out
+        # of phase with it, see GAIT_STYLE_PRESETS), shared by both references below.
+        front_phase = np.mod(self._pitch_phase_offset + t_abs / period, 1.0)
+
         if self._pitch_amplitude != 0.0:
-            period = gait.gait_period
-            t_abs = time_now + self.time
-            two_pi = 2.0 * np.pi
-            phase = np.mod(self._pitch_phase_offset + t_abs / period, 1.0)
-            self.rpy_traj_world[1, :] = self._pitch_amplitude * np.sin(two_pi * phase)
+            self.rpy_traj_world[1, :] = self._pitch_amplitude * np.sin(two_pi * front_phase)
             self.omega_traj_world[1, :] = (self._pitch_amplitude * (two_pi / period)
-                                            * np.cos(two_pi * phase))
+                                            * np.cos(two_pi * front_phase))
+
+        if self._height_amplitude != 0.0:
+            assert self._gait_duty < 0.5, (
+                "height bounce needs a genuine flight gap (duty < 0.5); "
+                f"got duty={self._gait_duty}")
+            d = self._gait_duty
+            w = 0.5 - d  # flight-window width, in units of phase (fraction of period)
+
+            def bump(s):
+                return 64.0 * s**3 * (1.0 - s)**3
+
+            def dbump_ds(s):
+                return 192.0 * s**2 * (1.0 - s)**2 * (1.0 - 2.0 * s)
+
+            s1 = np.clip((front_phase - d) / w, 0.0, 1.0)
+            in1 = (front_phase >= d) & (front_phase < 0.5)
+            s2 = np.clip((front_phase - (0.5 + d)) / w, 0.0, 1.0)
+            in2 = front_phase >= (0.5 + d)
+
+            b = np.where(in1, bump(s1), np.where(in2, bump(s2), 0.0))
+            db_ds = np.where(in1, dbump_ds(s1), np.where(in2, dbump_ds(s2), 0.0))
+            db_dt = db_ds / (w * period)
+
+            self.pos_traj_world[2, :] += self._height_amplitude * b
+            self.vel_traj_world[2, :] += self._height_amplitude * db_dt
 
 
 # Reuse this project's own heightfield constants/conventions exactly (not re-derived) --
@@ -409,6 +451,16 @@ GAIT_STYLE_PITCH_AMPLITUDE = {
 # orthogonal lever from the two above (changes the predicted foot lever arm fed into
 # Bd, not the QP's cost reference).
 GAIT_STYLE_TOUCHDOWN_Z_AMPLITUDE = {
+    "trot": 0.0,
+    "pace": 0.0,
+    "bound": 0.0,
+    "walk": 0.0,
+}
+
+# BoundAwareComTraj's flight-phase vertical-bounce lever (see its docstring). Only
+# meaningful once GAIT_STYLE_PRESETS["bound"]'s duty is < 0.5 (a genuine flight gap
+# exists); 0.0 for every style pending the sweep. See mpc/README.md.
+GAIT_STYLE_HEIGHT_AMPLITUDE = {
     "trot": 0.0,
     "pace": 0.0,
     "bound": 0.0,
@@ -607,8 +659,10 @@ class MPCResidualEnv(gym.Env):
         # a bound method, only ever called from solve_QP() well after _generate_terrain has run.
         self.terrain_friction_cone = terrain_friction_cone and self.terrain_enabled
         pitch_amplitude = GAIT_STYLE_PITCH_AMPLITUDE[self.gait_style]
-        self.traj = (BoundAwareComTraj(self.go2, pitch_amplitude, float(phase_offset[0]))
-                     if pitch_amplitude != 0.0 else ComTraj(self.go2))
+        height_amplitude = GAIT_STYLE_HEIGHT_AMPLITUDE[self.gait_style]
+        self.traj = (BoundAwareComTraj(self.go2, pitch_amplitude, float(phase_offset[0]),
+                                        gait_duty, height_amplitude)
+                     if (pitch_amplitude != 0.0 or height_amplitude != 0.0) else ComTraj(self.go2))
         self.mujoco_go2.model.opt.timestep = 1.0 / SIM_HZ
         self._q_init = self.go2.current_config.get_q().copy()
         self._floor_geom_id = mj.mj_name2id(self.mujoco_go2.model, mj.mjtObj.mjOBJ_GEOM, "floor")
