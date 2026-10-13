@@ -748,3 +748,62 @@ gait, not just bound) with no guarantee of success. `gait_style="bound"` stays a
 weight=1/pitch-amplitude=+0.3 default (23% success) -- usable, noticeably better than the
 original broken version, but not production-ready the way trot/pace/walk are, and closed
 for further investigation absent a specific new idea.
+
+## Foothold optimization: searching nearby footholds, a clean negative result
+
+Chased directly (user: "ok go ahead" on foothold optimization, the next roadmap item
+after bound). `TerrainAwareGait` (the already-adopted footstep-planning fix) only
+corrects the nominal Raibert touchdown point's HEIGHT -- the (x, y) location itself is
+still whatever the unmodified submodule's drift/rotation-correction math picks,
+regardless of whether that exact spot happens to sit on a stair edge or steep local
+slope. Foothold optimization is the actual next step real perceptive-locomotion
+controllers (Spot, ANYmal) take: search a small set of candidate (x, y) points near the
+nominal one and pick a better one, instead of only fixing up the single nominal point's
+height.
+
+Implemented as `TerrainAwareGait._best_foothold_xy` (`mpc_residual_env.py`): a small grid
+of candidate offsets (`FOOTHOLD_SEARCH_RADIUS=0.05m`, `FOOTHOLD_GRID_STEP=0.025m`) around
+the nominal point, scored by `local slope magnitude + regularization toward the nominal
+point` (`FOOTHOLD_REG_WEIGHT=0.15`, sized so the regularization cost at the search
+radius's edge is roughly the same order as the slope readings seen on this project's own
+test slopes) -- picks the lowest-cost candidate. Gated by a new
+`terrain_foothold_optimization` flag (`--terrain-foothold-optimization`), independent of
+(and requiring) `terrain_footstep_planning`. Verified directly before trusting it: stays
+exactly at the nominal point on flat terrain (zero slope everywhere, regularization alone
+picks dx=dy=0); near the sharpest riser edge in a generated stair terrain, moves to a
+candidate with slope dropping from 1.0 (saturated, right at the edge) to 0.0 (clean
+tread) -- confirms the search mechanism itself works as designed.
+
+**Tested zero-residual, paired per-episode seeds (same terrain/command draw both arms,
+64 seeds, same terrain distribution as every other terrain check -- amplitude to 8cm,
+slope to 12deg, stairs to 5cm), stacked on top of the already-adopted footstep-planning
+fix:**
+
+| variant | success | fall | qp_failed | ep_len_mean |
+|---|---|---|---|---|
+| terrain-aware-plan (z-only, adopted) | 0.719 | 0.016 | 0.266 | 1576 |
+| terrain-aware-plan + foothold-optimization | 0.719 | 0.000 | 0.281 | 1566 |
+
+**Identical success rate; fall/qp_failed differ by exactly 1 episode out of 64 in
+opposite directions** -- indistinguishable from noise, the same clean-negative pattern as
+the friction-cone-orientation check. (Note: this baseline's absolute success rate, 0.719,
+is noticeably higher than the 0.56-0.59 documented earlier for the same z-only fix --
+every other construction parameter checked matches exactly [command/friction/mass/terrain
+ranges, episode length, gait style], so this is attributed to a different random seed
+sample landing on an easier terrain distribution by chance, the same mechanism already
+seen and explained for the touchdown-z-amplitude sweep's baseline mismatch earlier in
+this file. Doesn't affect the conclusion here, since both arms use identical seeds within
+this one script -- the paired comparison is what answers whether foothold search helps,
+and it doesn't.)
+
+**Closed as tested-but-not-adopted** (`terrain_foothold_optimization=False` stays
+default); code kept since it's correct and verified, matching this project's practice
+elsewhere (friction-cone fix, touchdown-height mixin). Plausible reason this didn't move
+the needle: `TerrainAwareGait`'s z-only fix already gets the SWING LEG to the right
+height at the nominal (x, y) -- the remaining failures are more likely about WHEN a foot
+plants (duty-cycle timing relative to a stair riser) or how much force the stance legs
+can generate (same force/friction-cone-limit theme as bound's closed investigation above)
+than exactly WHERE within a small 5cm radius it plants. A genuinely different (x, y)
+search objective (e.g. one that scores support-polygon/stability margin instead of just
+local slope) might fare differently, but that's a new idea, not a tuning pass on this one
+-- not attempted.

@@ -44,6 +44,18 @@ from convex_mpc.mujoco_model import MuJoCo_GO2_Model
 import pinocchio as pin
 
 
+# TerrainAwareGait._best_foothold_xy's search grid/regularization. Radius/step chosen as
+# a small fraction of the leg's real reachable workspace (nowhere near kinematic limits);
+# REG_WEIGHT chosen so the regularization cost at the search radius's edge is roughly the
+# same order as the slope-magnitude readings seen on this project's own test slopes
+# (tan(12deg)~=0.21 at the steepest previously-tested terrain) -- i.e. a candidate has to
+# be meaningfully flatter than the nominal point to be worth moving toward, not just
+# infinitesimally flatter.
+FOOTHOLD_SEARCH_RADIUS = 0.05   # meters
+FOOTHOLD_GRID_STEP = 0.025      # meters
+FOOTHOLD_REG_WEIGHT = 0.15
+
+
 class TerrainAwareGait(Gait):
     """Patches the submodule's own Gait (unmodified otherwise -- subclassed rather than
     edited in place, since it lives in a vendored git submodule) so footstep planning
@@ -70,21 +82,62 @@ class TerrainAwareGait(Gait):
     discard only its hardcoded z, rather than re-deriving the drift/rotation-correction
     math here -- keeps this subclass correct even if the upstream submodule's own
     horizontal footstep logic changes.
+
+    `foothold_search`, off by default: once this class is already correcting Z at the
+    nominal (x, y), the natural next step (the actual ANYmal/Spot perceptive-locomotion
+    mechanism) is to also search nearby (x, y) candidates for a better foothold instead
+    of blindly accepting the nominal Raibert point's horizontal location -- see
+    `_best_foothold_xy`. Gated by its own flag (independent of the z-only fix above,
+    which stays exactly reproducible with this off) since it's a separate, newer,
+    less-tested lever.
     """
 
-    def __init__(self, frequency_hz, duty, terrain_height_fn):
+    def __init__(self, frequency_hz, duty, terrain_height_fn, foothold_search=False):
         super().__init__(frequency_hz, duty)
         self._terrain_height_fn = terrain_height_fn
+        self._foothold_search = foothold_search
+
+    def _best_foothold_xy(self, x_nom, y_nom):
+        """Searches a small grid of candidate (x, y) offsets around the nominal Raibert
+        touchdown point and returns the one with the lowest cost = local terrain slope
+        magnitude (a cheap proxy for "don't land on an edge/slope", same central-
+        difference style as _terrain_normal) + a regularization term pulling back toward
+        the nominal point (otherwise the search could wander to a flatter spot that's
+        kinematically awkward or outside the leg's real reach). This is the actual
+        ANYmal/Spot perceptive-locomotion mechanism -- search candidate footholds near
+        the nominal one instead of only correcting the single nominal point's height
+        (which is all compute_touchdown_world_for_traj_purpose_only/
+        compute_swing_traj_and_touchdown did before this)."""
+        offsets = np.arange(-FOOTHOLD_SEARCH_RADIUS, FOOTHOLD_SEARCH_RADIUS + 1e-9,
+                             FOOTHOLD_GRID_STEP)
+        dx, dy = np.meshgrid(offsets, offsets, indexing="ij")
+        dx, dy = dx.ravel(), dy.ravel()
+        cx, cy = x_nom + dx, y_nom + dy
+
+        eps = 0.02
+        dzdx = (self._terrain_height_fn(cx + eps, cy) - self._terrain_height_fn(cx - eps, cy)) / (2 * eps)
+        dzdy = (self._terrain_height_fn(cx, cy + eps) - self._terrain_height_fn(cx, cy - eps)) / (2 * eps)
+        slope_mag = np.sqrt(dzdx**2 + dzdy**2)
+
+        reg = FOOTHOLD_REG_WEIGHT * (dx**2 + dy**2) / FOOTHOLD_SEARCH_RADIUS**2
+        cost = slope_mag + reg
+        best = np.argmin(cost)
+        return float(cx[best]), float(cy[best])
 
     def compute_touchdown_world_for_traj_purpose_only(self, go2, leg):
         pos = super().compute_touchdown_world_for_traj_purpose_only(go2, leg)
         pos = np.array(pos, dtype=float)
+        if self._foothold_search:
+            pos[0], pos[1] = self._best_foothold_xy(pos[0], pos[1])
         pos[2] = float(self._terrain_height_fn(pos[0], pos[1])) + 0.02
         return pos
 
     def compute_swing_traj_and_touchdown(self, go2, leg):
         _, pos_touchdown_world = super().compute_swing_traj_and_touchdown(go2, leg)
         pos_touchdown_world = np.array(pos_touchdown_world, dtype=float)
+        if self._foothold_search:
+            pos_touchdown_world[0], pos_touchdown_world[1] = self._best_foothold_xy(
+                pos_touchdown_world[0], pos_touchdown_world[1])
         pos_touchdown_world[2] = float(self._terrain_height_fn(
             pos_touchdown_world[0], pos_touchdown_world[1])) + 0.02
         foot_pos, _ = go2.get_single_foot_state_in_world(leg)
@@ -181,11 +234,12 @@ class StyledGait(TouchdownHeightMixin, GaitStyleMixin, Gait):
 
 
 class StyledTerrainAwareGait(TouchdownHeightMixin, GaitStyleMixin, TerrainAwareGait):
-    def __init__(self, frequency_hz, duty, phase_offset, terrain_height_fn, touchdown_z_amplitude=0.0):
+    def __init__(self, frequency_hz, duty, phase_offset, terrain_height_fn, touchdown_z_amplitude=0.0,
+                 foothold_search=False):
         self._phase_offset = np.asarray(phase_offset, dtype=float)
         self._touchdown_z_amplitude = touchdown_z_amplitude
         self._last_touchdown_query_time = 0.0
-        super().__init__(frequency_hz, duty, terrain_height_fn)
+        super().__init__(frequency_hz, duty, terrain_height_fn, foothold_search)
 
 
 class BoundAwareComTraj(ComTraj):
@@ -556,6 +610,13 @@ class MPCResidualEnv(gym.Env):
                                                # land; this fixes what forces are assumed
                                                # achievable once planted). Default False
                                                # reproduces every prior variant's exact behavior.
+        terrain_foothold_optimization: bool = False,  # search nearby (x, y) candidate footholds
+                                               # for a flatter spot instead of only correcting the
+                                               # nominal Raibert point's height -- see
+                                               # TerrainAwareGait._best_foothold_xy. Requires
+                                               # terrain_footstep_planning (needs the same terrain-
+                                               # height function); a no-op otherwise. Default False
+                                               # reproduces every prior variant's exact behavior.
         gait_style: str = "trot",             # one of GAIT_STYLE_PRESETS -- selects the
                                                # contact-schedule parametrization (trot/pace/
                                                # bound/walk), a classical, non-learned choice.
@@ -649,10 +710,11 @@ class MPCResidualEnv(gym.Env):
         # present, but MPC's own footstep planner still flat-ground-blind) stays
         # reproducible without this fix.
         self.terrain_footstep_planning = terrain_footstep_planning and self.terrain_enabled
+        self.terrain_foothold_optimization = terrain_foothold_optimization and self.terrain_footstep_planning
         phase_offset, gait_duty = GAIT_STYLE_PRESETS[self.gait_style]
         touchdown_z_amplitude = GAIT_STYLE_TOUCHDOWN_Z_AMPLITUDE[self.gait_style]
         self.gait = (StyledTerrainAwareGait(GAIT_HZ, gait_duty, phase_offset, self._terrain_height,
-                                             touchdown_z_amplitude)
+                                             touchdown_z_amplitude, self.terrain_foothold_optimization)
                      if self.terrain_footstep_planning else
                      StyledGait(GAIT_HZ, gait_duty, phase_offset, touchdown_z_amplitude))
         # Same late-binding safety as self._terrain_height above -- self._terrain_normal is

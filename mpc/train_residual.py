@@ -119,6 +119,11 @@ def main():
                           "CentroidalMPC in mpc_residual_env.py). Independent of "
                           "--terrain-footstep-planning (that fixes where feet land; this fixes "
                           "what forces are assumed achievable once planted).")
+    ap.add_argument("--terrain-foothold-optimization", action="store_true",
+                     help="Search nearby (x, y) candidate footholds for a flatter spot instead of "
+                          "only correcting the nominal Raibert point's height (TerrainAwareGait."
+                          "_best_foothold_xy in mpc_residual_env.py). Requires "
+                          "--terrain-footstep-planning; a no-op otherwise.")
     ap.add_argument("--gait-style", type=str, default="trot",
                      choices=["trot", "pace", "bound", "walk"],
                      help="Contact-schedule parametrization MPC's Gait uses (GAIT_STYLE_PRESETS "
@@ -188,6 +193,7 @@ def main():
         use_terrain_heightmap=args.use_terrain_heightmap,
         terrain_footstep_planning=args.terrain_footstep_planning,
         terrain_friction_cone=args.terrain_friction_cone,
+        terrain_foothold_optimization=args.terrain_foothold_optimization,
         gait_style=args.gait_style,
     )
     with open(run_dir / "env_kwargs.json", "w") as f:

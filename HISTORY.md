@@ -2559,6 +2559,25 @@ is a bigger, differently-coupled tuning problem (affects every gait) with no gua
 noticeably better than before but not production-ready like the other three styles.
 See `mpc/README.md` for the full writeup.
 
+**Foothold optimization, 2026-10-13 (user: "ok go ahead", the next roadmap item after
+bound) -- a clean negative result.** The already-adopted footstep-planning fix only
+corrects the nominal touchdown point's HEIGHT; the (x, y) location is still whatever the
+unmodified submodule's Raibert heuristic picks, regardless of local terrain roughness.
+Implemented `TerrainAwareGait._best_foothold_xy`: searches a small grid of (x, y)
+candidates (5cm radius, 2.5cm step) around the nominal point, scored by local slope
+magnitude + a regularization term pulling back toward the nominal point, picks the best.
+Verified directly: stays exactly at the nominal point on flat terrain, moves to a
+genuinely flatter spot near a real stair-edge discontinuity (slope 1.0 -> 0.0). Gated by
+a new `terrain_foothold_optimization` flag. Tested zero-residual, 64 paired seeds, same
+terrain distribution as every prior terrain check, stacked on the adopted footstep-
+planning fix: success IDENTICAL (0.719 both), fall/qp_failed differ by exactly 1 episode
+out of 64 in opposite directions -- indistinguishable from noise, the same clean-negative
+pattern as the friction-cone-orientation check. Closed as tested-but-not-adopted (default
+off); code kept, correct and verified. Plausible reason: the z-only fix already gets the
+swing leg to the right height at the nominal (x, y) -- remaining failures more likely
+about plant TIMING or available stance FORCE than exactly where within a small radius a
+foot lands. See `mpc/README.md` for the full writeup.
+
 ## Next stages
 
 Terrain-aware observation and a non-trot gait mode were both tried already
