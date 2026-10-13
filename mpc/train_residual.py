@@ -107,6 +107,12 @@ def main():
                           "observation (obs_dim 47->56) -- mirrors envs/go1_env.py's own "
                           "--use-terrain-heightmap, needed there to handle its hardest terrain "
                           "corners since pure proprioception can't see a slope/stair coming.")
+    ap.add_argument("--terrain-footstep-planning", action="store_true",
+                     help="Make MPC's OWN footstep planner terrain-aware (TerrainAwareGait in "
+                          "mpc_residual_env.py), instead of the residual being the only terrain-"
+                          "aware thing (that's --use-terrain-heightmap, a separate flag). Fixes "
+                          "MPC's own touchdown-height computation, hardcoded flat in the vendored "
+                          "submodule.")
     ap.add_argument("--terrain-curriculum-start", type=float, default=None,
                      help="If given (needs --terrain-amplitude-range), ramp the sampled upper "
                           "bound from this value up to --terrain-amplitude-range's own hi over "
@@ -168,6 +174,7 @@ def main():
         slope_deg_range=tuple(args.slope_deg_range) if args.slope_deg_range else None,
         stair_height_range=tuple(args.stair_height_range) if args.stair_height_range else None,
         use_terrain_heightmap=args.use_terrain_heightmap,
+        terrain_footstep_planning=args.terrain_footstep_planning,
     )
     with open(run_dir / "env_kwargs.json", "w") as f:
         json.dump(env_kwargs, f, indent=2)

@@ -2426,17 +2426,43 @@ that measurably helped the pure-RL stairs policy) was the worst of all four, act
 underperforming the untrained zero-residual baseline on every metric (success 0.44, fall 0.56,
 speed/lateral/yaw tracking all down too) despite training converging cleanly by its own metrics.
 
-**Decision: closed, not adopted for terrain.** Four structurally different interventions found
-no way past `v1`'s ~56% success ceiling at this difficulty range. Most likely explanation: a
-structural capacity difference, not a tuning gap -- the residual is a small additive torque
-correction applied *after* MPC's QP has already fully committed to footsteps/body trajectory
-from its own simplified rigid-body contact model, which is often outright wrong (not merely
-infeasible) on a slope or stair riser; a bounded downstream correction has far less room to fix
-that than RL owning the whole decision from scratch, which is what the mature pure-RL pipeline
-already does well (`pretrained/p_stairs` / `pretrained/x_mesh_finetune`, near-0% falls on this
-same terrain distribution). MPC+residual's real, demonstrated value stays scoped to flat-ground
-robustness and turning (the Step 5 evaluation above). See `mpc/README.md` for the full
-experiment table, reproducible setup, and demo GIFs.
+All four of those experiments only ever changed the RL residual (schedule, torque authority, or
+observations) -- none touched the MPC base controller itself. Tracing the vendored submodule's
+own footstep planner found the actual root cause: `Gait.compute_touchdown_world_for_traj_purpose_
+only` and `Gait.compute_swing_traj_and_touchdown` (`third_party/go2-convex-mpc/.../gait.py`) both
+hardcode the touchdown point's world Z to a flat-ground constant (0.02), independent of this
+project's own terrain support -- on a slope/stair this biases the QP's predicted force/torque
+solution over the whole horizon AND commands the swing leg to land at the wrong height,
+contacting early or missing long. This is exactly the mechanism real quadruped controllers (Spot,
+ANYmal) solve with terrain-aware footstep *planning* fed by perceived terrain, rather than a
+downstream torque correction applied after a bad plan is already committed to.
+
+Fixed with `TerrainAwareGait` (subclasses the submodule's own `Gait`, doesn't edit the vendored
+submodule in place): overrides both methods to keep the parent's horizontal (x, y) touchdown
+computation (terrain-independent) and replace only the hardcoded z with the real terrain height
+plus the original clearance constant. Gated by a new `--terrain-footstep-planning` flag, off by
+default so every prior result stays exactly reproducible (verified: `verify_residual_interface.py`
+still gives the already-adopted 1.955 rad/s turning result unchanged).
+
+**Just this planner fix alone, with zero RL residual, already beats every residual-only variant
+tried**: success rate 0.50 -> 0.59, fall 0.50 -> 0.41, QP-failure 0.47 -> 0.41 (32 paired trials;
+confirmed directionally consistent at 96 trials too: 0.49 -> 0.56, 11 episodes flipped to
+surviving vs. 4 the other way). Training a residual on top of the corrected planner
+(`terrain_v5_footplan`, otherwise identical to `terrain_v1`) gave essentially no further survival
+improvement (identical success/fall/QP-failure rates, only marginal tracking polish) -- confirming
+the earlier diagnosis was right that the residual has limited leverage, but wrong about where the
+fix needed to go: the base controller's own plan, not the residual's inputs or torque budget.
+
+**Current status: a genuine, real improvement and the best terrain result in this track so far,
+but not a full fix** -- QP-failure rate is still 41%, and overall success (0.59) remains well
+below flat ground's near-complete result and far below the mature pure-RL pipeline's near-0% falls
+on this same terrain distribution (`pretrained/p_stairs` / `pretrained/x_mesh_finetune`). Likely
+remaining gap, not yet attempted: the QP's friction-cone constraints are still built in world axes
+(assuming the ground normal is always world-up, wrong on a steep slope even with touchdown height
+now correct), and swing-leg clearance height is still a fixed constant regardless of stair riser
+size -- the same "fixed clearance target" issue the pure-RL track's own stairs saga found and only
+partially fixed. See `mpc/README.md` for the full experiment table, reproducible setup, and demo
+GIFs.
 
 ## Next stages
 

@@ -34,12 +34,61 @@ sys.path.insert(0, str(REPO_ROOT))
 
 from convex_mpc.centroidal_mpc import CentroidalMPC
 from convex_mpc.com_trajectory import ComTraj
-from convex_mpc.gait import Gait
+from convex_mpc.gait import Gait, HEIGHT_SWING
 from convex_mpc.go2_robot_data import PinGo2Model
 from convex_mpc.leg_controller import LegController
 import convex_mpc.mujoco_model as mujoco_model_module
 from convex_mpc.mujoco_model import MuJoCo_GO2_Model
 import pinocchio as pin
+
+
+class TerrainAwareGait(Gait):
+    """Patches the submodule's own Gait (unmodified otherwise -- subclassed rather than
+    edited in place, since it lives in a vendored git submodule) so footstep planning
+    knows about terrain instead of hardcoding a flat-ground touchdown height.
+
+    Root cause this fixes: `Gait.compute_touchdown_world_for_traj_purpose_only` and
+    `Gait.compute_swing_traj_and_touchdown` both hardcode the touchdown point's world Z
+    to a constant 0.02 (a flat-ground assumption -- see third_party/go2-convex-mpc's own
+    gait.py). That constant feeds TWO places: (1) `ComTraj.generate_traj`'s predicted
+    foot lever arms over the whole MPC horizon, used to build the Bd dynamics matrices
+    the QP solves against -- on a slope/stair, the real moment arm's Z is wrong, biasing
+    the force/torque solution over the whole horizon; (2) the actual swing-leg Cartesian
+    PD target in `LegController.compute_leg_torque` -- the swing foot is commanded to
+    land at flat-ground height regardless of a real slope/step under it, so it can
+    contact early (confusing the MPC's own contact schedule, which still thinks that leg
+    is airborne) or miss long (briefly losing a support leg the MPC assumed was already
+    planted). This is a materially different fix than Stage 11's terrain_v4 experiment,
+    which gave the RL RESIDUAL a terrain-heightmap observation but left MPC's own
+    footstep planner blind -- here MPC's own planning is corrected directly, nothing
+    downstream has to compensate for a bad plan.
+
+    Both overridden methods call the parent (unmodified) implementation first to get
+    the correct horizontal (x, y) touchdown position (never depends on terrain) and
+    discard only its hardcoded z, rather than re-deriving the drift/rotation-correction
+    math here -- keeps this subclass correct even if the upstream submodule's own
+    horizontal footstep logic changes.
+    """
+
+    def __init__(self, frequency_hz, duty, terrain_height_fn):
+        super().__init__(frequency_hz, duty)
+        self._terrain_height_fn = terrain_height_fn
+
+    def compute_touchdown_world_for_traj_purpose_only(self, go2, leg):
+        pos = super().compute_touchdown_world_for_traj_purpose_only(go2, leg)
+        pos = np.array(pos, dtype=float)
+        pos[2] = float(self._terrain_height_fn(pos[0], pos[1])) + 0.02
+        return pos
+
+    def compute_swing_traj_and_touchdown(self, go2, leg):
+        _, pos_touchdown_world = super().compute_swing_traj_and_touchdown(go2, leg)
+        pos_touchdown_world = np.array(pos_touchdown_world, dtype=float)
+        pos_touchdown_world[2] = float(self._terrain_height_fn(
+            pos_touchdown_world[0], pos_touchdown_world[1])) + 0.02
+        foot_pos, _ = go2.get_single_foot_state_in_world(leg)
+        traj = self.make_swing_trajectory(foot_pos, pos_touchdown_world,
+                                           self.swing_time, h_sw=HEIGHT_SWING)
+        return traj, pos_touchdown_world
 
 # Reuse this project's own heightfield constants/conventions exactly (not re-derived) --
 # see envs/go1_env.py for the full rationale of each.
@@ -125,6 +174,14 @@ class MPCResidualEnv(gym.Env):
                                                # --use-terrain-heightmap exactly (a privileged
                                                # analytic lookup, zero on flat ground / terrain
                                                # disabled). Default False keeps obs_dim == 47.
+        terrain_footstep_planning: bool = False,  # make MPC's OWN footstep planner (Gait's
+                                               # touchdown-height computation) terrain-aware
+                                               # instead of hardcoding flat ground -- see
+                                               # TerrainAwareGait above. Independent of
+                                               # use_terrain_heightmap (that's the RL residual's
+                                               # observation; this is the base controller's own
+                                               # planning). Default False reproduces terrain_v1-
+                                               # v4's exact prior (flat-footstep-plan) behavior.
         ramp_length: float = DEFAULT_RAMP_LENGTH,
         stair_depth: float = 0.25,
         num_stairs: int = 8,
@@ -200,7 +257,17 @@ class MPCResidualEnv(gym.Env):
         self.go2 = PinGo2Model()
         self.mujoco_go2 = MuJoCo_GO2_Model()
         self.leg_controller = LegController()
-        self.gait = Gait(GAIT_HZ, GAIT_DUTY)
+        # self._terrain_height is a bound method referencing `self` -- it's looked up
+        # dynamically each call, so passing it here (before self._terrain_h etc. are set
+        # up below) is safe: by the time TerrainAwareGait actually calls it (from
+        # reset()/step(), always after _generate_terrain has populated self._terrain_h),
+        # it reflects the current episode's terrain. terrain_footstep_planning gates this
+        # independently of terrain_enabled so the earlier terrain_v1-v4 behavior (terrain
+        # present, but MPC's own footstep planner still flat-ground-blind) stays
+        # reproducible without this fix.
+        self.terrain_footstep_planning = terrain_footstep_planning and self.terrain_enabled
+        self.gait = (TerrainAwareGait(GAIT_HZ, GAIT_DUTY, self._terrain_height)
+                     if self.terrain_footstep_planning else Gait(GAIT_HZ, GAIT_DUTY))
         self.traj = ComTraj(self.go2)
         self.mujoco_go2.model.opt.timestep = 1.0 / SIM_HZ
         self._q_init = self.go2.current_config.get_q().copy()
