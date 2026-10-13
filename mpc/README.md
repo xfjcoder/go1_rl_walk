@@ -807,3 +807,51 @@ than exactly WHERE within a small 5cm radius it plants. A genuinely different (x
 search objective (e.g. one that scores support-polygon/stability margin instead of just
 local slope) might fare differently, but that's a new idea, not a tuning pass on this one
 -- not attempted.
+
+## Swing-leg clearance height: verified a real bug, fixed it, another clean negative result
+
+Chased directly (user: "go ahead" on the swing-clearance/`fz_min` item flagged after
+foothold optimization closed). `make_swing_trajectory`'s `h_sw` (apex height) is added on
+top of a straight-LINE interpolation between takeoff and touchdown, so true ground
+clearance above the HIGHER of the two endpoints is `h_sw - |p0_z - pf_z| / 2`, not `h_sw`
+-- moot on flat ground (equal endpoints), but ascending a stair riser shrinks the real
+clearance over the step being climbed, the same "fixed clearance target" bug the pure-RL
+stairs track already found and only partially fixed on its own.
+
+Fixed in `TerrainAwareGait.compute_swing_traj_and_touchdown`: solves for the `h_sw` that
+keeps clearance above the higher endpoint pinned at the original `HEIGHT_SWING`
+regardless of height difference -- `HEIGHT_SWING + |p0_z - pf_z| / 2` (reduces to exactly
+`HEIGHT_SWING` when flat). Gated by a new `terrain_swing_clearance` flag
+(`--terrain-swing-clearance`). Verified directly before trusting it: flat endpoints
+reproduce `HEIGHT_SWING` exactly; on a synthetic 5cm ascending step, the OLD fixed-h_sw
+trajectory's actual clearance above the higher endpoint came out to only 0.077m (not the
+intended 0.1m -- the bug is real, confirmed numerically, not just theorized), while the
+adaptive fix restores it to 0.1015m (within the expected small residual from the bump's
+peak shifting slightly off its nominal location once a linear height term is added).
+
+**Tested zero-residual, same paired-seed methodology as every other terrain check (64
+seeds, same terrain distribution), stacked on the adopted footstep-planning fix:**
+
+| variant | success | fall | qp_failed | ep_len_mean |
+|---|---|---|---|---|
+| terrain-aware-plan (z-only, adopted) | 0.719 | 0.016 | 0.266 | 1576 |
+| terrain-aware-plan + adaptive swing-clearance | 0.703 | 0.031 | 0.266 | 1589 |
+
+**Another wash** -- qp_failed identical, fall/success differ by exactly 1 episode out of
+64, within the same noise floor as the friction-cone and foothold-optimization checks.
+Closed as tested-but-not-adopted (`terrain_swing_clearance=False` stays default); code
+kept, correct and verified (this is a genuine bug fix, just not one that's a bottleneck
+at the terrain difficulty tested here). No regression:
+`verify_residual_interface.py` still gives 1.955 rad/s.
+
+**Status after three independently-tested terrain levers (friction-cone orientation,
+foothold optimization, swing-clearance height), all real/verified but none moving
+survival beyond the original footstep-planning fix's 0.719:** the remaining ~27%
+qp_failed rate doesn't appear to be explained by any of the geometric/force-orientation
+precision issues checked so far. The one terrain lever not yet tried is `fz_min`'s
+stance-force lower bound (world-z box constraint instead of the true-normal-aligned
+component) -- expected, by the same reasoning as the friction-cone result, to be a
+similarly small (~2% at these slope angles) effect, likely also inconclusive at this
+sample size. Given three consecutive clean-negative results, further incremental terrain
+levers in this style are likely near their ceiling; a bigger structural change (not yet
+scoped) would be needed to move past ~72% success on this terrain distribution.

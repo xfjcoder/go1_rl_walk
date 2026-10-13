@@ -108,6 +108,7 @@ def main():
     ap.add_argument("--terrain-footstep-planning", action="store_true")
     ap.add_argument("--terrain-friction-cone", action="store_true")
     ap.add_argument("--terrain-foothold-optimization", action="store_true")
+    ap.add_argument("--terrain-swing-clearance", action="store_true")
     ap.add_argument("--gait-style", type=str, default="trot",
                      choices=["trot", "pace", "bound", "walk"])
     args = ap.parse_args()
@@ -131,6 +132,7 @@ def main():
         terrain_footstep_planning=args.terrain_footstep_planning,
         terrain_friction_cone=args.terrain_friction_cone,
         terrain_foothold_optimization=args.terrain_foothold_optimization,
+        terrain_swing_clearance=args.terrain_swing_clearance,
         gait_style=args.gait_style,
     )
     max_steps = int(args.episode_seconds * 200)

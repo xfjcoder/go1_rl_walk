@@ -90,12 +90,26 @@ class TerrainAwareGait(Gait):
     `_best_foothold_xy`. Gated by its own flag (independent of the z-only fix above,
     which stays exactly reproducible with this off) since it's a separate, newer,
     less-tested lever.
+
+    `swing_clearance_adaptive`, off by default: `make_swing_trajectory`'s `h_sw` (swing
+    apex height) is added on top of a straight-LINE interpolation between takeoff and
+    touchdown, so the actual ground clearance above the HIGHER of the two endpoints is
+    `h_sw - |p0_z - pf_z| / 2`, not `h_sw` -- on flat ground the two z's are equal so
+    this is moot, but ascending a stair riser (touchdown higher than takeoff) shrinks the
+    true clearance over the step being climbed, the same "fixed clearance target" bug
+    the pure-RL stairs track already found and only partially fixed on its own. Fixed by
+    solving for the `h_sw` that keeps clearance above the higher endpoint fixed at the
+    original `HEIGHT_SWING` regardless of the height difference: `HEIGHT_SWING +
+    |p0_z - pf_z| / 2` (reduces to exactly `HEIGHT_SWING` when flat, i.e. bit-identical
+    to before when the two feet-height endpoints match).
     """
 
-    def __init__(self, frequency_hz, duty, terrain_height_fn, foothold_search=False):
+    def __init__(self, frequency_hz, duty, terrain_height_fn, foothold_search=False,
+                 swing_clearance_adaptive=False):
         super().__init__(frequency_hz, duty)
         self._terrain_height_fn = terrain_height_fn
         self._foothold_search = foothold_search
+        self._swing_clearance_adaptive = swing_clearance_adaptive
 
     def _best_foothold_xy(self, x_nom, y_nom):
         """Searches a small grid of candidate (x, y) offsets around the nominal Raibert
@@ -141,8 +155,12 @@ class TerrainAwareGait(Gait):
         pos_touchdown_world[2] = float(self._terrain_height_fn(
             pos_touchdown_world[0], pos_touchdown_world[1])) + 0.02
         foot_pos, _ = go2.get_single_foot_state_in_world(leg)
+        if self._swing_clearance_adaptive:
+            h_sw = HEIGHT_SWING + 0.5 * abs(foot_pos[2] - pos_touchdown_world[2])
+        else:
+            h_sw = HEIGHT_SWING
         traj = self.make_swing_trajectory(foot_pos, pos_touchdown_world,
-                                           self.swing_time, h_sw=HEIGHT_SWING)
+                                           self.swing_time, h_sw=h_sw)
         return traj, pos_touchdown_world
 
 
@@ -235,11 +253,11 @@ class StyledGait(TouchdownHeightMixin, GaitStyleMixin, Gait):
 
 class StyledTerrainAwareGait(TouchdownHeightMixin, GaitStyleMixin, TerrainAwareGait):
     def __init__(self, frequency_hz, duty, phase_offset, terrain_height_fn, touchdown_z_amplitude=0.0,
-                 foothold_search=False):
+                 foothold_search=False, swing_clearance_adaptive=False):
         self._phase_offset = np.asarray(phase_offset, dtype=float)
         self._touchdown_z_amplitude = touchdown_z_amplitude
         self._last_touchdown_query_time = 0.0
-        super().__init__(frequency_hz, duty, terrain_height_fn, foothold_search)
+        super().__init__(frequency_hz, duty, terrain_height_fn, foothold_search, swing_clearance_adaptive)
 
 
 class BoundAwareComTraj(ComTraj):
@@ -617,6 +635,13 @@ class MPCResidualEnv(gym.Env):
                                                # terrain_footstep_planning (needs the same terrain-
                                                # height function); a no-op otherwise. Default False
                                                # reproduces every prior variant's exact behavior.
+        terrain_swing_clearance: bool = False,  # make the swing-leg apex height adapt to the
+                                               # takeoff/touchdown height difference instead of a
+                                               # fixed HEIGHT_SWING -- see TerrainAwareGait.
+                                               # compute_swing_traj_and_touchdown. Requires
+                                               # terrain_footstep_planning; a no-op otherwise.
+                                               # Default False reproduces every prior variant's
+                                               # exact behavior.
         gait_style: str = "trot",             # one of GAIT_STYLE_PRESETS -- selects the
                                                # contact-schedule parametrization (trot/pace/
                                                # bound/walk), a classical, non-learned choice.
@@ -711,10 +736,12 @@ class MPCResidualEnv(gym.Env):
         # reproducible without this fix.
         self.terrain_footstep_planning = terrain_footstep_planning and self.terrain_enabled
         self.terrain_foothold_optimization = terrain_foothold_optimization and self.terrain_footstep_planning
+        self.terrain_swing_clearance = terrain_swing_clearance and self.terrain_footstep_planning
         phase_offset, gait_duty = GAIT_STYLE_PRESETS[self.gait_style]
         touchdown_z_amplitude = GAIT_STYLE_TOUCHDOWN_Z_AMPLITUDE[self.gait_style]
         self.gait = (StyledTerrainAwareGait(GAIT_HZ, gait_duty, phase_offset, self._terrain_height,
-                                             touchdown_z_amplitude, self.terrain_foothold_optimization)
+                                             touchdown_z_amplitude, self.terrain_foothold_optimization,
+                                             self.terrain_swing_clearance)
                      if self.terrain_footstep_planning else
                      StyledGait(GAIT_HZ, gait_duty, phase_offset, touchdown_z_amplitude))
         # Same late-binding safety as self._terrain_height above -- self._terrain_normal is

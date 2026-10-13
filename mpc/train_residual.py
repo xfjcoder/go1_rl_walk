@@ -124,6 +124,11 @@ def main():
                           "only correcting the nominal Raibert point's height (TerrainAwareGait."
                           "_best_foothold_xy in mpc_residual_env.py). Requires "
                           "--terrain-footstep-planning; a no-op otherwise.")
+    ap.add_argument("--terrain-swing-clearance", action="store_true",
+                     help="Make the swing-leg apex height adapt to the takeoff/touchdown height "
+                          "difference instead of a fixed HEIGHT_SWING (TerrainAwareGait."
+                          "compute_swing_traj_and_touchdown in mpc_residual_env.py). Requires "
+                          "--terrain-footstep-planning; a no-op otherwise.")
     ap.add_argument("--gait-style", type=str, default="trot",
                      choices=["trot", "pace", "bound", "walk"],
                      help="Contact-schedule parametrization MPC's Gait uses (GAIT_STYLE_PRESETS "
@@ -194,6 +199,7 @@ def main():
         terrain_footstep_planning=args.terrain_footstep_planning,
         terrain_friction_cone=args.terrain_friction_cone,
         terrain_foothold_optimization=args.terrain_foothold_optimization,
+        terrain_swing_clearance=args.terrain_swing_clearance,
         gait_style=args.gait_style,
     )
     with open(run_dir / "env_kwargs.json", "w") as f:

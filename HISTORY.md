@@ -2578,6 +2578,25 @@ swing leg to the right height at the nominal (x, y) -- remaining failures more l
 about plant TIMING or available stance FORCE than exactly where within a small radius a
 foot lands. See `mpc/README.md` for the full writeup.
 
+**Swing-leg clearance height, 2026-10-13 (user: "go ahead") -- verified a real bug,
+fixed it, another clean negative result.** `make_swing_trajectory`'s apex height is added
+on top of a straight-line interpolation, so true clearance above the higher of
+takeoff/touchdown is `h_sw - |height diff| / 2`, not `h_sw` -- moot flat, but shrinks real
+clearance ascending a stair riser (confirmed numerically: old fixed h_sw gave only 0.077m
+clearance on a synthetic 5cm step, not the intended 0.1m -- a real bug, not just
+theorized). Fixed by solving for the `h_sw` that keeps clearance pinned at `HEIGHT_SWING`
+regardless of height difference (`HEIGHT_SWING + |diff|/2`, exact no-op when flat).
+Gated by new `terrain_swing_clearance` flag. Tested zero-residual, same 64-paired-seed
+methodology, stacked on the footstep-planning fix: qp_failed IDENTICAL (0.266 both),
+fall/success differ by 1 episode out of 64 -- another wash, same pattern as friction-cone
+and foothold-optimization. Closed as tested-but-not-adopted (default off); code kept,
+correct and verified. **Three independently-tested terrain levers now closed negative**
+(friction-cone orientation, foothold optimization, swing-clearance height) without moving
+past the footstep-planning fix's 0.719 success -- further incremental levers in this
+style are likely near their ceiling; only `fz_min`'s stance-force bound remains
+untested, expected (by the same reasoning as friction-cone) to be a similarly small
+effect. See `mpc/README.md` for the full writeup.
+
 ## Next stages
 
 Terrain-aware observation and a non-trot gait mode were both tried already
