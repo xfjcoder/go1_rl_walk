@@ -38,7 +38,7 @@ from convex_mpc.centroidal_mpc import CentroidalMPC, COST_MATRIX_Q, MU, NU, NX
 from convex_mpc.com_trajectory import ComTraj
 from convex_mpc.gait import Gait, HEIGHT_SWING
 from convex_mpc.go2_robot_data import PinGo2Model
-from convex_mpc.leg_controller import LegController
+from convex_mpc.leg_controller import LEG_INDEX, LegController
 import convex_mpc.mujoco_model as mujoco_model_module
 from convex_mpc.mujoco_model import MuJoCo_GO2_Model
 import pinocchio as pin
@@ -137,15 +137,54 @@ class GaitStyleMixin:
         return (phases < self.gait_duty).astype(np.int32)
 
 
-class StyledGait(GaitStyleMixin, Gait):
-    def __init__(self, frequency_hz, duty, phase_offset):
+class TouchdownHeightMixin:
+    """Experimental lever for bound: ties gait.py's hardcoded touchdown z=0.02 (see
+    compute_touchdown_world_for_traj_purpose_only) to the same per-leg-pair phase used
+    for the contact schedule, instead of a flat constant regardless of where the body
+    is in its gait cycle. Independent of (and compatible with) GAIT_STYLE_PITCH_WEIGHT/
+    GAIT_STYLE_PITCH_AMPLITUDE above -- those change the COST reference; this changes
+    the PLANNED FOOT LEVER ARM fed into the predicted dynamics (Bd), which is the one
+    place pitch actually could have mattered for Bd (see note below) but doesn't
+    naturally, since compute_touchdown_world_for_traj_purpose_only only ever uses yaw
+    (go2.R_z is built from yaw alone, never roll/pitch -- confirmed directly:
+    go2_robot_data.py's R_z is cos/sin of `current_config.compute_euler_angle_world()[2]`
+    i.e. yaw only) and a hardcoded z. This mixin changes z only; it does NOT attempt to
+    route pitch into R_z (that would fight the controller's own yaw-only footstep-
+    placement design more broadly, well beyond bound).
+
+    compute_current_mask is called immediately before compute_touchdown_world_for_traj_
+    purpose_only for every leg in ComTraj.generate_traj's per-step loop (the only
+    caller), so caching the time there and reading it back here is reliable without
+    needing a time argument on the touchdown method itself (its signature is fixed by
+    the vendored Gait/TerrainAwareGait base classes)."""
+
+    def compute_current_mask(self, time):
+        self._last_touchdown_query_time = time
+        return super().compute_current_mask(time)
+
+    def compute_touchdown_world_for_traj_purpose_only(self, go2, leg):
+        pos = super().compute_touchdown_world_for_traj_purpose_only(go2, leg)
+        if self._touchdown_z_amplitude != 0.0:
+            leg_phase = self._phase_offset[LEG_INDEX[leg]]
+            phase = np.mod(leg_phase + self._last_touchdown_query_time / self.gait_period, 1.0)
+            pos = pos.copy()
+            pos[2] += self._touchdown_z_amplitude * np.sin(2.0 * np.pi * phase)
+        return pos
+
+
+class StyledGait(TouchdownHeightMixin, GaitStyleMixin, Gait):
+    def __init__(self, frequency_hz, duty, phase_offset, touchdown_z_amplitude=0.0):
         self._phase_offset = np.asarray(phase_offset, dtype=float)
+        self._touchdown_z_amplitude = touchdown_z_amplitude
+        self._last_touchdown_query_time = 0.0
         super().__init__(frequency_hz, duty)
 
 
-class StyledTerrainAwareGait(GaitStyleMixin, TerrainAwareGait):
-    def __init__(self, frequency_hz, duty, phase_offset, terrain_height_fn):
+class StyledTerrainAwareGait(TouchdownHeightMixin, GaitStyleMixin, TerrainAwareGait):
+    def __init__(self, frequency_hz, duty, phase_offset, terrain_height_fn, touchdown_z_amplitude=0.0):
         self._phase_offset = np.asarray(phase_offset, dtype=float)
+        self._touchdown_z_amplitude = touchdown_z_amplitude
+        self._last_touchdown_query_time = 0.0
         super().__init__(frequency_hz, duty, terrain_height_fn)
 
 
@@ -364,6 +403,18 @@ GAIT_STYLE_PITCH_AMPLITUDE = {
     "walk": 0.0,
 }
 
+# TouchdownHeightMixin lever: ties gait.py's hardcoded touchdown z=0.02 to each leg
+# pair's own phase instead of a flat constant. 0.0 for every style until swept for
+# bound (see mpc/README.md); kept as a separate dict since it's an independent,
+# orthogonal lever from the two above (changes the predicted foot lever arm fed into
+# Bd, not the QP's cost reference).
+GAIT_STYLE_TOUCHDOWN_Z_AMPLITUDE = {
+    "trot": 0.0,
+    "pace": 0.0,
+    "bound": 0.0,
+    "walk": 0.0,
+}
+
 
 class CostOverrideMixin:
     """Rebuilds the QP's Hessian/solver with a different state-cost weight matrix than
@@ -547,9 +598,11 @@ class MPCResidualEnv(gym.Env):
         # reproducible without this fix.
         self.terrain_footstep_planning = terrain_footstep_planning and self.terrain_enabled
         phase_offset, gait_duty = GAIT_STYLE_PRESETS[self.gait_style]
-        self.gait = (StyledTerrainAwareGait(GAIT_HZ, gait_duty, phase_offset, self._terrain_height)
+        touchdown_z_amplitude = GAIT_STYLE_TOUCHDOWN_Z_AMPLITUDE[self.gait_style]
+        self.gait = (StyledTerrainAwareGait(GAIT_HZ, gait_duty, phase_offset, self._terrain_height,
+                                             touchdown_z_amplitude)
                      if self.terrain_footstep_planning else
-                     StyledGait(GAIT_HZ, gait_duty, phase_offset))
+                     StyledGait(GAIT_HZ, gait_duty, phase_offset, touchdown_z_amplitude))
         # Same late-binding safety as self._terrain_height above -- self._terrain_normal is
         # a bound method, only ever called from solve_QP() well after _generate_terrain has run.
         self.terrain_friction_cone = terrain_friction_cone and self.terrain_enabled

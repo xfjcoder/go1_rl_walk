@@ -630,12 +630,59 @@ noise at this sample size (0.21->0.23, a 1-episode difference out of 48).
 **Adopted: weight=1, amplitude=+0.3** (both best-found values) as `gait_style="bound"`'s
 default -- a real, verified, non-placebo improvement over the original broken bound
 (6%->23% success, 94%->75% qp_failed), but **bound remains far from viable** compared to
-trot/pace/walk's 90-96%. The likely reason cost-side levers alone cap out here: the
-predicted-dynamics model (Ad/Bd, built from foot lever arms computed assuming flat
-pitch) is still internally inconsistent with the nonzero pitch the cost now asks for --
-fixing that would mean re-deriving `generate_traj`'s internal loop for a
-pitch-consistent prediction, or giving bound a genuine vertical-bounce/flight-phase
-reference the way MIT Cheetah 3 does, both materially bigger undertakings than either
-lever tried here. Not attempted further; `gait_style="bound"` is usable (noticeably
-better than before) but should not be treated as production-ready the way trot/pace/walk
-are.
+trot/pace/walk's 90-96%.
+
+**Follow-up investigation: is the Ad/Bd dynamics-model inconsistency actually fixable?**
+(user: "let's try to fix bound issues first".) The paragraph above originally guessed the
+remaining gap was the predicted-dynamics model (Ad/Bd, built from foot lever arms) still
+assuming flat pitch while the cost targets a sinusoid, and that fixing it would need
+duplicating `generate_traj` wholesale to inject the pitch reference before its internal
+per-step FK loop runs instead of patching it after. Implemented that duplication
+(`BoundAwareComTraj.generate_traj` rewritten to set the sinusoidal pitch reference before
+the loop) and verified directly: **Ad/Bd come out bit-identical whether pitch is injected
+before or after the loop.** Root cause: `gait.py`'s
+`compute_touchdown_world_for_traj_purpose_only` (the only place foot lever arms are
+derived) rotates the hip offset with `go2.R_z` -- a yaw-ONLY rotation matrix
+(`go2_robot_data.py`: `R_z` is built from `compute_euler_angle_world()[2]`, i.e. yaw,
+never roll/pitch) -- and uses a hardcoded touchdown height (`0.02`). Pitch structurally
+never reaches Bd through this path, by the vendored controller's own design, regardless
+of injection order. This isn't a bug to fix -- it rules out "dynamics-model
+pitch-consistency" as a lever entirely; reverted the duplicated code (zero behavioral
+difference, not worth the duplication).
+
+**Lever 3 (ruled out): tie the hardcoded touchdown height to gait phase.** Since pitch
+can't reach Bd via rotation, the only remaining path into the foot-lever-arm/Bd
+computation is the z-component of the touchdown point itself (hardcoded to a flat
+`0.02`). Added `TouchdownHeightMixin` (`mpc_residual_env.py`) to nudge it by
+`amplitude * sin(2*pi*phase)`, phase-tied to each leg pair's own contact-schedule offset,
+independent of (and compatible with) the two cost-side levers above. Swept on top of the
+adopted weight=1/amplitude=+0.3 defaults:
+
+| touchdown-z amplitude (m) | 0 (baseline) | +0.02 | -0.02 | +0.05 | -0.05 |
+|---|---|---|---|---|---|
+| success | 0.19 | 0.15 | 0.17 | 0.19 | 0.21 |
+| fall | 0.08 | 0.04 | 0.04 | 0.04 | 0.06 |
+| qp_failed | 0.73 | 0.81 | 0.79 | 0.77 | 0.73 |
+| ep_len_mean | 996 | 952 | 977 | 949 | 1035 |
+
+No real signal -- every point is within one episode (~0.02) of baseline, the same noise
+floor the amplitude sweep above already flagged as inconclusive. Kept
+`GAIT_STYLE_TOUCHDOWN_Z_AMPLITUDE["bound"] = 0.0` (not adopted); the mixin itself is kept
+in place (documented, harmless at amplitude 0) in case a future, better-targeted use for
+it turns up.
+
+(Note: re-measuring the adopted weight=1/amplitude=+0.3 baseline with this sweep's own
+script gives success=0.19, not the 0.23 in the table above -- confirmed this is a
+methodology difference between sweep scripts, not a regression, by running the exact
+committed baseline (`git show bf551be`) through the same script and getting the
+identical 0.19. The original Lever 2 table and this one are each internally consistent;
+they're just not directly comparable to each other episode-for-episode.)
+
+**Conclusion:** cost-side and footstep-height levers are exhausted for bound; none of
+them touch the actual missing piece, which is that the QP is a purely instantaneous
+force-balance controller being asked to run a 2-legs-only support gait with no
+vertical-bounce/flight-phase model at all. A real fix needs either a genuine
+flight-phase reference trajectory the way MIT Cheetah 3 does (materially bigger
+undertaking, not attempted), or accepting bound stays experimental.
+`gait_style="bound"` is usable (noticeably better than the original broken version) but
+should not be treated as production-ready the way trot/pace/walk are.

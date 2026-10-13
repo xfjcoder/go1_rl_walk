@@ -2519,11 +2519,24 @@ unambiguously the wrong sign (catastrophic as magnitude grows, falls almost imme
 -0.3); positive is safe and clearly helps episode length (783->1069 steps) but only marginally
 improves full-episode success (0.21->**0.23**, not clearly beyond noise at n=48). **Adopted:
 weight=1, amplitude=+0.3 -- a real, verified improvement (6%->23% success, 94%->75% qp_failed)
-but still far from trot/pace/walk's 90-96%.** The likely remaining cause: the dynamics model is
-internally inconsistent with the nonzero pitch the cost now targets; a full fix needs either a
-pitch-consistent dynamics rederivation or a genuine flight-phase/vertical-bounce reference (MIT
-Cheetah 3's approach) -- both materially bigger than either lever tried. `gait_style="bound"` is
-noticeably better than before but not production-ready like the other three styles.
+but still far from trot/pace/walk's 90-96%.**
+
+**Follow-up (user: "let's try to fix bound issues first") -- tested whether the guessed
+Ad/Bd dynamics-model inconsistency was actually fixable, and ruled it out.** Duplicated
+`generate_traj` to inject the pitch reference before its internal foot-lever-arm loop
+instead of after; Ad/Bd came out bit-identical either way. Root cause: `gait.py`'s
+touchdown-prediction rotates the hip offset with a yaw-ONLY `R_z` and uses a hardcoded
+touchdown height -- pitch structurally never reaches Bd through this path, regardless of
+injection order. Reverted the duplication (zero behavioral difference). Tried one more
+lever reachable through the same code path: tying the hardcoded touchdown *height* to gait
+phase (`TouchdownHeightMixin`), swept amplitude 0/+-0.02/+-0.05 m on top of weight=1/
+amplitude=+0.3 -> success 0.19/0.15/0.17/0.19/0.21, all within noise of baseline. Not
+adopted (kept at 0.0). Cost-side and footstep-height levers are now exhausted; the real
+remaining gap is architectural -- the QP has no vertical-bounce/flight-phase model at all,
+and fixing that for real needs a genuine flight-phase reference trajectory (MIT Cheetah
+3's approach), a materially bigger undertaking than any lever tried so far.
+`gait_style="bound"` is noticeably better than before but not production-ready like the
+other three styles. See `mpc/README.md` for the full writeup.
 
 ## Next stages
 
