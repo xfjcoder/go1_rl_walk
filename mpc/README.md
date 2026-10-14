@@ -856,6 +856,15 @@ sample size. Given three consecutive clean-negative results, further incremental
 levers in this style are likely near their ceiling; a bigger structural change (not yet
 scoped) would be needed to move past ~72% success on this terrain distribution.
 
+**DECISION (user, 2026-10-13): stop here.** Terrain is accepted at the footstep-planning
+fix's 0.719 success / ~72%, without chasing `fz_min` or a bigger structural redesign.
+`terrain_footstep_planning=True` (z-only touchdown correction) remains the one adopted
+terrain improvement; `terrain_friction_cone`, `terrain_foothold_optimization`, and
+`terrain_swing_clearance` all stay implemented, verified, and available (flags default
+off) but not adopted. Same closing treatment as every other accepted limit in this
+project (ascending stairs, sim-to-real latency, flight-phase top speed): a documented
+boundary, not an open bug.
+
 ## Bound stand-height sweep: a decisive negative result, in the wrong direction
 
 User hypothesis: is bound's elevated qp_failed rate (94%->73% after the pitch/cost fixes,

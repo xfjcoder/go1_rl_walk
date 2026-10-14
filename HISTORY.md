@@ -2613,6 +2613,18 @@ remains closed, now with four independently-tested levers (pitch/cost fixes part
 adopted; flight-phase/vertical-bounce, touchdown-height-phase-tie, and stand-height all
 ruled out) absent a genuinely new idea. See `mpc/README.md` for the full writeup.
 
+**DECISION (user: "let's stop here and accept terrain at 0.719"), 2026-10-13: terrain
+track closed.** After four consecutive negative/wash results across bound and terrain
+levers (bound's three flight-phase pieces, foothold optimization, swing-clearance height,
+and the stand-height sweep above), stopping rather than chasing `fz_min` or scoping a
+bigger structural redesign. `terrain_footstep_planning=True` (the z-only touchdown
+correction) remains the sole adopted terrain improvement, at 0.719 success / ~72% on the
+tested terrain distribution. Every other terrain/bound lever built this stage
+(`terrain_friction_cone`, `terrain_foothold_optimization`, `terrain_swing_clearance`,
+bound's pitch/cost fixes, height/touchdown-phase mixins) stays in the codebase, verified
+and default-off, as reusable infrastructure -- same accepted-limit treatment as ascending
+stairs, sim-to-real latency, and flight-phase top speed earlier in this project.
+
 ## Next stages
 
 Terrain-aware observation and a non-trot gait mode were both tried already
