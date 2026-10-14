@@ -1030,9 +1030,16 @@ class MPCResidualEnv(gym.Env):
         terminated = bool(fell or qp_failed)
         truncated = bool(self._ctrl_i >= self.ctrl_steps)
 
+        # base_pos/yaw: same keys/shape envs/go1_env.py's own info dict already exposes, added so
+        # navigate.py's existing compute_nav_command() outer loop (world position + heading each
+        # step) works against this env unmodified -- yaw via the identical formula _local_heightmap
+        # already uses elsewhere in this file (MuJoCo's own qpos quat order is w,x,y,z here).
+        qw, qx, qy, qz = self.mujoco_go2.data.qpos[3:7]
+        yaw = float(np.arctan2(2 * (qw * qz + qx * qy), 1 - 2 * (qy ** 2 + qz ** 2)))
         info = {
             "base_height": base_height, "roll": roll, "pitch": pitch, "qp_failed": qp_failed,
             "v_body": v_body.copy(), "w_body": w_body.copy(),
+            "base_pos": self.mujoco_go2.data.qpos[0:2].copy(), "yaw": yaw,
             # Same key ("reward_components") and flat-dict-of-floats shape train.py's own
             # RewardComponentLoggingCallback already expects, so it's reusable unmodified here.
             "reward_components": {
@@ -1040,3 +1047,10 @@ class MPCResidualEnv(gym.Env):
             },
         }
         return obs, float(reward), terminated, truncated, info
+
+    def set_command(self, target_speed: float, target_lateral: float = 0.0) -> None:
+        """Overwrite the commanded forward/lateral velocity directly, bypassing reset()'s own
+        per-episode randomization -- mirrors envs/go1_env.py's own set_command exactly (same name/
+        signature), so navigate.py's outer loop can drive either env interchangeably."""
+        self.target_speed = float(target_speed)
+        self.target_lateral = float(target_lateral)

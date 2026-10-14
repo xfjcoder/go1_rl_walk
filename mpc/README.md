@@ -903,3 +903,80 @@ still gives 1.955 rad/s.
 Bound-gait investigation remains closed (now four independently-tested levers --
 pitch/cost fixes partially adopted, flight-phase/vertical-bounce ruled out, touchdown-
 height-phase-tie ruled out, stand-height ruled out) absent a genuinely new idea.
+
+## MPC-based navigation: a real, favorable trade-off against the RL nav stack
+
+With both Stage 11 tracks (bound, terrain) closed, user asked whether MPC-based point-to-
+goal navigation had been tried (it hadn't -- every nav mechanism in this project, Stage
+10a/10b and its three follow-up extensions, was built on top of the RL policies
+`go2_gaitclock`/`go2_latback`, never on `MPCResidualEnv`). The plumbing lines up directly:
+this env already exposes the same `target_speed`/`target_lateral` pair `navigate.py`'s
+`set_command()`/`compute_nav_command()` outer loop drives, so the experiment is a port, not
+a new navigation stack -- `navigate.py`'s own proportional goal-attraction steering law is
+reused completely unmodified (imported directly, not duplicated).
+
+Added to `mpc_residual_env.py` (both minimal, additive, no behavior change otherwise):
+`info["base_pos"]`/`info["yaw"]` (same keys/shape `envs/go1_env.py`'s own info dict already
+exposes, computed from `data.qpos` via the identical quaternion-to-yaw formula
+`_local_heightmap` already uses elsewhere in this file) and `set_command(target_speed,
+target_lateral)` (mirrors `envs/go1_env.py`'s own method name/signature exactly, so
+`navigate.py`'s loop can drive either env interchangeably). New `mpc/navigate_mpc.py`
+(single-episode demo + GIF, mirrors `navigate.py`'s CLI) and `mpc/eval_navigate_mpc.py`
+(randomized multi-episode harness, mirrors `eval_navigate.py`'s metrics, single-process
+sequential episodes like `eval_residual.py` -- env construction cost, not worth
+SubprocVecEnv's complexity for a one-off harness). Zero RL residual throughout
+(`action=zeros(12)`) -- this tests pure classical-controller navigation.
+
+**Found and fixed a real compatibility gap before trusting any result**: `compute_nav_command()`
+recomputes the command every control tick (200Hz here, continuously decreasing as the goal
+nears) -- a regime this env's own zero-residual eval harness never exercises (always one
+FIXED command for a whole episode). Confirmed directly: the exact same (forward=0.8,
+lateral=0.3) combo that runs a clean full 10s episode on 4 of 5 seeds under a flat FIXED
+command caused a genuine QP infeasibility (not a fall) partway through 4 of 8 navigation
+seeds tested with the raw, un-rate-limited nav command -- the classical controller's
+receding-horizon dynamics prediction assumes an approximately constant commanded velocity
+over its own horizon, and degrades under a command that keeps shifting tick to tick. Fixed
+with a simple acceleration-rate limiter on the forward/lateral command before
+`set_command()` (`--max-accel`, default 1.5 m/s^2 -- real robot navigation stacks apply
+exactly this kind of limit on a velocity reference, for the same reason). Verified: the
+same 8 seeds (4 of which failed unlimited) all ran clean with the limiter active, final
+distance 0.025-0.028m.
+
+**Result (32 episodes, flat ground, goal distance 1.5-4m, bearing 0-360deg -- identical
+methodology to `go2_latback`'s own documented Stage 10a numbers):**
+
+| | success | fall | qp_failed | time-to-goal | path efficiency |
+|---|---|---|---|---|---|
+| `go2_latback` (RL nav, from HISTORY.md) | 1.00 | 0.00 | -- | 9.6s | 0.65 |
+| MPC nav (`--max-accel 1.5`) | 0.88 | 0.12 | 0.12 | 5.2s | 0.99 |
+| MPC nav (`--max-accel 1.0`) | 0.88 | 0.12 | 0.12 | 5.3s | 0.99 |
+
+**A genuine trade-off, not a strict win or loss.** MPC navigation is almost twice as fast to
+the goal (5.2s vs 9.6s) and travels an almost perfectly direct path (0.99 vs 0.65) --
+directly explained by the base controller's own much tighter speed/lateral tracking (already
+established: ~0.98 tracking accuracy on all 3 command axes at a fixed command, vs RL's own
+known gait/drift quirks under combined commands). But it's less reliable: 12% of episodes end
+in a genuine QP infeasibility (zero physical falls -- `fall_rate` and `qp_failed_rate` are
+exactly equal here, confirming every termination was a classical-solver failure, not a tip-
+over). Halving the rate limiter (1.5 -> 1.0 m/s^2) gave an **identical** result -- rules out
+"just tune the ramp rate further" as the fix; this is a genuine harder corner (plausibly:
+navigation's full 360-degree bearing coverage, including sustained near-max-lateral or
+backward commands while far from a goal, exercises the same kind of combined-command QP
+corner flagged from the very first terrain-extension work, not something specific to
+navigation's command-generation).
+
+Demo (wide free-camera shot, goal at (3.0, 1.5), reached in 4.0s):
+
+<p align="center">
+  <img src="../media/mpc_navigate_demo.gif" width="480" alt="MPC-based navigation, zero RL residual, driving toward a world-frame goal using navigate.py's own steering law">
+</p>
+
+No regression: `verify_residual_interface.py` still gives 1.955 rad/s.
+
+**Not attempted here (deliberately, to keep this a cheap first pass)**: obstacle avoidance
+(`MPCResidualEnv` has no `nav_obstacles` injection mechanism, unlike `Go1FlatEnv` -- would
+need porting that XML-injection machinery first) and a turn-to-face steering law using
+`target_yaw_rate` (this experiment deliberately reused `compute_nav_command()` UNCHANGED --
+speed+lateral only -- for an apples-to-apples test of low-level tracking quality alone; a
+real turn-to-face law is the natural next step to actually exercise MPC's working yaw-rate
+capability, which RL's own navigation can't use at all per Stage 10c).

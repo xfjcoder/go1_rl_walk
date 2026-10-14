@@ -2625,6 +2625,35 @@ bound's pitch/cost fixes, height/touchdown-phase mixins) stays in the codebase, 
 and default-off, as reusable infrastructure -- same accepted-limit treatment as ascending
 stairs, sim-to-real latency, and flight-phase top speed earlier in this project.
 
+**MPC-based navigation, 2026-10-13 (user: "did we try mpc based navigation?") -- a real,
+favorable trade-off against the RL nav stack.** Every prior navigation mechanism (Stage
+10a/10b and its 3 follow-up extensions) was built on `go2_gaitclock`/`go2_latback`, never
+on `MPCResidualEnv` -- but the plumbing lines up directly (same `target_speed`/
+`target_lateral` pair `navigate.py`'s steering law already drives), so this was a port, not
+a new stack. Added `info["base_pos"]`/`info["yaw"]` and `set_command()` to
+`mpc_residual_env.py` (mirrors `envs/go1_env.py`'s own info keys/method exactly); new
+`mpc/navigate_mpc.py` + `mpc/eval_navigate_mpc.py` reuse `navigate.py`'s
+`compute_nav_command()` completely unmodified, zero RL residual throughout.
+
+**Found and fixed a real compatibility gap first**: a continuously-recomputed, decreasing
+goal-seeking command (this env's own eval harness only ever tests ONE fixed command per
+episode) caused genuine QP infeasibility on 4 of 8 test seeds -- confirmed the exact same
+command combo runs clean under a FIXED command. Fixed with a simple acceleration-rate
+limiter (`--max-accel`, default 1.5 m/s^2) before `set_command()`, verified fixing all 8
+seeds. **Result (32 episodes, flat ground, identical methodology to go2_latback's own
+numbers)**: MPC nav success=0.88/fall=0.12/time-to-goal=5.2s/path_efficiency=0.99 vs RL
+nav's 1.00/0.00/9.6s/0.65. Halving the rate limiter (1.5->1.0 m/s^2) gave an IDENTICAL
+result, ruling out "just tune the ramp further" -- the 12% is a genuine harder QP corner
+(all QP-infeasibility, zero physical falls), not a rate-limiter artifact. **A genuine
+trade-off**: MPC navigates almost twice as fast and nearly perfectly directly (0.99 vs
+0.65 path efficiency, from its own much tighter low-level velocity tracking), at the cost
+of a real 12% reliability gap RL's navigation doesn't have. Demo:
+`media/mpc_navigate_demo.gif`. Not attempted: obstacle avoidance (no `nav_obstacles`
+mechanism exists on this env) or a turn-to-face steering law exploiting MPC's actually-
+working yaw-rate command (this pass deliberately reused the unmodified speed+lateral-only
+steering law for an apples-to-apples low-level-tracking comparison). See `mpc/README.md`
+for the full writeup.
+
 ## Next stages
 
 Terrain-aware observation and a non-trot gait mode were both tried already
