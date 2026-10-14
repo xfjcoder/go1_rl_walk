@@ -942,6 +942,10 @@ exactly this kind of limit on a velocity reference, for the same reason). Verifi
 same 8 seeds (4 of which failed unlimited) all ran clean with the limiter active, final
 distance 0.025-0.028m.
 
+<p align="center">
+  <img src="../media/mpc_navigate_unratelimited_qpfail.gif" width="400" alt="The un-rate-limited bug reproduced: a continuously-recomputed nav command drives the QP infeasible mid-episode">
+</p>
+
 **Result (32 episodes, flat ground, goal distance 1.5-4m, bearing 0-360deg -- identical
 methodology to `go2_latback`'s own documented Stage 10a numbers):**
 
@@ -973,10 +977,55 @@ Demo (wide free-camera shot, goal at (3.0, 1.5), reached in 4.0s):
 
 No regression: `verify_residual_interface.py` still gives 1.955 rad/s.
 
-**Not attempted here (deliberately, to keep this a cheap first pass)**: obstacle avoidance
+**Not attempted in this first pass (deliberately, to keep it cheap)**: obstacle avoidance
 (`MPCResidualEnv` has no `nav_obstacles` injection mechanism, unlike `Go1FlatEnv` -- would
-need porting that XML-injection machinery first) and a turn-to-face steering law using
-`target_yaw_rate` (this experiment deliberately reused `compute_nav_command()` UNCHANGED --
-speed+lateral only -- for an apples-to-apples test of low-level tracking quality alone; a
-real turn-to-face law is the natural next step to actually exercise MPC's working yaw-rate
-capability, which RL's own navigation can't use at all per Stage 10c).
+need porting that XML-injection machinery first).
+
+## Turn-to-face steering: exercising MPC's actually-working yaw-rate, a clean win
+
+User asked directly: "did we try turn involved navigation with mpc?" -- not yet; the pass
+above deliberately reused `compute_nav_command()` unmodified (speed+lateral/crab only) for
+an apples-to-apples low-level-tracking comparison. This follow-up builds the natural next
+steering law: rotate to face the goal bearing (commanded yaw-rate proportional to heading
+error), drive forward at a speed tapered by `cos(heading_err)` (floored at 0 -- turns
+around instead of ever driving backward), never using the lateral command at all. RL's own
+navigation (`envs/go1_env.py`) has no equivalent available -- Stage 10c found RL never
+learned to sustain a commanded turn, so its navigation is strafe-only by necessity, not
+choice.
+
+Added `compute_nav_command_turn()` to `mpc/navigate_mpc.py` (new, MPC-only -- left out of
+the shared `navigate.py` since only this controller can actually use it) and a
+`--steering {strafe,turn}` flag threaded through both `navigate_mpc.py` and
+`eval_navigate_mpc.py` (default `strafe` reproduces the exact prior behavior/results
+above). Extended `MPCResidualEnv.set_command()` with an additive third `target_yaw_rate`
+argument (default 0.0, so every existing two-argument call stays identical). Same
+rate-limiting fix applied to the yaw-rate command too (`--max-yaw-accel`, default 3
+rad/s^2) -- a continuously-recomputed yaw-rate command is exactly the same kind of
+tick-to-tick-shifting regime that broke the QP for the strafe case.
+
+**Result (32 episodes, identical flat-ground methodology):**
+
+| steering | success | fall | qp_failed | time-to-goal | path efficiency |
+|---|---|---|---|---|---|
+| `go2_latback` (RL nav) | 1.00 | 0.00 | -- | 9.6s | 0.65 |
+| MPC, strafe (speed+lateral only) | 0.88 | 0.12 | 0.12 | 5.2s | 0.99 |
+| **MPC, turn (turn-to-face + drive)** | **1.00** | **0.00** | **0.00** | **4.8s** | **0.97** |
+
+**A clean win, not another trade-off**: turn-to-face steering matches RL navigation's
+perfect reliability (0% falls, 0% QP failures across all 32 episodes) while staying almost
+twice as fast (4.8s vs 9.6s) and nearly as direct as the strafe variant (0.97 vs 0.99 --
+the small dip is the turning motion itself adding a little arc before the robot is
+pointed at the goal). This strongly supports the working theory for strafe-mode's 12%
+failure rate: it's specifically the SUSTAINED large LATERAL command (a genuinely harder
+regime for this quadrotor-style SRBD controller than forward walking) that drove the QP
+into infeasibility, not navigation's continuously-changing commands in general -- turning
+to reduce the required lateral authority to near-zero removes the failure mode entirely.
+No regression: `verify_residual_interface.py` still gives 1.955 rad/s.
+
+<p align="center">
+  <img src="../media/mpc_navigate_turn_demo.gif" width="480" alt="Turn-to-face MPC navigation: rotates toward a goal behind/beside the robot, then drives forward">
+</p>
+
+Not attempted: obstacle avoidance combined with turning (same missing `nav_obstacles`
+mechanism as above), and tuning `kp_yaw`/`--max-yaw-accel` further (the first values tried
+already gave a clean sweep, so there was no motivating failure to chase).

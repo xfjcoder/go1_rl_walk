@@ -28,9 +28,18 @@ stacks apply exactly this kind of acceleration limit on a velocity reference for
 Verified directly: the same 8 seeds that included 4 QP-infeasibility failures all ran clean with
 the rate limiter active (final distance 0.025-0.028m, well within tolerance).
 
+`--steering turn` is the turn-to-face follow-up flagged above: rotate to face the goal bearing
+(commanded yaw-rate, proportional to heading error) while driving forward at a speed tapered by
+how well-aligned the heading already is (`cos(heading_err)`, clipped to >=0 -- never drives
+backward, just turns around instead) -- the capability `--steering strafe` (the default, exactly
+reproducing the original compute_nav_command()-based behavior) deliberately leaves unused. Same
+rate-limiting fix applied to the yaw-rate command too (`--max-yaw-accel`), for the identical reason
+(a continuously-recomputed command destabilizes this env's QP -- see above).
+
 Usage:
     python3 navigate_mpc.py --goal-x 3.0 --goal-y 1.0 --record out.gif
     python3 navigate_mpc.py --goal-x 4.0 --goal-y 0.0 --terrain-amplitude 0.08 --record out.gif
+    python3 navigate_mpc.py --goal-x 3.0 --goal-y -2.0 --steering turn --record turn.gif
 """
 import argparse
 import os
@@ -47,6 +56,24 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from mpc_residual_env import MPCResidualEnv
 from navigate import compute_nav_command
+
+
+def compute_nav_command_turn(x, y, yaw, goal_x, goal_y, kp_fwd, kp_yaw, speed_lo, speed_hi,
+                              yaw_lo, yaw_hi):
+    """Turn-to-face steering: command a yaw-rate proportional to the heading error toward the
+    goal bearing, and a forward speed tapered by how well-aligned the heading already is
+    (cos(heading_err), floored at 0 -- never drives backward, turns around instead). Unlike
+    compute_nav_command's strafe/crab law (reused unmodified for --steering strafe), this
+    exercises the MPC base controller's actually-working yaw-rate tracking -- RL's own
+    navigation (envs/go1_env.py) has no equivalent, since Stage 10c found RL never learned to
+    sustain a commanded turn."""
+    dx, dy = goal_x - x, goal_y - y
+    dist = float(np.hypot(dx, dy))
+    heading_err = float(np.arctan2(dy, dx)) - yaw
+    heading_err = (heading_err + np.pi) % (2 * np.pi) - np.pi   # wrap to [-pi, pi]
+    yaw_cmd = float(np.clip(kp_yaw * heading_err, yaw_lo, yaw_hi))
+    fwd_cmd = float(np.clip(kp_fwd * dist, speed_lo, speed_hi) * max(0.0, np.cos(heading_err)))
+    return fwd_cmd, yaw_cmd
 
 
 def main():
@@ -66,6 +93,17 @@ def main():
                          help="m/s^2: rate-limits the forward/lateral command before set_command "
                               "-- see module docstring, this env's QP goes infeasible under raw "
                               "step changes in a dynamically-recomputed goal-seeking command.")
+    parser.add_argument("--steering", choices=["strafe", "turn"], default="strafe",
+                         help="strafe (default): compute_nav_command's original speed+lateral "
+                              "crab law, no yaw-rate used. turn: turn-to-face the goal bearing "
+                              "then drive forward, exercising MPC's working yaw-rate tracking.")
+    parser.add_argument("--kp-yaw", type=float, default=2.0,
+                         help="Only used with --steering turn: commanded yaw-rate (rad/s) per "
+                              "radian of heading error.")
+    parser.add_argument("--yaw-rate-range", type=float, nargs=2, default=[-1.5, 1.5])
+    parser.add_argument("--max-yaw-accel", type=float, default=3.0,
+                         help="rad/s^2: rate-limits the yaw-rate command, same reason as "
+                              "--max-accel. Only used with --steering turn.")
     parser.add_argument("--seconds", type=float, default=25.0)
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--terrain-amplitude", type=float, default=None,
@@ -96,14 +134,16 @@ def main():
     obs, _ = env.reset(seed=args.seed)
     speed_lo, speed_hi = args.speed_range
     lat_lo, lat_hi = args.lateral_range
+    yaw_lo, yaw_hi = args.yaw_rate_range
     max_cmd_delta = args.max_accel / 200.0   # this env's CTRL_HZ is 200, not go1_env's 50
+    max_yaw_delta = args.max_yaw_accel / 200.0
 
     max_steps = int(args.seconds * 200)
     n_wp = len(route)
     current_idx = 0
     goal = route[current_idx]
     x, y, yaw = 0.0, 0.0, 0.0
-    cur_fwd, cur_lat = 0.0, 0.0
+    cur_fwd, cur_lat, cur_yaw = 0.0, 0.0, 0.0
     frames = []
     reached, fell = False, False
     t_reached = None
@@ -135,11 +175,21 @@ def main():
                 goal = route[current_idx]
                 just_arrived_idx = None
 
-        target_fwd, target_lat = (0.0, 0.0) if reached else compute_nav_command(
-            x, y, yaw, goal[0], goal[1], [], args.kp, speed_lo, speed_hi, lat_lo, lat_hi)
+        if reached:
+            target_fwd, target_lat, target_yaw = 0.0, 0.0, 0.0
+        elif args.steering == "turn":
+            target_fwd, target_yaw = compute_nav_command_turn(
+                x, y, yaw, goal[0], goal[1], args.kp, args.kp_yaw, speed_lo, speed_hi,
+                yaw_lo, yaw_hi)
+            target_lat = 0.0
+        else:
+            target_fwd, target_lat = compute_nav_command(
+                x, y, yaw, goal[0], goal[1], [], args.kp, speed_lo, speed_hi, lat_lo, lat_hi)
+            target_yaw = 0.0
         cur_fwd += np.clip(target_fwd - cur_fwd, -max_cmd_delta, max_cmd_delta)
         cur_lat += np.clip(target_lat - cur_lat, -max_cmd_delta, max_cmd_delta)
-        env.set_command(cur_fwd, cur_lat)
+        cur_yaw += np.clip(target_yaw - cur_yaw, -max_yaw_delta, max_yaw_delta)
+        env.set_command(cur_fwd, cur_lat, cur_yaw)
 
         obs, _, terminated, truncated, info = env.step(np.zeros(12, dtype=np.float32))
         x, y = float(info["base_pos"][0]), float(info["base_pos"][1])

@@ -2654,6 +2654,24 @@ working yaw-rate command (this pass deliberately reused the unmodified speed+lat
 steering law for an apples-to-apples low-level-tracking comparison). See `mpc/README.md`
 for the full writeup.
 
+**Turn-to-face steering, 2026-10-13 (user: "did we try turn involved navigation with mpc?")
+-- a clean win, not another trade-off.** Built the natural follow-up flagged above:
+`compute_nav_command_turn()` (new, in `mpc/navigate_mpc.py` -- MPC-only, left out of the
+shared `navigate.py` since RL's own navigation has no working yaw-rate to drive) rotates to
+face the goal bearing and drives forward tapered by `cos(heading_err)`, never using the
+lateral command. Extended `MPCResidualEnv.set_command()` with an additive
+`target_yaw_rate` argument (default 0.0, every existing 2-arg call unchanged) and applied
+the same rate-limiting fix to the yaw-rate command (`--max-yaw-accel`). **Result (32
+episodes, identical flat-ground methodology)**: success=1.00/fall=0.00/qp_failed=0.00/
+time-to-goal=4.8s/path_efficiency=0.97 -- matches RL navigation's perfect reliability
+while staying almost twice as fast, and barely behind the strafe variant's own path
+efficiency. Strongly supports a specific root cause for strafe-mode's 12% failure rate: a
+sustained large LATERAL command specifically (not navigation's changing commands in
+general) is the harder regime for this SRBD controller -- turning to remove that need
+eliminates the failure mode entirely. Demos: `media/mpc_navigate_turn_demo.gif` (clean
+turn-and-drive) and `media/mpc_navigate_unratelimited_qpfail.gif` (the un-rate-limited bug
+reproduced for illustration). See `mpc/README.md` for the full writeup.
+
 ## Next stages
 
 Terrain-aware observation and a non-trot gait mode were both tried already

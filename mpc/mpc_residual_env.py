@@ -1048,9 +1048,15 @@ class MPCResidualEnv(gym.Env):
         }
         return obs, float(reward), terminated, truncated, info
 
-    def set_command(self, target_speed: float, target_lateral: float = 0.0) -> None:
-        """Overwrite the commanded forward/lateral velocity directly, bypassing reset()'s own
-        per-episode randomization -- mirrors envs/go1_env.py's own set_command exactly (same name/
-        signature), so navigate.py's outer loop can drive either env interchangeably."""
+    def set_command(self, target_speed: float, target_lateral: float = 0.0,
+                     target_yaw_rate: float = 0.0) -> None:
+        """Overwrite the commanded forward/lateral/yaw-rate velocity directly, bypassing reset()'s
+        own per-episode randomization. The (target_speed, target_lateral) part mirrors
+        envs/go1_env.py's own set_command exactly (same name/signature) so navigate.py's strafe-
+        based outer loop can drive either env interchangeably; target_yaw_rate is an ADDITIVE third
+        argument go1_env.py has no equivalent of (its own RL navigation never sustains a commanded
+        turn, see Stage 10c) -- this env's MPC base controller does, so a turn-to-face steering law
+        can use it here."""
         self.target_speed = float(target_speed)
         self.target_lateral = float(target_lateral)
+        self.target_yaw_rate = float(target_yaw_rate)

@@ -23,10 +23,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from mpc_residual_env import MPCResidualEnv
 from navigate import compute_nav_command
+from navigate_mpc import compute_nav_command_turn
 
 
 def run_episode(seed, goal_x, goal_y, seconds, kp, tolerance, speed_range, lateral_range,
-                max_accel, terrain_amplitude, terrain_footstep_planning):
+                max_accel, terrain_amplitude, terrain_footstep_planning, steering="strafe",
+                kp_yaw=2.0, yaw_rate_range=(-1.5, 1.5), max_yaw_accel=3.0):
     env = MPCResidualEnv(
         episode_seconds=seconds,
         speed_range=(0.0, 0.0), lateral_range=(0.0, 0.0), yaw_rate_range=(0.0, 0.0),
@@ -38,11 +40,13 @@ def run_episode(seed, goal_x, goal_y, seconds, kp, tolerance, speed_range, later
     obs, _ = env.reset(seed=seed)
     speed_lo, speed_hi = speed_range
     lat_lo, lat_hi = lateral_range
+    yaw_lo, yaw_hi = yaw_rate_range
     max_cmd_delta = max_accel / 200.0
+    max_yaw_delta = max_yaw_accel / 200.0
 
     max_steps = int(seconds * 200)
     x, y, yaw = 0.0, 0.0, 0.0
-    cur_fwd, cur_lat = 0.0, 0.0
+    cur_fwd, cur_lat, cur_yaw = 0.0, 0.0, 0.0
     path_len = 0.0
     reached, t_reached = False, None
     fell, qp_failed_any = False, False
@@ -52,13 +56,19 @@ def run_episode(seed, goal_x, goal_y, seconds, kp, tolerance, speed_range, later
         if dist <= tolerance:
             if not reached:
                 reached, t_reached = True, step / 200.0
-            target_fwd, target_lat = 0.0, 0.0
+            target_fwd, target_lat, target_yaw = 0.0, 0.0, 0.0
+        elif steering == "turn":
+            target_fwd, target_yaw = compute_nav_command_turn(
+                x, y, yaw, goal_x, goal_y, kp, kp_yaw, speed_lo, speed_hi, yaw_lo, yaw_hi)
+            target_lat = 0.0
         else:
             target_fwd, target_lat = compute_nav_command(
                 x, y, yaw, goal_x, goal_y, [], kp, speed_lo, speed_hi, lat_lo, lat_hi)
+            target_yaw = 0.0
         cur_fwd += np.clip(target_fwd - cur_fwd, -max_cmd_delta, max_cmd_delta)
         cur_lat += np.clip(target_lat - cur_lat, -max_cmd_delta, max_cmd_delta)
-        env.set_command(cur_fwd, cur_lat)
+        cur_yaw += np.clip(target_yaw - cur_yaw, -max_yaw_delta, max_yaw_delta)
+        env.set_command(cur_fwd, cur_lat, cur_yaw)
 
         obs, _, terminated, truncated, info = env.step(np.zeros(12, dtype=np.float32))
         new_x, new_y = float(info["base_pos"][0]), float(info["base_pos"][1])
@@ -89,6 +99,10 @@ def main():
     ap.add_argument("--speed-range", type=float, nargs=2, default=[-0.4, 0.8])
     ap.add_argument("--lateral-range", type=float, nargs=2, default=[-0.3, 0.3])
     ap.add_argument("--max-accel", type=float, default=1.5)
+    ap.add_argument("--steering", choices=["strafe", "turn"], default="strafe")
+    ap.add_argument("--kp-yaw", type=float, default=2.0)
+    ap.add_argument("--yaw-rate-range", type=float, nargs=2, default=[-1.5, 1.5])
+    ap.add_argument("--max-yaw-accel", type=float, default=3.0)
     ap.add_argument("--terrain-amplitude", type=float, nargs="+", default=[None],
                      help="terrain amplitude(s) in m (peak-to-peak) to evaluate at. "
                           "Default: flat ground only.")
@@ -109,7 +123,8 @@ def main():
         results = [run_episode(args.seed0 + i, float(goal_x[i]), float(goal_y[i]), args.seconds,
                                 args.kp, args.tolerance, tuple(args.speed_range),
                                 tuple(args.lateral_range), args.max_accel, amp,
-                                args.terrain_footstep_planning)
+                                args.terrain_footstep_planning, args.steering, args.kp_yaw,
+                                tuple(args.yaw_rate_range), args.max_yaw_accel)
                    for i in range(args.episodes)]
 
         reached = np.array([r["reached"] for r in results])
