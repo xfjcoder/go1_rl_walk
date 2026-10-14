@@ -1,11 +1,13 @@
 # Quadruped Locomotion: Unitree Go1 / Go2, MuJoCo + PPO
 
 Trains Unitree Go1 and Go2 quadrupeds to walk — forward, backward, and
-sideways — across flat ground, rough terrain, slopes, and stairs, using
-MuJoCo physics simulation and PPO (Stable-Baselines3). Nine stages of
-development, each building on the last, with every reward-shaping decision,
-bug, and failed experiment documented against real logged numbers, not
-guesses — see [HISTORY.md](HISTORY.md) for the full story.
+sideways — across flat ground, rough terrain, slopes, and stairs, then
+navigate toward world-frame goals, using MuJoCo physics simulation, PPO
+(Stable-Baselines3), and (Stage 11) a classical MPC controller as an
+alternative locomotion base. Eleven stages of development, each building on
+the last, with every reward-shaping decision, bug, and failed experiment
+documented against real logged numbers, not guesses — see
+[HISTORY.md](HISTORY.md) for the full story.
 
 <p align="center">
   <img src="media/go2_speed_curriculum_0.8ms.gif" width="300" alt="Go2 walking forward at 0.8 m/s">
@@ -52,9 +54,42 @@ latency-robustness specialization —
 a third adopted-but-specialized checkpoint, trading some stairs capability
 for robustness to sim-to-real control latency.)
 
+## MPC-based locomotion and navigation (Stage 11)
+
+A parallel, non-RL locomotion stack: a classical convex MPC controller
+(vendored, [`third_party/go2-convex-mpc`](third_party/go2-convex-mpc))
+drives the same Go2 model directly — no training required for any of the
+numbers below. Built specifically because real turning never emerged from
+four structurally different from-scratch RL attempts (item 10 below); MPC
+sustains a commanded turn cleanly out of the box.
+
+<p align="center">
+  <img src="media/mpc_turning_demo.gif" width="300" alt="MPC-controlled Go2 holding a pure in-place rotation command">
+  <img src="media/mpc_navigate_turn_demo.gif" width="300" alt="MPC navigation turning to face a goal, then driving straight to it">
+</p>
+
+*Left: a sustained in-place turn (1.91-1.955 rad/s against a 2.0 rad/s
+command) — the capability RL alone could never hold onto. Right:
+turn-to-face navigation built on top of it — rotates toward the goal
+bearing, then drives straight in, 100% success / 0% falls over 32
+randomized goals, almost twice as fast as the RL navigation stack's own
+strafe-only approach.*
+
+```bash
+cd mpc && pip install -r requirements.txt   # separate venv -- see mpc/README.md
+python3 navigate_mpc.py --goal-x 3.0 --goal-y -2.0 --steering turn --record out.gif
+```
+
+See [`mpc/README.md`](mpc/README.md) for the full writeup: gait-style
+switching (pace/walk adopted, bound partially fixed/partially a known
+limit), terrain-aware footstep planning (adopted, the track's one genuine
+terrain fix), several terrain/bound levers tested and honestly reported as
+negative, and MPC-based navigation (both a strafe-based first pass and the
+turn-to-face follow-up above).
+
 ## The project, in brief
 
-Nine stages, each building on the last (full detail, including every
+Eleven stages, each building on the last (full detail, including every
 failure and fix, in [HISTORY.md](HISTORY.md)):
 
 0. **Scripted crawl** (no RL) — a hand-designed gait, to confirm the model
@@ -135,18 +170,33 @@ failure and fix, in [HISTORY.md](HISTORY.md)):
     different angle on the turning problem above: use a conventional MPC
     controller (which naturally supports yaw-rate commands) as the
     locomotion base instead of training RL to discover turning from
-    scratch, with RL as a possible later residual correction. Evaluation
-    in progress on its own branch (`stage11-mpc`) — survey and "does it
-    actually work against this project's own Go2 model" are done:
-    genuine, repeatable turning (1.91/1.93 rad/s against a 2.0 rad/s
-    command) verified against `assets/go2_mesh.xml` itself, after finding
-    and fixing a real integration bug (positional, not name-based, joint
-    remapping between the controller and this project's model). The
-    RL-residual interface is also defined and verified (a Gymnasium env
-    adding a small RL torque correction on top of the MPC's own output,
-    reusing this project's reward/domain-randomization conventions). **Not
-    yet decided whether to adopt** — the residual policy hasn't been
-    trained yet. See `mpc/README.md`.
+    scratch. Verified genuine, repeatable turning (1.91-1.955 rad/s
+    against a 2.0 rad/s command) against this project's own Go2 model,
+    after finding and fixing a real integration bug (positional, not
+    name-based, joint remapping between the controller and this project's
+    model). An RL-residual layer was built and trained on top (SB3 PPO
+    correcting the MPC's own torque output) and measurably helped on flat
+    ground — but every subsequent real improvement came from fixing the
+    classical controller directly, so the project pivoted to **MPC-only,
+    RL residual deprioritized**. Extended with: gait-style switching
+    (pace/walk adopted cleanly, zero RL needed; bound partially fixed via
+    a pitch-reference mechanism, 23% success, closed as a known limit
+    after four further independently-tested levers — flight-phase/
+    vertical-bounce, touchdown-height-phase-tie, and standing-height —
+    all came back negative); terrain-aware footstep planning (the track's
+    one genuine terrain fix, 0.719 success vs. the terrain-blind
+    baseline, after which three further terrain levers — friction-cone
+    orientation, foothold optimization, swing-clearance height — were
+    tested and honestly reported as negative/wash results, and the
+    terrain track was closed at this accepted limit); and **MPC-based
+    navigation** — a direct port of the RL navigation stack's own
+    steering law (88% success, less reliable but almost twice as fast and
+    far more direct than RL navigation, from much tighter low-level
+    velocity tracking) followed by a turn-to-face steering law that
+    actually exploits MPC's working yaw-rate command (a clean win: 100%
+    success / 0% falls, matching RL navigation's reliability while
+    staying nearly twice as fast). See [`mpc/README.md`](mpc/README.md)
+    for the full writeup, including every negative result in full detail.
 
 ## Repository layout
 
@@ -172,6 +222,12 @@ go1_rl_walk/
 │   ├── go2_gaitclock/       #   no training required. go2_gaitclock / go2_latback are current
 │   ├── go2_latback/         #   best (see above); the rest are earlier stages or specializations.
 │   └── ...
+├── mpc/                    # Stage 11: classical MPC locomotion + navigation, own venv (see
+│   ├── mpc_residual_env.py #   mpc/README.md) -- vendors third_party/go2-convex-mpc, never
+│   ├── navigate_mpc.py     #   edited in place (every fix is a subclass override)
+│   ├── eval_navigate_mpc.py
+│   └── README.md           # full Stage 11 writeup, including every negative result
+├── third_party/go2-convex-mpc/  # vendored submodule, the MPC controller itself
 ├── requirements.txt
 └── LICENSE                 # MIT
 ```
