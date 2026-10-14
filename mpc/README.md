@@ -855,3 +855,42 @@ similarly small (~2% at these slope angles) effect, likely also inconclusive at 
 sample size. Given three consecutive clean-negative results, further incremental terrain
 levers in this style are likely near their ceiling; a bigger structural change (not yet
 scoped) would be needed to move past ~72% success on this terrain distribution.
+
+## Bound stand-height sweep: a decisive negative result, in the wrong direction
+
+User hypothesis: is bound's elevated qp_failed rate (94%->73% after the pitch/cost fixes,
+see above) caused by the robot standing too crouched? `STAND_HEIGHT = 0.27` (the
+`z_pos_des_body` reference fed to `ComTraj.generate_traj` for every gait style, including
+bound) turns out to be inherited verbatim, unmodified and unquestioned per-gait-style,
+from the upstream submodule's own examples (`ex00_demo.py` through `ex04_trot_rotation.py`
+-- all five literally hardcode `0.27`, tuned only for trot). The robot's own MJCF home
+keyframe (`go2_mesh.xml`, verified safe by FK + PD-hold) stands at `z=0.35` -- 8cm higher,
+a real, previously-unexamined discrepancy that made the hypothesis worth testing directly
+rather than dismissing on priors.
+
+Tested by monkeypatching the module-level `STAND_HEIGHT` global (read at call-time by
+both `generate_traj()` call sites, not captured into a closure, so no committed-code
+change was needed to sweep it) across `[0.27, 0.29, 0.31, 0.33, 0.35]`, bound gait,
+flat ground, zero-residual, 48 seeds each (`seed=range(48)`, this project's own
+bound-sweep convention):
+
+| height (m) | success | qp_failed |
+|---|---|---|
+| 0.27 (baseline) | 0.188 | 0.729 |
+| 0.29 | 0.146 | 0.792 |
+| 0.31 | 0.125 | 0.875 |
+| 0.33 | 0.104 | 0.812 |
+| 0.35 (MJCF home pose) | 0.125 | 0.792 |
+
+**Every height above baseline is worse on both metrics, not better** -- raising the
+standing-height reference does not relieve the QP's hard-constraint infeasibility; if
+anything it worsens it. This refutes the hypothesis outright (the direction is backwards
+from what "too low" would predict) and additionally suggests the existing 0.27 crouch is
+already a reasonably good operating point for bound within this range, not an overlooked
+deficiency. No code changes made (nothing to wire in -- the experiment itself is the
+result); `STAND_HEIGHT` left untouched. No regression: `verify_residual_interface.py`
+still gives 1.955 rad/s.
+
+Bound-gait investigation remains closed (now four independently-tested levers --
+pitch/cost fixes partially adopted, flight-phase/vertical-bounce ruled out, touchdown-
+height-phase-tie ruled out, stand-height ruled out) absent a genuinely new idea.

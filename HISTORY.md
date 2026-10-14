@@ -2597,6 +2597,22 @@ style are likely near their ceiling; only `fz_min`'s stance-force bound remains
 untested, expected (by the same reasoning as friction-cone) to be a similarly small
 effect. See `mpc/README.md` for the full writeup.
 
+**Bound stand-height sweep, 2026-10-13 (user: "the dog pose too low coud be the
+problem especially for the bound?") -- a decisive negative result, in the wrong
+direction.** `STAND_HEIGHT = 0.27` (the body-height reference fed to every gait style,
+including bound) turns out to be inherited verbatim from the upstream submodule's own
+trot-only example scripts, never previously questioned per-style; the robot's own MJCF
+home pose sits 8cm higher at `z=0.35`, making the hypothesis worth testing directly.
+Swept `STAND_HEIGHT` across `[0.27, 0.29, 0.31, 0.33, 0.35]` for bound, zero-residual, 48
+seeds each: success fell monotonically-ish from 0.188 at baseline to 0.10-0.15 at every
+higher height, qp_failed rose from 0.729 to 0.79-0.88 at every higher height. Raising the
+standing height makes bound WORSE, not better -- refutes the hypothesis outright, and
+suggests the existing 0.27 crouch is already a good operating point in this range, not an
+overlooked deficiency. No code changes (nothing to wire in). Bound-gait investigation
+remains closed, now with four independently-tested levers (pitch/cost fixes partially
+adopted; flight-phase/vertical-bounce, touchdown-height-phase-tie, and stand-height all
+ruled out) absent a genuinely new idea. See `mpc/README.md` for the full writeup.
+
 ## Next stages
 
 Terrain-aware observation and a non-trot gait mode were both tried already
