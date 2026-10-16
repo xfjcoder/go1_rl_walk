@@ -1029,3 +1029,76 @@ No regression: `verify_residual_interface.py` still gives 1.955 rad/s.
 Not attempted: obstacle avoidance combined with turning (same missing `nav_obstacles`
 mechanism as above), and tuning `kp_yaw`/`--max-yaw-accel` further (the first values tried
 already gave a clean sweep, so there was no motivating failure to chase).
+
+## Contact-feedback gait correction: a 4th terrain lever, re-opened then re-closed
+
+The terrain track was reopened once (user: scope then build "the bigger structural
+redesign" flagged, but not attempted, when terrain closed at 0.719 success -- see above).
+Scoped to two candidate mechanisms, neither tried by any of the three closed terrain
+levers: (A) make the gait's contact SCHEDULE feedback-aware instead of a pure open-loop
+clock, (B) make the CoM reference trajectory actively weight-shift onto remaining stance
+feet before a difficult swing. Built and tested (A) first, per the user's own sequencing
+("build (A) first").
+
+**Root cause targeted**: `Gait.compute_contact_table` is a function of elapsed time
+alone -- a foot the clock calls "stance" gets `fz >= fz_min` DEMANDED of it in
+`_compute_bounds` regardless of whether it has actually touched anything yet. On uneven
+terrain a scheduled-stance foot can still be airborne (late touchdown into a dip) -- the
+QP is then asked for force from a foot that physically cannot supply it, a direct
+mechanism for `qp_failed`. Symmetrically, a foot the clock still calls "swing" can
+already be loaded (early touchdown onto a bump); `_compute_bounds` forces its force to
+exactly 0 even though it's touching, discarding capacity the other three legs might need
+it to share. None of friction-cone orientation, foothold xy-search, or swing-clearance
+height touch WHEN a foot's contact state is decided -- only WHERE or HOW HIGH it swings.
+Mirrors the pure-RL track's own already-ADOPTED `gait_clock_wait_for_contact` mechanism
+(`envs/go1_env.py`), which fixed a genuine descending-stairs corner there (see memory:
+go1-staged-plan) -- this is the deliberately simpler MPC-side version: instead of
+pausing the gait clock's own phase, `ContactFeedbackMixin` (`mpc_residual_env.py`) only
+overrides the REALIZED contact assignment at the currently-executed step (`traj.
+contact_table[:, 0]`) against real per-foot MuJoCo contact force (new
+`MPCResidualEnv._foot_contact_forces`, same per-geom-sum technique as `envs/go1_env.py`'s
+own `_foot_contacts`), leaving every future horizon step exactly as the open-loop clock
+schedules -- the receding-horizon replan gives each step its own correction once it
+becomes current. A grace period (`contact_grace_steps`, default 4) avoids firing right at
+a normal phase transition (force genuinely is ~0 for the first few ms of a new stance
+phase, nothing to do with terrain). Gated by new `terrain_contact_feedback`/
+`contact_grace_steps`/`contact_force_threshold` flags, combinable with every existing
+terrain/cost-override lever (`ContactFeedbackCentroidalMPC`/
+`ContactFeedbackTerrainAwareCentroidalMPC`/`CostOverrideContactFeedback*`, mirroring the
+existing `CostOverrideMixin` composition pattern).
+
+Verified before trusting it: a synthetic unit test (fake contact table + scripted force
+sequences, no MuJoCo) confirmed the grace-period timing and both override directions fire
+exactly as designed, and that the mechanism is a provable no-op when `contact_force_fn is
+None` (the default) -- confirmed by inspection too, since the construction logic's final
+`else` branch is the original, completely unmodified `CentroidalMPC(self.go2, self.traj)`
+line. `verify_residual_interface.py` (flag off) still gives 1.955 rad/s exactly.
+
+**Tested zero-residual, same 64-paired-seed methodology, same terrain distribution,
+stacked on the adopted footstep-planning fix:**
+
+| variant | success | fall | qp_failed |
+|---|---|---|---|
+| terrain-aware-plan (adopted) | 0.66 | 0.34 | 0.33 |
+| terrain-aware-plan + contact-feedback | 0.61 | 0.39 | 0.36 |
+
+(Baseline's absolute rate differing from the 0.719 quoted earlier is the same
+different-seed-sample effect already documented for the foothold-optimization check --
+doesn't affect this paired comparison.) **Unlike the three previously-closed terrain
+levers (each a ~1-episode wash), this one is NOT noise**: a same-process paired check
+(identical seeds, both arms) found 11 of 64 episodes flipped outcome (4 fall->survive, 7
+survive->fall) -- a real, nontrivial effect, just net UNFAVORABLE. The mechanism clearly
+does something; it's simply the wrong something, at least in this first cut (bundling
+both override directions as one lever, grace=4/threshold=1N taken directly from the RL
+track's own convention rather than tuned for this QP).
+
+**DECISION (user, same session): stop here rather than isolate the two override
+directions or tune grace/threshold.** Consistent with the user's own prior decision to
+close the terrain track at 0.719 -- a 4th independently-tried lever landing negative
+(and more disruptive than the first three) is read as further evidence this class of
+incremental, geometry/timing-precision terrain fix is near its ceiling here, not as a
+reason to keep iterating on this one. `terrain_contact_feedback=False` stays default;
+the mechanism stays in the codebase, verified and available, not adopted -- same
+treatment as `terrain_friction_cone`/`terrain_foothold_optimization`/
+`terrain_swing_clearance`. Lever (B) (CoM weight-shift reference), scoped alongside (A)
+but not yet built, remains a live option if this is revisited.

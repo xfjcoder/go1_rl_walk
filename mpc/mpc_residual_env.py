@@ -567,6 +567,85 @@ class CostOverrideTerrainAwareCentroidalMPC(CostOverrideMixin, TerrainAwareCentr
     pass
 
 
+class ContactFeedbackMixin:
+    """Overrides solve_QP to correct the CURRENTLY-EXECUTED horizon step's contact
+    assignment (`traj.contact_table[:, 0]`) against REAL measured per-foot contact force,
+    instead of trusting `Gait.compute_contact_table`'s pure time-based clock unconditionally.
+
+    Root cause this targets: `Gait.compute_contact_table` is a function of elapsed time
+    alone -- a foot the clock calls "stance" gets an `fz >= fz_min` box-bound DEMANDED of
+    it in `_compute_bounds` regardless of whether it has actually touched anything yet. On
+    uneven terrain a scheduled-stance foot can still be airborne (late touchdown into a
+    dip) -- the QP is then asked for force from a foot that physically cannot supply it, a
+    direct, literal mechanism for infeasibility (`qp_failed`). Symmetrically, a foot the
+    clock still calls "swing" can already be loaded (early touchdown onto a bump);
+    `_compute_bounds` forces its (x,y,z) force to exactly 0 even though it's touching,
+    discarding force capacity the OTHER three legs might otherwise need it to share. None
+    of the three previously-tried terrain levers (friction-cone orientation, foothold
+    xy-search, adaptive swing-clearance height -- see mpc/README.md's terrain-extension
+    section) touch WHEN a foot's contact state is decided, only WHERE or HOW HIGH it swings.
+
+    Mirrors the pure-RL track's own already-ADOPTED `gait_clock_wait_for_contact`
+    mechanism (envs/go1_env.py), which fixed a genuine descending-stairs corner there --
+    this is the MPC-side version of the same idea, deliberately simpler: instead of
+    pausing the gait clock's own phase (would mean giving the vendored, stateless `Gait`
+    persistent state), this only overrides the REALIZED contact_table at the
+    currently-executed step (k=0), leaving every future horizon step (k=1..N-1, not yet
+    realized, nothing to measure yet) exactly as the open-loop clock already schedules --
+    the receding-horizon replan at MPC_DT then gives every step its own real correction
+    once it actually becomes current.
+
+    A grace period (`contact_grace_steps`) avoids overriding right at a normal phase
+    transition (force genuinely IS ~0 for the first few ms after a stance phase begins,
+    before the foot has had physical time to land -- not a terrain problem, just contact
+    dynamics): only overrides once a leg has been schedule/measurement-mismatched for MORE
+    than this many consecutive solve_QP calls in a row, the same purpose as the RL
+    mechanism's own `gait_clock_grace_steps`.
+
+    No-op (bit-identical to the base class) when `contact_force_fn is None` (the default),
+    so this is safe to mix in ahead of ANY CentroidalMPC variant unconditionally."""
+
+    def __init__(self, go2, traj, *args, contact_force_fn=None, contact_grace_steps=4,
+                 contact_force_threshold=1.0, **kwargs):
+        super().__init__(go2, traj, *args, **kwargs)
+        self._contact_force_fn = contact_force_fn
+        self._contact_grace_steps = contact_grace_steps
+        self._contact_force_threshold = contact_force_threshold
+        self._contact_mismatch_streak = np.zeros(4, dtype=int)
+
+    def solve_QP(self, go2, traj, verbose: bool = False):
+        if self._contact_force_fn is not None:
+            force = np.asarray(self._contact_force_fn(), dtype=float)
+            scheduled_stance = traj.contact_table[:, 0].astype(bool)
+            measured_stance = force > self._contact_force_threshold
+            mismatch = scheduled_stance != measured_stance
+            self._contact_mismatch_streak = np.where(
+                mismatch, self._contact_mismatch_streak + 1, 0)
+            override = self._contact_mismatch_streak > self._contact_grace_steps
+            if override.any():
+                new_col0 = traj.contact_table[:, 0].copy()
+                new_col0[override] = measured_stance[override].astype(traj.contact_table.dtype)
+                traj.contact_table[:, 0] = new_col0
+        return super().solve_QP(go2, traj, verbose)
+
+
+class ContactFeedbackCentroidalMPC(ContactFeedbackMixin, CentroidalMPC):
+    pass
+
+
+class ContactFeedbackTerrainAwareCentroidalMPC(ContactFeedbackMixin, TerrainAwareCentroidalMPC):
+    pass
+
+
+class CostOverrideContactFeedbackCentroidalMPC(CostOverrideMixin, ContactFeedbackMixin, CentroidalMPC):
+    pass
+
+
+class CostOverrideContactFeedbackTerrainAwareCentroidalMPC(
+        CostOverrideMixin, ContactFeedbackMixin, TerrainAwareCentroidalMPC):
+    pass
+
+
 GAIT_T = 1.0 / GAIT_HZ
 
 SIM_HZ = 1000
@@ -642,6 +721,26 @@ class MPCResidualEnv(gym.Env):
                                                # terrain_footstep_planning; a no-op otherwise.
                                                # Default False reproduces every prior variant's
                                                # exact behavior.
+        terrain_contact_feedback: bool = False,  # correct the CURRENTLY-EXECUTED horizon
+                                               # step's contact assignment against REAL sensed
+                                               # per-foot contact force, instead of trusting
+                                               # Gait's pure time-based clock unconditionally --
+                                               # see ContactFeedbackMixin above. Independent of
+                                               # terrain_friction_cone/terrain_foothold_optimization/
+                                               # terrain_swing_clearance (those fix WHERE/HOW HIGH
+                                               # a foot plants; this fixes WHEN its contact state
+                                               # is trusted). Default False reproduces every prior
+                                               # variant's exact behavior.
+        contact_grace_steps: int = 4,          # consecutive solve_QP calls a leg must stay
+                                               # schedule/measurement-mismatched before
+                                               # ContactFeedbackMixin overrides it -- avoids
+                                               # firing right at a normal phase transition (force
+                                               # genuinely is ~0 for the first few ms of a new
+                                               # stance phase, before the foot has had time to
+                                               # land). Only used when terrain_contact_feedback.
+        contact_force_threshold: float = 1.0,  # N -- same convention and default as
+                                               # envs/go1_env.py's own contact_force_threshold.
+                                               # Only used when terrain_contact_feedback.
         gait_style: str = "trot",             # one of GAIT_STYLE_PRESETS -- selects the
                                                # contact-schedule parametrization (trot/pace/
                                                # bound/walk), a classical, non-learned choice.
@@ -747,6 +846,11 @@ class MPCResidualEnv(gym.Env):
         # Same late-binding safety as self._terrain_height above -- self._terrain_normal is
         # a bound method, only ever called from solve_QP() well after _generate_terrain has run.
         self.terrain_friction_cone = terrain_friction_cone and self.terrain_enabled
+        # Same gating convention as terrain_friction_cone above -- flat-ground runs stay
+        # byte-identical to every prior variant regardless of this flag's value.
+        self.terrain_contact_feedback = terrain_contact_feedback and self.terrain_enabled
+        self.contact_grace_steps = contact_grace_steps
+        self.contact_force_threshold = contact_force_threshold
         pitch_amplitude = GAIT_STYLE_PITCH_AMPLITUDE[self.gait_style]
         height_amplitude = GAIT_STYLE_HEIGHT_AMPLITUDE[self.gait_style]
         self.traj = (BoundAwareComTraj(self.go2, pitch_amplitude, float(phase_offset[0]),
@@ -757,6 +861,14 @@ class MPCResidualEnv(gym.Env):
         self._floor_geom_id = mj.mj_name2id(self.mujoco_go2.model, mj.mjtObj.mjOBJ_GEOM, "floor")
         self._base_id = mj.mj_name2id(self.mujoco_go2.model, mj.mjtObj.mjOBJ_BODY, "base_link")
         self._nominal_base_mass = float(self.mujoco_go2.model.body_mass[self._base_id])
+        # LEG_INDEX order (FL, FR, RL, RR) -- matches the force-vector layout
+        # CentroidalMPC._compute_bounds already assumes, so _foot_contact_forces()'s
+        # output lines up directly against traj.contact_table's own row order with no
+        # reshuffling needed.
+        self._foot_geom_ids = np.array([
+            mj.mj_name2id(self.mujoco_go2.model, mj.mjtObj.mjOBJ_GEOM, f"{leg}_foot")
+            for leg in ("FL", "FR", "RL", "RR")])
+        self._contact_force_buf = np.zeros(6)
 
         self._terrain_geom = None
         self._terrain_h = None
@@ -833,6 +945,11 @@ class MPCResidualEnv(gym.Env):
         # fresh each reset anyway, to avoid any question of stale OSQP warm-start state
         # leaking across episodes.
         pitch_weight = GAIT_STYLE_PITCH_WEIGHT[self.gait_style]
+        contact_fn = self._foot_contact_forces if self.terrain_contact_feedback else None
+        contact_kwargs = (dict(contact_force_fn=contact_fn,
+                                contact_grace_steps=self.contact_grace_steps,
+                                contact_force_threshold=self.contact_force_threshold)
+                           if self.terrain_contact_feedback else {})
         if pitch_weight is not None:
             # COST_MATRIX_Q is int-dtype (np.diag of an all-int list) -- .copy() alone
             # preserves that dtype, silently truncating a non-integer pitch_weight to 0
@@ -840,13 +957,24 @@ class MPCResidualEnv(gym.Env):
             # producing bit-identical, wrong results). astype(float) first avoids this.
             cost_q = COST_MATRIX_Q.astype(float)
             cost_q[4, 4] = pitch_weight
-            if self.terrain_friction_cone:
+            if self.terrain_friction_cone and self.terrain_contact_feedback:
+                self.mpc = CostOverrideContactFeedbackTerrainAwareCentroidalMPC(
+                    self.go2, self.traj, cost_q, self._terrain_normal, **contact_kwargs)
+            elif self.terrain_friction_cone:
                 self.mpc = CostOverrideTerrainAwareCentroidalMPC(
                     self.go2, self.traj, cost_q, self._terrain_normal)
+            elif self.terrain_contact_feedback:
+                self.mpc = CostOverrideContactFeedbackCentroidalMPC(
+                    self.go2, self.traj, cost_q, **contact_kwargs)
             else:
                 self.mpc = CostOverrideCentroidalMPC(self.go2, self.traj, cost_q)
+        elif self.terrain_friction_cone and self.terrain_contact_feedback:
+            self.mpc = ContactFeedbackTerrainAwareCentroidalMPC(
+                self.go2, self.traj, self._terrain_normal, **contact_kwargs)
         elif self.terrain_friction_cone:
             self.mpc = TerrainAwareCentroidalMPC(self.go2, self.traj, self._terrain_normal)
+        elif self.terrain_contact_feedback:
+            self.mpc = ContactFeedbackCentroidalMPC(self.go2, self.traj, **contact_kwargs)
         else:
             self.mpc = CentroidalMPC(self.go2, self.traj)
         self._U_opt = np.zeros((12, self.traj.N), dtype=float)
@@ -927,6 +1055,22 @@ class MPCResidualEnv(gym.Env):
         dzdy = (self._terrain_height(x, y + eps) - self._terrain_height(x, y - eps)) / (2 * eps)
         n = np.array([-dzdx, -dzdy, 1.0])
         return n / np.linalg.norm(n)
+
+    def _foot_contact_forces(self) -> np.ndarray:
+        """Real per-foot normal contact force (N), LEG_INDEX order (FL, FR, RL, RR) -- same
+        technique as envs/go1_env.py's own _foot_contacts (sum over ALL of a foot's contact
+        points, since a foot on a heightfield/stairs can touch at more than one point), just
+        returning the raw force instead of a thresholded bool so ContactFeedbackMixin can
+        apply its own threshold. Feeds ContactFeedbackMixin's contact_force_fn."""
+        data = self.mujoco_go2.data
+        force = np.zeros(4)
+        for i in range(data.ncon):
+            c = data.contact[i]
+            hit = np.flatnonzero((self._foot_geom_ids == c.geom1) | (self._foot_geom_ids == c.geom2))
+            if hit.size:
+                mj.mj_contactForce(self.mujoco_go2.model, data, i, self._contact_force_buf)
+                force[hit[0]] += self._contact_force_buf[0]
+        return force
 
     def _local_heightmap(self, qpos) -> np.ndarray:
         """Ported verbatim from envs/go1_env.py's own _local_heightmap: terrain height (m) at a
