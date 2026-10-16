@@ -346,6 +346,191 @@ class BoundAwareComTraj(ComTraj):
             self.vel_traj_world[2, :] += self._height_amplitude * db_dt
 
 
+class WeightShiftComTraj(ComTraj):
+    """Lever (B), scoped when the terrain track was reopened a second time (see
+    mpc/README.md): bias the QP's tracked CoM position reference's (x, y) at each horizon
+    step toward the centroid of whichever feet are SCHEDULED STANCE at that step, instead
+    of `ComTraj.generate_traj`'s own straight-line, contact-oblivious reference -- the
+    structural gap neither of the three closed terrain levers (friction-cone orientation,
+    foothold xy-search, swing-clearance height) nor lever (A) (contact-feedback gait
+    scheduling, also negative) ever touched: none of them give the QP's TRACKED
+    TRAJECTORY itself any notion of "lean onto remaining support before a leg lifts."
+
+    Unlike `BoundAwareComTraj`'s pitch/height patches just above (provably safe to apply
+    AFTER calling the unmodified parent -- see that class's own docstring: neither field
+    ever reaches the foot-lever-arm computation), a POSITION bias is NOT safe to patch
+    after the fact: `Gait.compute_touchdown_world_for_traj_purpose_only` predicts each
+    leg's next touchdown point FROM the predicted base position at that horizon step, and
+    `_continuousDynamics`/`_discreteDynamics`' force-to-motion mapping (Bd/Ad) is built
+    directly from those lever arms -- patching position after the parent call would leave
+    the QP's COST tracking a biased trajectory while its DYNAMICS still assumed the
+    UNBIASED one's lever arms, a real self-consistency gap. So `generate_traj` here calls
+    the unmodified parent ONCE (pass 1: gives `contact_table` and a nominal, soon-to-be-
+    overwritten trajectory -- the cheapest way to get contact_table without duplicating
+    `Gait.compute_contact_table` itself), computes and applies the bias, then RE-DERIVES
+    the lever arms and dynamics matrices from the now-biased trajectory via
+    `_recompute_lever_arms` (a near-verbatim copy of `ComTraj.generate_traj`'s own
+    per-step loop, since that loop isn't factored into a separately-callable method
+    upstream -- genuinely duplicated vendored logic, not a thin wrapper, the real cost
+    flagged when this lever was scoped) followed by the PARENT's own (unmodified, reused
+    as-is) `_continuousDynamics`/`_discreteDynamics`.
+
+    Gated by local terrain height at each currently-swinging leg's nominal hip-projected
+    position (`terrain_height_fn`, the SAME lookup every other terrain lever already
+    uses), not just an always-on gain: `terrain_height_fn` returns EXACTLY 0.0 on flat
+    ground (confirmed from its own docstring/implementation), so `difficulty` is
+    EXACTLY 0.0 there regardless of `weight_shift_gain`, which short-circuits straight
+    back to the parent's own unmodified pass-1 result (see the early return below) --
+    bit-identical to `ComTraj` on flat ground, matching every OTHER terrain lever's own
+    flat-ground-identical property. (Caveat, documented rather than hidden: height
+    magnitude is a cheap proxy for "is this foot landing somewhere unusual," not a true
+    local-slope measure -- it under-reacts to a shallow-but-long slope far from the start
+    pad and may over-react right at a tall single bump's edge. Good enough to gate a
+    first test of the underlying hypothesis; a real slope/roughness metric would be the
+    natural refinement if this lever showed promise.)
+    """
+
+    _DIFFICULTY_HEIGHT_SCALE = 0.05   # m -- same order as this project's own stair-height
+                                       # and terrain-amplitude test ranges (0-5cm / 0-8cm).
+
+    def __init__(self, go2, weight_shift_gain: float, terrain_height_fn):
+        super().__init__(go2)
+        self._weight_shift_gain = weight_shift_gain
+        self._terrain_height_fn = terrain_height_fn
+
+    def generate_traj(self, go2, gait, time_now, x_vel_des_body, y_vel_des_body,
+                       z_pos_des_body, yaw_rate_des_body, time_step):
+        # Pass 1: unmodified parent -- gives contact_table, a nominal (soon-to-be-biased)
+        # pos_traj_world/rpy_traj_world, and nominal lever arms/Bd/Ad (all three discarded
+        # below if the bias turns out nonzero; reused as-is, unmodified, if it's zero).
+        super().generate_traj(go2, gait, time_now, x_vel_des_body, y_vel_des_body,
+                               z_pos_des_body, yaw_rate_des_body, time_step)
+        if self._weight_shift_gain == 0.0:
+            return
+
+        N = self.N
+        contact = self.contact_table  # (4, N), 1=stance, 0=swing; LEG_INDEX order
+        leg_order = ("FL", "FR", "RL", "RR")
+        hip_offset_xy = {leg: np.asarray(go2.get_hip_offset(leg), dtype=float)[:2]
+                          for leg in leg_order}
+
+        difficulty = np.zeros(N)
+        bias_xy = np.zeros((2, N))
+        for i in range(N):
+            swinging = np.flatnonzero(contact[:, i] == 0)
+            stance = np.flatnonzero(contact[:, i] == 1)
+            if swinging.size == 0 or stance.size == 0:
+                continue   # no leg transition in play this step -- nothing to bias
+            yaw_i = float(self.rpy_traj_world[2, i])
+            cy, sy = np.cos(yaw_i), np.sin(yaw_i)
+            R_z_2d = np.array([[cy, -sy], [sy, cy]])
+            base_xy = self.pos_traj_world[0:2, i]
+
+            swing_difficulty = 0.0
+            for j in swinging:
+                probe_xy = base_xy + R_z_2d @ hip_offset_xy[leg_order[j]]
+                h = abs(float(self._terrain_height_fn(probe_xy[0], probe_xy[1])))
+                swing_difficulty = max(swing_difficulty, min(1.0, h / self._DIFFICULTY_HEIGHT_SCALE))
+            if swing_difficulty == 0.0:
+                continue
+            difficulty[i] = swing_difficulty
+
+            stance_centroid_body = np.mean([hip_offset_xy[leg_order[j]] for j in stance], axis=0)
+            bias_xy[:, i] = self._weight_shift_gain * swing_difficulty * (R_z_2d @ stance_centroid_body)
+
+        if not difficulty.any():
+            return   # flat ground (or no swing/stance split this horizon) -- exact no-op
+
+        self.pos_traj_world[0:2, :] += bias_xy
+        self._recompute_lever_arms(go2, gait, time_now, time_step)
+        self._continuousDynamics(go2)
+        self._discreteDynamics(time_step)
+
+    def _recompute_lever_arms(self, go2, gait, time_now, time_step):
+        """Near-verbatim copy of `ComTraj.generate_traj`'s own per-step foot-lever-arm
+        loop (not factored into its own method upstream), re-run here against the
+        now-BIASED `self.pos_traj_world`/`self.rpy_traj_world` so `r_{fl,fr,rl,rr}_
+        foot_world` (and therefore Bd/Ad, built from them by `_continuousDynamics`/
+        `_discreteDynamics` right after this returns) are self-consistent with the
+        biased trajectory the QP's cost is now tracking, instead of stale values computed
+        against pass 1's unbiased one."""
+        N = self.N
+        r_fl_traj_world = np.zeros((3, N))
+        r_fr_traj_world = np.zeros((3, N))
+        r_rl_traj_world = np.zeros((3, N))
+        r_rr_traj_world = np.zeros((3, N))
+
+        [r_fl_next_td_world, r_fr_next_td_world, r_rl_next_td_world, r_rr_next_td_world] = \
+            go2.get_foot_lever_world()
+
+        mask_previous = np.array([2, 2, 2, 2])
+        q = np.zeros(6)
+        dq = np.zeros(6)
+
+        for i in range(N):
+            current_mask = gait.compute_current_mask(time_now + i * time_step)
+
+            q[0:3] = self.pos_traj_world[:, i]
+            q[3:6] = self.rpy_traj_world[:, i]
+            R = go2.R_world_to_body
+            v_world = self.vel_traj_world[:, i]
+            w_world = self.omega_traj_world[:, i]
+            w_body = R @ w_world
+            v_body = R @ v_world
+            dq[0:3] = v_body
+            dq[3:6] = w_body
+            self.dummy_go2.update_model_simplified(q, dq)
+
+            p_base_traj_world = self.dummy_go2.current_config.base_pos
+
+            if current_mask[0] != mask_previous[0] and current_mask[0] == 0:
+                pos_fl_next_td_world = gait.compute_touchdown_world_for_traj_purpose_only(
+                    self.dummy_go2, "FL")
+                r_fl_next_td_world = pos_fl_next_td_world - p_base_traj_world
+                r_fl_traj_world[:, i] = np.array([0, 0, 0])
+            if current_mask[0] != mask_previous[0] and current_mask[0] == 1:
+                r_fl_traj_world[:, i] = r_fl_next_td_world
+            if current_mask[0] == mask_previous[0]:
+                r_fl_traj_world[:, i] = r_fl_traj_world[:, i - 1]
+
+            if current_mask[1] != mask_previous[1] and current_mask[1] == 0:
+                pos_fr_next_td_world = gait.compute_touchdown_world_for_traj_purpose_only(
+                    self.dummy_go2, "FR")
+                r_fr_next_td_world = pos_fr_next_td_world - p_base_traj_world
+                r_fr_traj_world[:, i] = np.array([0, 0, 0])
+            if current_mask[1] != mask_previous[1] and current_mask[1] == 1:
+                r_fr_traj_world[:, i] = r_fr_next_td_world
+            if current_mask[1] == mask_previous[1]:
+                r_fr_traj_world[:, i] = r_fr_traj_world[:, i - 1]
+
+            if current_mask[2] != mask_previous[2] and current_mask[2] == 0:
+                pos_rl_next_td_world = gait.compute_touchdown_world_for_traj_purpose_only(
+                    self.dummy_go2, "RL")
+                r_rl_next_td_world = pos_rl_next_td_world - p_base_traj_world
+                r_rl_traj_world[:, i] = np.array([0, 0, 0])
+            elif current_mask[2] != mask_previous[2] and current_mask[2] == 1:
+                r_rl_traj_world[:, i] = r_rl_next_td_world
+            elif current_mask[2] == mask_previous[2]:
+                r_rl_traj_world[:, i] = r_rl_traj_world[:, i - 1]
+
+            if current_mask[3] != mask_previous[3] and current_mask[3] == 0:
+                pos_rr_next_td_world = gait.compute_touchdown_world_for_traj_purpose_only(
+                    self.dummy_go2, "RR")
+                r_rr_next_td_world = pos_rr_next_td_world - p_base_traj_world
+                r_rr_traj_world[:, i] = np.array([0, 0, 0])
+            elif current_mask[3] != mask_previous[3] and current_mask[3] == 1:
+                r_rr_traj_world[:, i] = r_rr_next_td_world
+            elif current_mask[3] == mask_previous[3]:
+                r_rr_traj_world[:, i] = r_rr_traj_world[:, i - 1]
+
+            mask_previous = current_mask
+
+        self.r_fl_foot_world = r_fl_traj_world
+        self.r_fr_foot_world = r_fr_traj_world
+        self.r_rl_foot_world = r_rl_traj_world
+        self.r_rr_foot_world = r_rr_traj_world
+
+
 # Reuse this project's own heightfield constants/conventions exactly (not re-derived) --
 # see envs/go1_env.py for the full rationale of each.
 from envs.go1_env import HF_CELL, HF_CX, HF_HALF_X, HF_HALF_Y, HF_ELEV, HF_PAD_START, HF_PAD_END
@@ -741,6 +926,22 @@ class MPCResidualEnv(gym.Env):
         contact_force_threshold: float = 1.0,  # N -- same convention and default as
                                                # envs/go1_env.py's own contact_force_threshold.
                                                # Only used when terrain_contact_feedback.
+        terrain_weight_shift: bool = False,    # bias the QP's tracked CoM position
+                                               # reference toward the current stance-foot
+                                               # centroid, gated by local terrain height at
+                                               # each swinging leg's nominal position -- see
+                                               # WeightShiftComTraj above. Independent of
+                                               # every other terrain lever (acts on self.traj,
+                                               # not self.mpc). Not implemented combined with
+                                               # a bound-style pitch/height reference (no
+                                               # terrain test uses gait_style="bound"; raises
+                                               # if both are requested together). Default
+                                               # False reproduces every prior variant's exact
+                                               # behavior.
+        weight_shift_gain: float = 0.15,       # fraction of the way to lean the CoM
+                                               # reference toward the stance centroid, at
+                                               # full (difficulty=1.0) gate. Only used when
+                                               # terrain_weight_shift.
         gait_style: str = "trot",             # one of GAIT_STYLE_PRESETS -- selects the
                                                # contact-schedule parametrization (trot/pace/
                                                # bound/walk), a classical, non-learned choice.
@@ -851,11 +1052,22 @@ class MPCResidualEnv(gym.Env):
         self.terrain_contact_feedback = terrain_contact_feedback and self.terrain_enabled
         self.contact_grace_steps = contact_grace_steps
         self.contact_force_threshold = contact_force_threshold
+        self.terrain_weight_shift = terrain_weight_shift and self.terrain_enabled
+        self.weight_shift_gain = weight_shift_gain
         pitch_amplitude = GAIT_STYLE_PITCH_AMPLITUDE[self.gait_style]
         height_amplitude = GAIT_STYLE_HEIGHT_AMPLITUDE[self.gait_style]
-        self.traj = (BoundAwareComTraj(self.go2, pitch_amplitude, float(phase_offset[0]),
-                                        gait_duty, height_amplitude)
-                     if (pitch_amplitude != 0.0 or height_amplitude != 0.0) else ComTraj(self.go2))
+        if self.terrain_weight_shift and (pitch_amplitude != 0.0 or height_amplitude != 0.0):
+            raise NotImplementedError(
+                "terrain_weight_shift combined with a bound-style pitch/height reference "
+                "is not implemented (no terrain test uses gait_style='bound'); use "
+                "gait_style='trot' or disable terrain_weight_shift.")
+        elif self.terrain_weight_shift:
+            self.traj = WeightShiftComTraj(self.go2, self.weight_shift_gain, self._terrain_height)
+        elif (pitch_amplitude != 0.0 or height_amplitude != 0.0):
+            self.traj = BoundAwareComTraj(self.go2, pitch_amplitude, float(phase_offset[0]),
+                                           gait_duty, height_amplitude)
+        else:
+            self.traj = ComTraj(self.go2)
         self.mujoco_go2.model.opt.timestep = 1.0 / SIM_HZ
         self._q_init = self.go2.current_config.get_q().copy()
         self._floor_geom_id = mj.mj_name2id(self.mujoco_go2.model, mj.mjtObj.mjOBJ_GEOM, "floor")

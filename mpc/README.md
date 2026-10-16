@@ -1102,3 +1102,51 @@ the mechanism stays in the codebase, verified and available, not adopted -- same
 treatment as `terrain_friction_cone`/`terrain_foothold_optimization`/
 `terrain_swing_clearance`. Lever (B) (CoM weight-shift reference), scoped alongside (A)
 but not yet built, remains a live option if this is revisited.
+
+## Lever (B): CoM weight-shift reference -- built correctly, also negative, terrain track closed again
+
+Built the scoped design, not a shortcut: `WeightShiftComTraj` (`mpc_residual_env.py`)
+biases the QP's tracked CoM position reference's (x, y) at each horizon step toward the
+centroid of whichever feet are scheduled stance at that step, instead of `ComTraj.
+generate_traj`'s own straight-line, contact-oblivious reference. Unlike `BoundAwareComTraj`'s
+pitch/height patches (provably safe to apply after calling the unmodified parent -- neither
+field ever reaches the foot-lever-arm computation), a position bias DOES reach it
+(`Gait.compute_touchdown_world_for_traj_purpose_only` predicts touchdown FROM the predicted
+base position), so patching after the fact would leave the QP's dynamics (Bd/Ad) built
+around the unbiased trajectory while its cost tracked the biased one. Built the
+self-consistent version instead: calls the unmodified parent once (pass 1, for
+`contact_table`), applies the bias, then RE-DERIVES the lever arms (`_recompute_lever_arms`,
+a near-verbatim re-run of the parent's own per-step loop against the now-biased trajectory,
+since that loop isn't factored into its own callable method upstream) before calling the
+parent's own unmodified `_continuousDynamics`/`_discreteDynamics`. Also gated by local
+terrain height at each swinging leg's nominal hip-projected position (same `_terrain_height`
+lookup every other terrain lever uses) rather than an always-on gain, so -- unlike a naive
+version -- this is a true no-op on flat ground (verified: `difficulty` is provably exactly
+0.0 there, confirmed both by code inspection of the early-return path and by
+`verify_residual_interface.py` still giving 1.955 rad/s exactly).
+
+Verified before trusting it: a live run with terrain enabled confirmed the bias actually
+fires (non-zero, consistent magnitude scaling with the gain) against a plausible alternating
+trot contact pattern, and a diff against a plain `ComTraj` built from identical state
+confirmed the bias direction/magnitude matches the design.
+
+**Tested zero-residual, same 64-paired-seed methodology, default gain (0.15):**
+
+| variant | success | fall | qp_failed |
+|---|---|---|---|
+| terrain-aware-plan (adopted) | 0.66 | 0.34 | 0.33 |
+| terrain-aware-plan + weight-shift | 0.61 | 0.39 | 0.36 |
+
+Discordant pairs: 0 flipped fall->survive, 3 flipped survive->fall (n=64) -- cleaner than
+lever (A)'s churn (11 discordant pairs) but still purely one-directional: zero episodes
+improved, 3 got strictly worse. Not a wash; a small, consistent negative. Gain was not
+swept (only the stated 0.15 default was tested).
+
+**DECISION (user, same session): stop here.** Five independently-built, independently-
+verified terrain mechanisms now (friction-cone orientation, foothold xy-search,
+swing-clearance height, contact-feedback scheduling, weight-shift reference), across two
+separate re-openings of this track, with zero wins and several small negatives. Terrain
+track closed again at the original `terrain_footstep_planning`-only baseline (0.719 on the
+original seed sample). `terrain_weight_shift=False` stays default; the mechanism stays in
+the codebase, verified and available, not adopted -- same treatment as every other
+tested-but-not-adopted terrain lever in this file.
